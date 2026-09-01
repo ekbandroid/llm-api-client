@@ -1,6 +1,7 @@
 """Веб-интерфейс к LLM: потоковый ответ и настройка ограничений из браузера."""
 
 import json
+import os
 import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -90,7 +91,8 @@ app.add_middleware(
     secret_key=auth.SESSION_SECRET or secrets.token_urlsafe(48),
     session_cookie="llm_session",
     same_site="lax",
-    https_only=False,  # на проде за TLS поставьте True
+    # За TLS кука должна ходить только по HTTPS: COOKIE_SECURE=true в .env.
+    https_only=os.getenv("COOKIE_SECURE", "false").lower() == "true",
     max_age=14 * 24 * 3600,
 )
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
