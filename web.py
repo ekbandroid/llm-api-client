@@ -1,14 +1,20 @@
 """Веб-интерфейс к LLM: потоковый ответ и настройка ограничений из браузера."""
 
 import json
+import secrets
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from starlette.middleware.sessions import SessionMiddleware
 
+import auth
+import db
 import llm
 
 STATIC = Path(__file__).parent / "static"
@@ -72,7 +78,48 @@ class ChatRequest(BaseModel):
     constraints: Constraints = Constraints()
 
 
-app = FastAPI(title="LLM chat")
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    db.init()
+    yield
+
+
+app = FastAPI(title="LLM chat", lifespan=lifespan)
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=auth.SESSION_SECRET or secrets.token_urlsafe(48),
+    session_cookie="llm_session",
+    same_site="lax",
+    https_only=False,  # на проде за TLS поставьте True
+    max_age=14 * 24 * 3600,
+)
+app.mount("/static", StaticFiles(directory=STATIC), name="static")
+
+
+# ---------- доступ ----------
+
+def current_user(request: Request) -> dict | None:
+    """Пользователь текущей сессии или None."""
+    user_id = request.session.get("user_id")
+    return db.get(user_id) if user_id else None
+
+
+def require_approved(request: Request) -> dict:
+    """Пускает только подтверждённых. Для API-маршрутов."""
+    user = current_user(request)
+    if user is None:
+        raise HTTPException(401, "Требуется вход")
+    if user["status"] != db.APPROVED:
+        raise HTTPException(403, "Доступ ещё не подтверждён администратором")
+    return user
+
+
+def require_admin(request: Request) -> dict:
+    """Пускает только администраторов."""
+    user = require_approved(request)
+    if not user["is_admin"]:
+        raise HTTPException(403, "Нужны права администратора")
+    return user
 
 
 def build_system_prompt(c: Constraints) -> str:
@@ -105,7 +152,7 @@ def sse(event: dict) -> str:
 
 
 @app.get("/api/config")
-async def config() -> dict:
+async def config(_: dict = Depends(require_approved)) -> dict:
     """Отдаёт интерфейсу список моделей и пресетов формата."""
     models = FALLBACK_MODELS
     try:
@@ -126,7 +173,9 @@ async def config() -> dict:
 
 
 @app.post("/api/chat")
-async def chat(request: ChatRequest) -> StreamingResponse:
+async def chat(
+    request: ChatRequest, _: dict = Depends(require_approved)
+) -> StreamingResponse:
     """Стримит ответ модели в виде SSE."""
     c = request.constraints
     system_prompt = build_system_prompt(c)
@@ -156,6 +205,130 @@ async def chat(request: ChatRequest) -> StreamingResponse:
     )
 
 
+# ---------- страницы ----------
+
 @app.get("/")
-async def index() -> FileResponse:
+async def index(request: Request):
+    """Чат — только для подтверждённых пользователей."""
+    user = current_user(request)
+    if user is None:
+        return RedirectResponse("/login", status_code=302)
+    if user["status"] != db.APPROVED:
+        return RedirectResponse("/pending", status_code=302)
     return FileResponse(STATIC / "index.html")
+
+
+@app.get("/login")
+async def login_page(request: Request):
+    if current_user(request):
+        return RedirectResponse("/", status_code=302)
+    return FileResponse(STATIC / "login.html")
+
+
+@app.get("/pending")
+async def pending_page(request: Request):
+    user = current_user(request)
+    if user is None:
+        return RedirectResponse("/login", status_code=302)
+    if user["status"] == db.APPROVED:
+        return RedirectResponse("/", status_code=302)
+    return FileResponse(STATIC / "pending.html")
+
+
+@app.get("/admin")
+async def admin_page(request: Request):
+    user = current_user(request)
+    if user is None:
+        return RedirectResponse("/login", status_code=302)
+    if not (user["status"] == db.APPROVED and user["is_admin"]):
+        raise HTTPException(403, "Нужны права администратора")
+    return FileResponse(STATIC / "admin.html")
+
+
+# ---------- OAuth ----------
+
+@app.get("/auth/login")
+async def auth_login(request: Request):
+    """Отправляет пользователя на страницу входа Яндекса."""
+    if not auth.is_configured():
+        raise HTTPException(
+            503,
+            "Яндекс OAuth не настроен: заполните YANDEX_CLIENT_ID и "
+            "YANDEX_CLIENT_SECRET в .env",
+        )
+    state = auth.new_state()
+    request.session["oauth_state"] = state
+    return RedirectResponse(auth.authorize_url(state), status_code=302)
+
+
+@app.get("/auth/callback")
+async def auth_callback(request: Request, code: str = "", state: str = "", error: str = ""):
+    """Принимает возврат от Яндекса и заводит сессию."""
+    if error:
+        raise HTTPException(400, f"Яндекс вернул ошибку: {error}")
+
+    expected = request.session.pop("oauth_state", None)
+    if not expected or not secrets.compare_digest(state, expected):
+        raise HTTPException(400, "Неверный state — попробуйте войти заново")
+    if not code:
+        raise HTTPException(400, "Яндекс не передал код авторизации")
+
+    try:
+        token = await auth.exchange_code(code)
+        profile = await auth.fetch_profile(token)
+    except auth.AuthError as err:
+        raise HTTPException(502, str(err)) from err
+
+    user = db.upsert_from_yandex(profile, admin_logins=auth.admin_logins())
+    request.session["user_id"] = user["id"]
+    return RedirectResponse("/" if user["status"] == db.APPROVED else "/pending", status_code=302)
+
+
+@app.get("/auth/logout")
+async def auth_logout(request: Request):
+    request.session.clear()
+    return RedirectResponse("/login", status_code=302)
+
+
+# ---------- API текущего пользователя ----------
+
+@app.get("/api/me")
+async def me(request: Request) -> dict:
+    """Кто вошёл; используется страницами для отрисовки шапки."""
+    user = current_user(request)
+    if user is None:
+        return {"authenticated": False, "oauth_configured": auth.is_configured()}
+    return {
+        "authenticated": True,
+        "oauth_configured": auth.is_configured(),
+        "login": user["login"],
+        "name": user["name"],
+        "email": user["email"],
+        "status": user["status"],
+        "is_admin": bool(user["is_admin"]),
+    }
+
+
+# ---------- админка ----------
+
+class StatusUpdate(BaseModel):
+    status: str
+
+
+@app.get("/api/admin/users")
+async def admin_users(_: dict = Depends(require_admin)) -> dict:
+    return {"users": db.list_all()}
+
+
+@app.post("/api/admin/users/{user_id}/status")
+async def admin_set_status(
+    user_id: int, update: StatusUpdate, admin: dict = Depends(require_admin)
+) -> dict:
+    """Подтверждает, блокирует или возвращает пользователя в ожидание."""
+    if update.status not in db.STATUSES:
+        raise HTTPException(400, f"Допустимые статусы: {', '.join(db.STATUSES)}")
+    if user_id == admin["id"] and update.status != db.APPROVED:
+        raise HTTPException(400, "Нельзя снять доступ у самого себя")
+    if not db.set_status(user_id, update.status):
+        raise HTTPException(404, "Пользователь не найден")
+    return {"ok": True, "user": db.get(user_id)}

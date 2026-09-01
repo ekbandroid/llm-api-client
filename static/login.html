@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Вход — LLM чат</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="center">
+  <div class="card">
+    <h1>LLM чат</h1>
+    <p>Войдите через Яндекс. Доступ к чату открывает администратор после подтверждения.</p>
+    <a class="btn" href="/auth/login" id="loginBtn">Войти через Яндекс</a>
+    <div class="notice" id="notConfigured" hidden>
+      Яндекс OAuth не настроен: в <code>.env</code> пустые
+      <code>YANDEX_CLIENT_ID</code> и <code>YANDEX_CLIENT_SECRET</code>.
+      Заведите приложение на <b>oauth.yandex.ru</b> и впишите ключи.
+    </div>
+  </div>
+</div>
+<script>
+fetch("/api/me").then(r => r.json()).then(me => {
+  if (!me.oauth_configured) {
+    document.getElementById("notConfigured").hidden = false;
+    const btn = document.getElementById("loginBtn");
+    btn.style.opacity = ".5";
+    btn.style.pointerEvents = "none";
+  }
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ожидает подтверждения — LLM чат</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="center">
+  <div class="card">
+    <h1 id="title">Доступ ожидает подтверждения</h1>
+    <p id="text">Вы вошли, но администратор ещё не открыл доступ к чату. Обновите страницу позже.</p>
+    <div class="mono" id="who" style="margin-bottom:20px"></div>
+    <a class="btn ghost" href="/auth/logout">Выйти</a>
+  </div>
+</div>
+<script>
+fetch("/api/me").then(r => r.json()).then(me => {
+  if (!me.authenticated) { location.href = "/login"; return; }
+  if (me.status === "approved") { location.href = "/"; return; }
+  document.getElementById("who").textContent = me.login + (me.email ? " · " + me.email : "");
+  if (me.status === "blocked") {
+    document.getElementById("title").textContent = "Доступ закрыт";
+    document.getElementById("text").textContent =
+      "Администратор заблокировал этот аккаунт. Если это ошибка — свяжитесь с ним.";
+  }
+});
+</script>
+</body>
+</html>

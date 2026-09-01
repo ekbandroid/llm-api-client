@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Пользователи — LLM чат</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="bar">
+  <a href="/">← К чату</a>
+  <span class="grow"></span>
+  <span class="who" id="who"></span>
+  <a class="btn ghost small" href="/auth/logout">Выйти</a>
+</header>
+
+<div class="wrap">
+  <h1>Пользователи</h1>
+  <div class="sub">Новые аккаунты попадают сюда со статусом «ожидает» и доступа к чату не имеют.</div>
+  <table>
+    <thead>
+      <tr><th>Пользователь</th><th>Email</th><th>Статус</th><th>Последний вход</th><th></th></tr>
+    </thead>
+    <tbody id="rows"><tr><td colspan="5" class="mono">Загрузка…</td></tr></tbody>
+  </table>
+  <div class="hint" id="err" style="color:var(--danger)"></div>
+</div>
+
+<script>
+const STATUS_LABEL = { pending: "ожидает", approved: "подтверждён", blocked: "заблокирован" };
+let meLogin = null;
+
+const el = (tag, cls, text) => {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text !== undefined) n.textContent = text;
+  return n;
+};
+
+const when = iso => iso ? iso.replace("T", " ").replace(/(\+.*|Z)$/, "") : "—";
+
+async function setStatus(id, status) {
+  const res = await fetch(`/api/admin/users/${id}/status`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ status }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    document.getElementById("err").textContent = body.detail || `Ошибка ${res.status}`;
+    return;
+  }
+  document.getElementById("err").textContent = "";
+  load();
+}
+
+function actions(u) {
+  const td = el("td", "actions");
+  if (u.login === meLogin) { td.appendChild(el("span", "you", "это вы")); return td; }
+
+  if (u.status !== "approved") {
+    const ok = el("button", "small", "Подтвердить");
+    ok.onclick = () => setStatus(u.id, "approved");
+    td.appendChild(ok);
+  }
+  if (u.status !== "blocked") {
+    const no = el("button", "small danger", "Заблокировать");
+    no.onclick = () => setStatus(u.id, "blocked");
+    td.appendChild(no);
+  }
+  return td;
+}
+
+function render(users) {
+  const tbody = document.getElementById("rows");
+  tbody.innerHTML = "";
+  if (!users.length) {
+    const tr = el("tr");
+    tr.appendChild(Object.assign(el("td", "mono", "Пока никто не входил."), { colSpan: 5 }));
+    tbody.appendChild(tr);
+    return;
+  }
+  for (const u of users) {
+    const tr = el("tr");
+
+    const person = el("td");
+    person.appendChild(el("div", null, u.name || u.login));
+    person.appendChild(el("div", "mono", u.login + (u.is_admin ? " · админ" : "")));
+    tr.appendChild(person);
+
+    tr.appendChild(el("td", "mono", u.email || "—"));
+
+    const st = el("td");
+    st.appendChild(el("span", "status " + u.status, STATUS_LABEL[u.status] || u.status));
+    tr.appendChild(st);
+
+    tr.appendChild(el("td", "mono", when(u.last_login_at)));
+    tr.appendChild(actions(u));
+    tbody.appendChild(tr);
+  }
+}
+
+async function load() {
+  const res = await fetch("/api/admin/users");
+  if (!res.ok) { location.href = res.status === 401 ? "/login" : "/"; return; }
+  render((await res.json()).users);
+}
+
+fetch("/api/me").then(r => r.json()).then(me => {
+  meLogin = me.login;
+  document.getElementById("who").innerHTML = "";
+  document.getElementById("who").append("Вы: ", Object.assign(document.createElement("b"), { textContent: me.login }));
+}).then(load);
+</script>
+</body>
+</html>

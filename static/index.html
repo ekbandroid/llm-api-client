@@ -4,94 +4,21 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>LLM чат</title>
-<style>
-  :root {
-    --bg: #f6f7f9; --panel: #ffffff; --border: #dfe3e8; --text: #1a1d21;
-    --muted: #6b7280; --accent: #16a34a; --accent-soft: #eaf7ee;
-    --user: #eef2ff; --warn: #b45309; --warn-soft: #fef3c7; --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #14161a; --panel: #1c1f24; --border: #2c3138; --text: #e6e8ea;
-      --muted: #9aa3ad; --accent: #4ade80; --accent-soft: #16281c;
-      --user: #1e2533; --warn: #fbbf24; --warn-soft: #2c2313;
-    }
-  }
-  * { box-sizing: border-box; }
-  [hidden] { display: none !important; }
-  body {
-    margin: 0; background: var(--bg); color: var(--text);
-    font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-    display: grid; grid-template-columns: 320px 1fr; height: 100vh;
-  }
-  @media (max-width: 860px) { body { grid-template-columns: 1fr; height: auto; } }
-
-  aside {
-    background: var(--panel); border-right: 1px solid var(--border);
-    padding: 20px; overflow-y: auto;
-  }
-  aside h1 { font-size: 16px; margin: 0 0 4px; }
-  aside .sub { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
-  fieldset { border: 1px solid var(--border); border-radius: 8px; padding: 12px; margin: 0 0 14px; }
-  legend { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; padding: 0 6px; }
-  label { display: block; font-size: 13px; margin-bottom: 10px; }
-  label span { display: block; color: var(--muted); margin-bottom: 4px; }
-  label:last-child { margin-bottom: 0; }
-  select, input[type=text], input[type=number], textarea {
-    width: 100%; padding: 7px 9px; border: 1px solid var(--border); border-radius: 6px;
-    background: var(--bg); color: var(--text); font: inherit; font-size: 13px;
-  }
-  textarea { font-family: var(--mono); font-size: 12px; resize: vertical; min-height: 90px; }
-  .row { display: flex; gap: 10px; }
-  .row label { flex: 1; }
-  .check { display: flex; align-items: center; gap: 8px; font-size: 13px; }
-  .check input { margin: 0; }
-  .hint { color: var(--muted); font-size: 12px; margin-top: 6px; }
-
-  main { display: flex; flex-direction: column; min-width: 0; height: 100vh; }
-  @media (max-width: 860px) { main { height: 80vh; } }
-  #log { flex: 1; overflow-y: auto; padding: 24px; display: flex; flex-direction: column; gap: 16px; }
-  .msg { max-width: 780px; }
-  .msg .who { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
-  .msg .body {
-    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
-    padding: 12px 14px; white-space: pre-wrap; word-wrap: break-word;
-  }
-  .msg.user .body { background: var(--user); }
-  details { margin-top: 8px; }
-  details summary { cursor: pointer; font-size: 12px; color: var(--muted); }
-  details pre {
-    margin: 8px 0 0; padding: 10px; background: var(--bg); border: 1px solid var(--border);
-    border-radius: 6px; font-family: var(--mono); font-size: 12px; white-space: pre-wrap; color: var(--muted);
-  }
-  .stats {
-    margin-top: 8px; font-family: var(--mono); font-size: 12px; color: var(--muted);
-    display: flex; flex-wrap: wrap; gap: 12px;
-  }
-  .stats b { font-weight: 600; color: var(--text); }
-  .truncated {
-    margin-top: 8px; padding: 8px 10px; border-radius: 6px;
-    background: var(--warn-soft); color: var(--warn); font-size: 13px;
-  }
-  .error { border-color: var(--warn); color: var(--warn); }
-  .empty { color: var(--muted); text-align: center; margin-top: 40px; font-size: 14px; }
-
-  form { border-top: 1px solid var(--border); background: var(--panel); padding: 14px 24px; display: flex; gap: 10px; }
-  #prompt { flex: 1; min-height: 44px; max-height: 180px; font-family: inherit; font-size: 14px; }
-  button {
-    padding: 0 20px; border: 0; border-radius: 6px; background: var(--accent); color: #052e14;
-    font: inherit; font-weight: 600; cursor: pointer; white-space: nowrap;
-  }
-  button:disabled { opacity: .5; cursor: default; }
-  button.ghost { background: transparent; color: var(--muted); border: 1px solid var(--border); font-weight: 400; }
-  .cursor::after { content: "▌"; color: var(--accent); animation: blink 1s steps(2) infinite; }
-  @keyframes blink { 50% { opacity: 0; } }
-</style>
+<link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
 
+<header class="bar">
+  <b>LLM чат</b>
+  <span class="grow"></span>
+  <span class="who" id="who"></span>
+  <a class="btn ghost small" href="/admin" id="adminLink" hidden>Пользователи</a>
+  <a class="btn ghost small" href="/auth/logout">Выйти</a>
+</header>
+
+<div class="app">
 <aside>
-  <h1>LLM чат</h1>
+  <h1>Параметры</h1>
   <div class="sub">Стриминг ответа + ограничения на лету</div>
 
   <fieldset>
@@ -127,11 +54,12 @@
 
 <main>
   <div id="log"><div class="empty">Задайте вопрос — ответ придёт потоком.</div></div>
-  <form id="form">
+  <form id="form" class="composer">
     <textarea id="prompt" placeholder="Ваш вопрос…  (Enter — отправить, Shift+Enter — перенос строки)"></textarea>
     <button id="send" type="submit">Отправить</button>
   </form>
 </main>
+</div>
 
 <script>
 const $ = id => document.getElementById(id);
@@ -139,11 +67,18 @@ const log = $("log");
 let history = [];      // диалог живёт только в памяти вкладки
 let busy = false;
 
+// ---------- кто вошёл ----------
+fetch("/api/me").then(r => r.json()).then(me => {
+  if (!me.authenticated) { location.href = "/login"; return; }
+  if (me.status !== "approved") { location.href = "/pending"; return; }
+  $("who").append("Вы: ", Object.assign(document.createElement("b"), { textContent: me.login }));
+  if (me.is_admin) $("adminLink").hidden = false;
+});
+
 // ---------- начальная конфигурация ----------
 fetch("/api/config").then(r => r.json()).then(cfg => {
   cfg.models.forEach(m => {
-    const o = new Option(m, m, m === cfg.default_model, m === cfg.default_model);
-    $("model").add(o);
+    $("model").add(new Option(m, m, m === cfg.default_model, m === cfg.default_model));
   });
   cfg.formats.forEach(f => $("format").add(new Option(f.label, f.id)));
 }).catch(() => {
@@ -201,6 +136,8 @@ async function send(text) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ messages: history, constraints: constraints() }),
     });
+    if (res.status === 401) { location.href = "/login"; return; }
+    if (res.status === 403) { location.href = "/pending"; return; }
     if (!res.ok) throw new Error("HTTP " + res.status);
 
     const reader = res.body.getReader();
