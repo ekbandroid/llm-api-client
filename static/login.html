@@ -10,22 +10,53 @@
 <div class="center">
   <div class="card">
     <h1>LLM чат</h1>
-    <p>Войдите через Яндекс. Доступ к чату открывает администратор после подтверждения.</p>
-    <a class="btn" href="/auth/login" id="loginBtn">Войти через Яндекс</a>
-    <div class="notice" id="notConfigured" hidden>
-      Яндекс OAuth не настроен: в <code>.env</code> пустые
-      <code>YANDEX_CLIENT_ID</code> и <code>YANDEX_CLIENT_SECRET</code>.
-      Заведите приложение на <b>oauth.yandex.ru</b> и впишите ключи.
+    <p>Войдите, чтобы продолжить. Доступ к чату открывает администратор.</p>
+
+    <div class="formerror" id="err" hidden></div>
+
+    <form id="form">
+      <label><span>Логин</span><input type="text" id="login" autocomplete="username" autofocus required></label>
+      <label><span>Пароль</span><input type="password" id="password" autocomplete="current-password" required></label>
+      <button type="submit" id="submit">Войти</button>
+    </form>
+
+    <div class="alt">
+      Нет аккаунта? <a href="/register">Зарегистрироваться</a>
+      <a class="btn ghost" href="/auth/yandex" id="yandex" hidden>Войти через Яндекс</a>
     </div>
   </div>
 </div>
+
 <script>
+const $ = id => document.getElementById(id);
+
 fetch("/api/me").then(r => r.json()).then(me => {
-  if (!me.oauth_configured) {
-    document.getElementById("notConfigured").hidden = false;
-    const btn = document.getElementById("loginBtn");
-    btn.style.opacity = ".5";
-    btn.style.pointerEvents = "none";
+  if (me.authenticated) { location.href = "/"; return; }
+  if (me.oauth_configured) $("yandex").hidden = false;
+});
+
+function fail(text) {
+  $("err").textContent = text;
+  $("err").hidden = false;
+}
+
+$("form").addEventListener("submit", async e => {
+  e.preventDefault();
+  $("err").hidden = true;
+  $("submit").disabled = true;
+  try {
+    const res = await fetch("/api/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ login: $("login").value, password: $("password").value }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) { fail(body.detail || `Ошибка ${res.status}`); return; }
+    location.href = body.redirect || "/";
+  } catch (err) {
+    fail("Сбой сети: " + err.message);
+  } finally {
+    $("submit").disabled = false;
   }
 });
 </script>

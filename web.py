@@ -225,6 +225,13 @@ async def login_page(request: Request):
     return FileResponse(STATIC / "login.html")
 
 
+@app.get("/register")
+async def register_page(request: Request):
+    if current_user(request):
+        return RedirectResponse("/", status_code=302)
+    return FileResponse(STATIC / "register.html")
+
+
 @app.get("/pending")
 async def pending_page(request: Request):
     user = current_user(request)
@@ -245,10 +252,72 @@ async def admin_page(request: Request):
     return FileResponse(STATIC / "admin.html")
 
 
+# ---------- вход по логину и паролю ----------
+
+class Credentials(BaseModel):
+    login: str
+    password: str
+    email: str = ""
+    name: str = ""
+
+
+def _finish_login(request: Request, user: dict) -> dict:
+    """Заводит сессию и говорит странице, куда идти дальше."""
+    request.session["user_id"] = user["id"]
+    return {
+        "ok": True,
+        "redirect": "/" if user["status"] == db.APPROVED else "/pending",
+        "status": user["status"],
+    }
+
+
+@app.post("/api/auth/register")
+def api_register(request: Request, creds: Credentials) -> dict:
+    """Регистрирует нового пользователя со статусом «ожидает подтверждения».
+
+    Синхронный def — FastAPI уводит его в пул потоков, и scrypt не блокирует
+    событийный цикл на время хеширования.
+    """
+    login = creds.login.strip()
+    if error := auth.validate_credentials(login, creds.password):
+        raise HTTPException(400, error)
+
+    is_admin = login.lower() in auth.admin_logins()
+    user = db.create_user(
+        login,
+        auth.hash_password(creds.password),
+        email=creds.email.strip(),
+        name=creds.name.strip(),
+        is_admin=is_admin,
+    )
+    if user is None:
+        raise HTTPException(409, "Такой логин уже занят")
+    return _finish_login(request, user)
+
+
+@app.post("/api/auth/login")
+def api_login(request: Request, creds: Credentials) -> dict:
+    """Проверяет логин и пароль."""
+    login = creds.login.strip()
+
+    if wait := auth.throttle_check(login):
+        raise HTTPException(429, f"Слишком много попыток. Повторите через {wait} с.")
+
+    user = db.get_by_login(login)
+    if user is None or not auth.verify_password(creds.password, user["password_hash"]):
+        auth.throttle_fail(login)
+        # Одна формулировка на оба случая: иначе форма подскажет, какие логины заняты.
+        raise HTTPException(401, "Неверный логин или пароль")
+
+    auth.throttle_reset(login)
+    db.touch_login(user["id"])
+    return _finish_login(request, user)
+
+
 # ---------- OAuth ----------
 
-@app.get("/auth/login")
-async def auth_login(request: Request):
+@app.get("/auth/yandex")
+async def auth_yandex(request: Request):
     """Отправляет пользователя на страницу входа Яндекса."""
     if not auth.is_configured():
         raise HTTPException(
@@ -315,9 +384,16 @@ class StatusUpdate(BaseModel):
     status: str
 
 
+def _public_user(user: dict) -> dict:
+    """Убирает из записи хеш пароля — наружу он не должен попадать никогда."""
+    safe = {k: v for k, v in user.items() if k != "password_hash"}
+    safe["has_password"] = bool(user.get("password_hash"))
+    return safe
+
+
 @app.get("/api/admin/users")
 async def admin_users(_: dict = Depends(require_admin)) -> dict:
-    return {"users": db.list_all()}
+    return {"users": [_public_user(u) for u in db.list_all()]}
 
 
 @app.post("/api/admin/users/{user_id}/status")
@@ -331,4 +407,4 @@ async def admin_set_status(
         raise HTTPException(400, "Нельзя снять доступ у самого себя")
     if not db.set_status(user_id, update.status):
         raise HTTPException(404, "Пользователь не найден")
-    return {"ok": True, "user": db.get(user_id)}
+    return {"ok": True, "user": _public_user(db.get(user_id))}

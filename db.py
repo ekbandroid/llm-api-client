@@ -10,11 +10,14 @@ DB_PATH = Path(os.getenv("DB_PATH", "app.db"))
 PENDING, APPROVED, BLOCKED = "pending", "approved", "blocked"
 STATUSES = (PENDING, APPROVED, BLOCKED)
 
+# login COLLATE NOCASE — «Ivan» и «ivan» это один и тот же пользователь.
+# password_hash пуст у входа через Яндекс, yandex_id — у входа по паролю.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    yandex_id     TEXT    NOT NULL UNIQUE,
-    login         TEXT    NOT NULL,
+    login         TEXT    NOT NULL UNIQUE COLLATE NOCASE,
+    password_hash TEXT,
+    yandex_id     TEXT    UNIQUE,
     email         TEXT,
     name          TEXT,
     status        TEXT    NOT NULL DEFAULT 'pending',
@@ -23,6 +26,10 @@ CREATE TABLE IF NOT EXISTS users (
     last_login_at TEXT
 );
 """
+
+
+class SchemaError(RuntimeError):
+    """База создана прежней версией приложения."""
 
 
 def connect() -> sqlite3.Connection:
@@ -35,17 +42,78 @@ def connect() -> sqlite3.Connection:
 
 
 def init() -> None:
-    """Создаёт таблицы, если их ещё нет."""
+    """Создаёт таблицы, если их ещё нет, и проверяет совместимость схемы."""
     with connect() as conn:
         conn.executescript(SCHEMA)
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(users)")}
+    missing = {"login", "password_hash", "status", "is_admin"} - columns
+    if missing:
+        raise SchemaError(
+            f"В таблице users нет колонок: {', '.join(sorted(missing))}. "
+            f"База {DB_PATH} создана прежней версией — удалите её и запустите заново."
+        )
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _fetch(conn: sqlite3.Connection, where: str, value) -> dict | None:
+    row = conn.execute(f"SELECT * FROM users WHERE {where}", (value,)).fetchone()
+    return dict(row) if row else None
+
+
+# ---------- вход по логину и паролю ----------
+
+def create_user(
+    login: str, password_hash: str, *, email: str = "", name: str = "", is_admin: bool = False
+) -> dict:
+    """Заводит пользователя. Возвращает None, если логин уже занят."""
+    with connect() as conn:
+        if _fetch(conn, "login = ?", login):
+            return None
+        conn.execute(
+            "INSERT INTO users (login, password_hash, email, name, status, is_admin,"
+            " created_at, last_login_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                login,
+                password_hash,
+                email or None,
+                name or login,
+                APPROVED if is_admin else PENDING,
+                int(is_admin),
+                _now(),
+                _now(),
+            ),
+        )
+        return _fetch(conn, "login = ?", login)
+
+
+def get_by_login(login: str) -> dict | None:
+    """Ищет пользователя по логину без учёта регистра."""
+    with connect() as conn:
+        return _fetch(conn, "login = ?", login)
+
+
+def set_password(user_id: int, password_hash: str) -> bool:
+    """Меняет пароль. Возвращает False, если пользователь не найден."""
+    with connect() as conn:
+        cur = conn.execute(
+            "UPDATE users SET password_hash = ? WHERE id = ?", (password_hash, user_id)
+        )
+    return cur.rowcount > 0
+
+
+def touch_login(user_id: int) -> None:
+    """Отмечает момент успешного входа."""
+    with connect() as conn:
+        conn.execute("UPDATE users SET last_login_at = ? WHERE id = ?", (_now(), user_id))
+
+
+# ---------- вход через Яндекс ----------
+
 def upsert_from_yandex(profile: dict, *, admin_logins: set[str]) -> dict:
-    """Создаёт или обновляет пользователя по профилю Яндекса, возвращает его запись.
+    """Создаёт или обновляет пользователя по профилю Яндекса.
 
     Новый пользователь получает статус pending — доступ подтверждает админ.
     Логины из admin_logins сразу становятся админами с доступом.
@@ -57,17 +125,18 @@ def upsert_from_yandex(profile: dict, *, admin_logins: set[str]) -> dict:
     is_admin = 1 if login.lower() in admin_logins else 0
 
     with connect() as conn:
-        existing = conn.execute(
-            "SELECT * FROM users WHERE yandex_id = ?", (yandex_id,)
-        ).fetchone()
+        existing = _fetch(conn, "yandex_id = ?", yandex_id)
 
         if existing is None:
+            # Логин мог быть занят аккаунтом с паролем — тогда разводим суффиксом.
+            if _fetch(conn, "login = ?", login):
+                login = f"{login}@yandex"
             conn.execute(
-                "INSERT INTO users (yandex_id, login, email, name, status, is_admin,"
+                "INSERT INTO users (login, yandex_id, email, name, status, is_admin,"
                 " created_at, last_login_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    yandex_id,
                     login,
+                    yandex_id,
                     email,
                     name,
                     APPROVED if is_admin else PENDING,
@@ -80,21 +149,20 @@ def upsert_from_yandex(profile: dict, *, admin_logins: set[str]) -> dict:
             # Профиль мог измениться; статус трогаем только для админов из конфига.
             status = APPROVED if is_admin else existing["status"]
             conn.execute(
-                "UPDATE users SET login = ?, email = ?, name = ?, is_admin = ?,"
-                " status = ?, last_login_at = ? WHERE yandex_id = ?",
-                (login, email, name, is_admin, status, _now(), yandex_id),
+                "UPDATE users SET email = ?, name = ?, is_admin = ?, status = ?,"
+                " last_login_at = ? WHERE yandex_id = ?",
+                (email, name, is_admin, status, _now(), yandex_id),
             )
 
-        return dict(conn.execute(
-            "SELECT * FROM users WHERE yandex_id = ?", (yandex_id,)
-        ).fetchone())
+        return _fetch(conn, "yandex_id = ?", yandex_id)
 
+
+# ---------- общее ----------
 
 def get(user_id: int) -> dict | None:
     """Возвращает пользователя по внутреннему id."""
     with connect() as conn:
-        row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
-    return dict(row) if row else None
+        return _fetch(conn, "id = ?", user_id)
 
 
 def list_all() -> list[dict]:

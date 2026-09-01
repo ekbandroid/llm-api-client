@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Регистрация — LLM чат</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="center">
+  <div class="card">
+    <h1>Регистрация</h1>
+    <p>После регистрации доступ к чату откроет администратор — какое-то время аккаунт будет ждать подтверждения.</p>
+
+    <div class="formerror" id="err" hidden></div>
+
+    <form id="form">
+      <label><span>Логин</span><input type="text" id="login" autocomplete="username" autofocus required></label>
+      <label><span>Пароль (от 8 символов)</span><input type="password" id="password" autocomplete="new-password" required></label>
+      <label><span>Имя — необязательно</span><input type="text" id="name" autocomplete="name"></label>
+      <label><span>Email — необязательно</span><input type="text" id="email" autocomplete="email"></label>
+      <button type="submit" id="submit">Зарегистрироваться</button>
+    </form>
+
+    <div class="alt">Уже есть аккаунт? <a href="/login">Войти</a></div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+function fail(text) {
+  $("err").textContent = text;
+  $("err").hidden = false;
+}
+
+$("form").addEventListener("submit", async e => {
+  e.preventDefault();
+  $("err").hidden = true;
+  $("submit").disabled = true;
+  try {
+    const res = await fetch("/api/auth/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        login: $("login").value,
+        password: $("password").value,
+        name: $("name").value,
+        email: $("email").value,
+      }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) { fail(body.detail || `Ошибка ${res.status}`); return; }
+    location.href = body.redirect || "/pending";
+  } catch (err) {
+    fail("Сбой сети: " + err.message);
+  } finally {
+    $("submit").disabled = false;
+  }
+});
+</script>
+</body>
+</html>
