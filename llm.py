@@ -1,9 +1,12 @@
-"""Клиент к LLM по OpenAI-совместимому API."""
+"""Клиент к LLM по OpenAI-совместимому API: синхронный вызов и потоковый."""
 
+import json
 import os
 import time
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
+import httpx
 import requests
 from dotenv import load_dotenv
 
@@ -39,7 +42,7 @@ class Completion:
         return self.finish_reason == "length"
 
 
-def complete(
+def build_payload(
     messages: list[dict],
     *,
     model: str | None = None,
@@ -47,16 +50,8 @@ def complete(
     stop: list[str] | None = None,
     thinking: bool | None = None,
     temperature: float | None = None,
-    timeout: int = 120,
-) -> Completion:
-    """Отправляет историю сообщений в API и возвращает ответ с телеметрией.
-
-    max_tokens — жёсткий потолок генерации на стороне API.
-    stop — стоп-последовательности: API обрывает генерацию, не включая их в ответ.
-    """
-    if not API_KEY:
-        raise LLMError("Не задан LLM_API_KEY. Скопируйте .env.example в .env и впишите ключ.")
-
+) -> dict:
+    """Собирает тело запроса к /chat/completions."""
     use_thinking = THINKING if thinking is None else thinking
     payload: dict = {"model": model or MODEL, "messages": messages}
     if use_thinking:
@@ -72,14 +67,23 @@ def complete(
         payload["stop"] = stop
     if temperature is not None:
         payload["temperature"] = temperature
+    return payload
+
+
+def _headers() -> dict:
+    if not API_KEY:
+        raise LLMError("Не задан LLM_API_KEY. Скопируйте .env.example в .env и впишите ключ.")
+    return {"Authorization": f"Bearer {API_KEY}"}
+
+
+def complete(messages: list[dict], *, timeout: int = 120, **options) -> Completion:
+    """Синхронный вызов: ждёт ответ целиком и возвращает его с телеметрией."""
+    payload = build_payload(messages, **options)
 
     started = time.monotonic()
     try:
         response = requests.post(
-            f"{BASE_URL}/chat/completions",
-            headers={"Authorization": f"Bearer {API_KEY}"},
-            json=payload,
-            timeout=timeout,
+            f"{BASE_URL}/chat/completions", headers=_headers(), json=payload, timeout=timeout
         )
         response.raise_for_status()
     except requests.HTTPError as err:
@@ -100,3 +104,62 @@ def complete(
         total_tokens=usage.get("total_tokens", 0),
         elapsed=elapsed,
     )
+
+
+async def stream(
+    messages: list[dict], *, timeout: int = 300, **options
+) -> AsyncIterator[dict]:
+    """Потоковый вызов: отдаёт куски ответа по мере генерации.
+
+    Генерирует события:
+      {"type": "reasoning", "text": ...} — кусок рассуждения (если thinking включён);
+      {"type": "content",   "text": ...} — кусок ответа;
+      {"type": "done", "finish_reason": ..., "usage": {...}, "elapsed": ...}.
+    """
+    payload = build_payload(messages, **options)
+    payload["stream"] = True
+    payload["stream_options"] = {"include_usage": True}
+
+    started = time.monotonic()
+    finish_reason = "unknown"
+    usage: dict = {}
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            async with client.stream(
+                "POST", f"{BASE_URL}/chat/completions", headers=_headers(), json=payload
+            ) as response:
+                if response.status_code != 200:
+                    detail = (await response.aread()).decode("utf-8", "replace")
+                    raise LLMError(f"Ошибка API {response.status_code}: {detail}")
+
+                async for line in response.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+
+                    if chunk.get("usage"):
+                        usage = chunk["usage"]
+                    for choice in chunk.get("choices") or []:
+                        if choice.get("finish_reason"):
+                            finish_reason = choice["finish_reason"]
+                        delta = choice.get("delta") or {}
+                        if reasoning := delta.get("reasoning_content"):
+                            yield {"type": "reasoning", "text": reasoning}
+                        if content := delta.get("content"):
+                            yield {"type": "content", "text": content}
+    except httpx.HTTPError as err:
+        raise LLMError(f"Ошибка сети: {err}") from err
+
+    yield {
+        "type": "done",
+        "finish_reason": finish_reason,
+        "usage": usage,
+        "elapsed": round(time.monotonic() - started, 2),
+    }

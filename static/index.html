@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LLM чат</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --border: #dfe3e8; --text: #1a1d21;
+    --muted: #6b7280; --accent: #16a34a; --accent-soft: #eaf7ee;
+    --user: #eef2ff; --warn: #b45309; --warn-soft: #fef3c7; --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14161a; --panel: #1c1f24; --border: #2c3138; --text: #e6e8ea;
+      --muted: #9aa3ad; --accent: #4ade80; --accent-soft: #16281c;
+      --user: #1e2533; --warn: #fbbf24; --warn-soft: #2c2313;
+    }
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: grid; grid-template-columns: 320px 1fr; height: 100vh;
+  }
+  @media (max-width: 860px) { body { grid-template-columns: 1fr; height: auto; } }
+
+  aside {
+    background: var(--panel); border-right: 1px solid var(--border);
+    padding: 20px; overflow-y: auto;
+  }
+  aside h1 { font-size: 16px; margin: 0 0 4px; }
+  aside .sub { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  fieldset { border: 1px solid var(--border); border-radius: 8px; padding: 12px; margin: 0 0 14px; }
+  legend { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; padding: 0 6px; }
+  label { display: block; font-size: 13px; margin-bottom: 10px; }
+  label span { display: block; color: var(--muted); margin-bottom: 4px; }
+  label:last-child { margin-bottom: 0; }
+  select, input[type=text], input[type=number], textarea {
+    width: 100%; padding: 7px 9px; border: 1px solid var(--border); border-radius: 6px;
+    background: var(--bg); color: var(--text); font: inherit; font-size: 13px;
+  }
+  textarea { font-family: var(--mono); font-size: 12px; resize: vertical; min-height: 90px; }
+  .row { display: flex; gap: 10px; }
+  .row label { flex: 1; }
+  .check { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+  .check input { margin: 0; }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 6px; }
+
+  main { display: flex; flex-direction: column; min-width: 0; height: 100vh; }
+  @media (max-width: 860px) { main { height: 80vh; } }
+  #log { flex: 1; overflow-y: auto; padding: 24px; display: flex; flex-direction: column; gap: 16px; }
+  .msg { max-width: 780px; }
+  .msg .who { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  .msg .body {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 12px 14px; white-space: pre-wrap; word-wrap: break-word;
+  }
+  .msg.user .body { background: var(--user); }
+  details { margin-top: 8px; }
+  details summary { cursor: pointer; font-size: 12px; color: var(--muted); }
+  details pre {
+    margin: 8px 0 0; padding: 10px; background: var(--bg); border: 1px solid var(--border);
+    border-radius: 6px; font-family: var(--mono); font-size: 12px; white-space: pre-wrap; color: var(--muted);
+  }
+  .stats {
+    margin-top: 8px; font-family: var(--mono); font-size: 12px; color: var(--muted);
+    display: flex; flex-wrap: wrap; gap: 12px;
+  }
+  .stats b { font-weight: 600; color: var(--text); }
+  .truncated {
+    margin-top: 8px; padding: 8px 10px; border-radius: 6px;
+    background: var(--warn-soft); color: var(--warn); font-size: 13px;
+  }
+  .error { border-color: var(--warn); color: var(--warn); }
+  .empty { color: var(--muted); text-align: center; margin-top: 40px; font-size: 14px; }
+
+  form { border-top: 1px solid var(--border); background: var(--panel); padding: 14px 24px; display: flex; gap: 10px; }
+  #prompt { flex: 1; min-height: 44px; max-height: 180px; font-family: inherit; font-size: 14px; }
+  button {
+    padding: 0 20px; border: 0; border-radius: 6px; background: var(--accent); color: #052e14;
+    font: inherit; font-weight: 600; cursor: pointer; white-space: nowrap;
+  }
+  button:disabled { opacity: .5; cursor: default; }
+  button.ghost { background: transparent; color: var(--muted); border: 1px solid var(--border); font-weight: 400; }
+  .cursor::after { content: "▌"; color: var(--accent); animation: blink 1s steps(2) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+</style>
+</head>
+<body>
+
+<aside>
+  <h1>LLM чат</h1>
+  <div class="sub">Стриминг ответа + ограничения на лету</div>
+
+  <fieldset>
+    <legend>Модель</legend>
+    <label><span>Название</span><select id="model"></select></label>
+    <div class="check"><input type="checkbox" id="thinking"><label for="thinking" style="margin:0">Режим thinking</label></div>
+    <div class="hint">При включённом thinking рассуждение расходует бюджет <code>max_tokens</code> наравне с ответом.</div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Формат ответа</legend>
+    <label><span>Пресет</span><select id="format"></select></label>
+    <label id="customWrap" hidden><span>Своя инструкция</span><textarea id="customFormat" placeholder="Опишите требуемый формат ответа"></textarea></label>
+  </fieldset>
+
+  <fieldset>
+    <legend>Длина</legend>
+    <div class="row">
+      <label><span>Лимит слов</span><input type="number" id="wordLimit" min="1" max="5000" placeholder="без лимита"></label>
+      <label><span>max_tokens</span><input type="number" id="maxTokens" min="1" max="8192" placeholder="без лимита"></label>
+    </div>
+    <div class="hint">Слова — инструкция модели, <code>max_tokens</code> — жёсткий обрыв на стороне API.</div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Завершение</legend>
+    <label><span>Стоп-последовательность</span><input type="text" id="stop" placeholder="например ###END###"></label>
+    <div class="hint">Передаётся в <code>stop</code> и добавляется инструкцией в системный промпт.</div>
+  </fieldset>
+
+  <button class="ghost" id="clear" style="width:100%">Очистить диалог</button>
+</aside>
+
+<main>
+  <div id="log"><div class="empty">Задайте вопрос — ответ придёт потоком.</div></div>
+  <form id="form">
+    <textarea id="prompt" placeholder="Ваш вопрос…  (Enter — отправить, Shift+Enter — перенос строки)"></textarea>
+    <button id="send" type="submit">Отправить</button>
+  </form>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const log = $("log");
+let history = [];      // диалог живёт только в памяти вкладки
+let busy = false;
+
+// ---------- начальная конфигурация ----------
+fetch("/api/config").then(r => r.json()).then(cfg => {
+  cfg.models.forEach(m => {
+    const o = new Option(m, m, m === cfg.default_model, m === cfg.default_model);
+    $("model").add(o);
+  });
+  cfg.formats.forEach(f => $("format").add(new Option(f.label, f.id)));
+}).catch(() => {
+  $("model").add(new Option("(не удалось загрузить список)", ""));
+});
+
+$("format").addEventListener("change", e => {
+  $("customWrap").hidden = e.target.value !== "custom";
+});
+
+// ---------- отрисовка ----------
+function addMessage(role, who) {
+  if (log.querySelector(".empty")) log.innerHTML = "";
+  const el = document.createElement("div");
+  el.className = "msg " + role;
+  el.innerHTML = `<div class="who"></div><div class="body"></div>`;
+  el.querySelector(".who").textContent = who;
+  log.appendChild(el);
+  log.scrollTop = log.scrollHeight;
+  return el;
+}
+
+function num(v) { return v === "" || v === null ? null : Number(v); }
+
+function constraints() {
+  return {
+    model: $("model").value || null,
+    format_preset: $("format").value || "free",
+    custom_format: $("customFormat").value,
+    word_limit: num($("wordLimit").value),
+    max_tokens: num($("maxTokens").value),
+    stop: $("stop").value,
+    thinking: $("thinking").checked,
+  };
+}
+
+// ---------- отправка ----------
+async function send(text) {
+  if (busy) return;
+  busy = true;
+  $("send").disabled = true;
+
+  addMessage("user", "Вы").querySelector(".body").textContent = text;
+  history.push({ role: "user", content: text });
+
+  const el = addMessage("assistant", "Модель");
+  const body = el.querySelector(".body");
+  body.classList.add("cursor");
+
+  let answer = "", reasoning = "", reasoningBox = null;
+
+  try {
+    const res = await fetch("/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ messages: history, constraints: constraints() }),
+    });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const parts = buf.split("\n\n");
+      buf = parts.pop();
+
+      for (const part of parts) {
+        if (!part.startsWith("data: ")) continue;
+        const ev = JSON.parse(part.slice(6));
+
+        if (ev.type === "meta") {
+          const d = document.createElement("details");
+          d.innerHTML = `<summary>Системный промпт (${ev.model})</summary><pre></pre>`;
+          d.querySelector("pre").textContent = ev.system;
+          el.appendChild(d);
+        } else if (ev.type === "reasoning") {
+          if (!reasoningBox) {
+            const d = document.createElement("details");
+            d.innerHTML = `<summary>Рассуждение</summary><pre></pre>`;
+            el.insertBefore(d, body);
+            reasoningBox = d.querySelector("pre");
+          }
+          reasoning += ev.text;
+          reasoningBox.textContent = reasoning;
+        } else if (ev.type === "content") {
+          answer += ev.text;
+          body.textContent = answer;
+          log.scrollTop = log.scrollHeight;
+        } else if (ev.type === "error") {
+          body.classList.add("error");
+          body.textContent = ev.message;
+        } else if (ev.type === "done") {
+          const u = ev.usage || {};
+          const stats = document.createElement("div");
+          stats.className = "stats";
+          stats.innerHTML =
+            `<span>finish_reason <b>${ev.finish_reason}</b></span>` +
+            `<span>токенов ответа <b>${u.completion_tokens ?? "—"}</b></span>` +
+            `<span>всего <b>${u.total_tokens ?? "—"}</b></span>` +
+            `<span>слов <b>${answer.trim() ? answer.trim().split(/\s+/).length : 0}</b></span>` +
+            `<span>время <b>${ev.elapsed} с</b></span>`;
+          el.appendChild(stats);
+          if (ev.finish_reason === "length") {
+            const w = document.createElement("div");
+            w.className = "truncated";
+            w.textContent = "Генерация оборвана лимитом max_tokens — ответ не дописан. " +
+              (reasoning ? "Часть бюджета ушла на рассуждение." : "");
+            el.appendChild(w);
+          }
+        }
+      }
+    }
+    if (answer) history.push({ role: "assistant", content: answer });
+  } catch (err) {
+    body.classList.add("error");
+    body.textContent = "Сбой запроса: " + err.message;
+  } finally {
+    body.classList.remove("cursor");
+    busy = false;
+    $("send").disabled = false;
+    log.scrollTop = log.scrollHeight;
+  }
+}
+
+// ---------- события ----------
+$("form").addEventListener("submit", e => {
+  e.preventDefault();
+  const text = $("prompt").value.trim();
+  if (!text) return;
+  $("prompt").value = "";
+  send(text);
+});
+
+$("prompt").addEventListener("keydown", e => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("form").requestSubmit(); }
+});
+
+$("clear").addEventListener("click", () => {
+  history = [];
+  log.innerHTML = '<div class="empty">Задайте вопрос — ответ придёт потоком.</div>';
+});
+</script>
+</body>
+</html>
