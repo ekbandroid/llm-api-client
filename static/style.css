@@ -167,3 +167,19 @@ td.actions button { margin-left: 6px; }
 .waiting { color: var(--muted); font-size: 14px; padding: 14px 0; }
 .summary { margin-top: 26px; }
 .summary h2 { font-size: 16px; margin: 0 0 12px; }
+
+/* ---------- режим сравнения температур ---------- */
+.tcard { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px; margin-bottom: 14px; }
+.tcard h3 { margin: 0 0 12px; font-size: 15px; font-family: var(--mono); }
+.tcard h3 .tag { font-family: system-ui, sans-serif; font-size: 12px; color: var(--muted); font-weight: 400; margin-left: 8px; }
+.sample { padding: 10px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; margin-bottom: 8px; font-size: 14px; white-space: pre-wrap; }
+.sample .n { display: block; font-size: 11px; color: var(--muted); font-family: var(--mono); margin-bottom: 4px; }
+.sample.ok { border-left: 3px solid var(--accent); }
+.sample.no { border-left: 3px solid var(--danger); }
+.bar { height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; min-width: 60px; }
+.bar > i { display: block; height: 100%; background: var(--accent); }
+.guide { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 18px; margin-top: 22px; }
+.guide h2 { font-size: 16px; margin: 0 0 12px; }
+.guide dt { font-family: var(--mono); font-weight: 600; margin-top: 12px; }
+.guide dt:first-of-type { margin-top: 0; }
+.guide dd { margin: 4px 0 0; color: var(--muted); font-size: 14px; }

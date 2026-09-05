@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Температура — LLM чат</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="bar">
+  <a href="/">← К чату</a>
+  <b>Температура</b>
+  <span class="grow"></span>
+  <span class="who" id="who"></span>
+  <a class="btn ghost small" href="/admin" id="adminLink" hidden>Пользователи</a>
+  <a class="btn ghost small" href="/auth/logout">Выйти</a>
+</header>
+
+<div class="wrap wide">
+  <h1>Один запрос при разной температуре</h1>
+  <div class="sub">Каждая температура прогоняется несколько раз: по одному ответу разнообразие измерить не с чем. Thinking выключен, чтобы рассуждение не сглаживало влияние параметра.</div>
+
+  <div class="setup">
+    <label><span>Запрос</span><textarea id="prompt" placeholder="Что спросить у модели" autofocus></textarea></label>
+    <div class="row" style="margin-bottom:12px">
+      <label><span>Эталонный ответ — для оценки точности, необязательно</span><input type="text" id="reference" placeholder="например 2007"></label>
+      <label style="flex:0 0 130px"><span>Выборок</span><input type="number" id="samples" value="3" min="1" max="8"></label>
+      <label style="flex:0 0 190px"><span>Температуры</span><input type="text" id="temps" value="0, 0.7, 1.2"></label>
+    </div>
+    <div class="go">
+      <button id="run">Сравнить</button>
+      <span class="progress" id="progress"></span>
+    </div>
+  </div>
+
+  <div id="results"></div>
+
+  <div class="summary" id="summary" hidden>
+    <h2>Сравнение</h2>
+    <table>
+      <thead><tr><th>t</th><th>Точность</th><th>Разных ответов</th><th>Разнообразие</th><th>Уник. слов</th><th>Слов</th><th>Токенов</th></tr></thead>
+      <tbody id="summaryRows"></tbody>
+    </table>
+    <div class="hint" id="conclusion"></div>
+  </div>
+
+  <div class="guide">
+    <h2>Для каких задач какая температура</h2>
+    <dl>
+      <dt>0 — низкая</dt>
+      <dd>Извлечение фактов, классификация, разбор текста в структуру, генерация кода, любые задачи с единственным правильным ответом. Там, где ответ должен воспроизводиться: тесты, кэширование, сверка результатов между запусками.</dd>
+      <dt>0.7 — средняя</dt>
+      <dd>Разговор, объяснения, переписывание текста, черновики. Формулировки живые, но модель не уходит от сути. Разумное значение по умолчанию, когда не понятно, что выбрать.</dd>
+      <dt>1.2 — высокая</dt>
+      <dd>Мозговой штурм, названия и слоганы, варианты сюжета — всё, где нужен перебор непохожих вариантов, а не один точный. Цена — растущий риск выдумок: факты при высокой температуре проверять обязательно.</dd>
+    </dl>
+    <div class="hint" style="margin-top:14px">Температура 0 не гарантирует одинаковый ответ. Она убирает случайность выбора токена, но не устраняет расхождения на стороне провайдера — на длинных ответах выборки при 0 расходятся, что видно в таблице выше.</div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let results = [], busy = false;
+
+fetch("/api/me").then(r => r.json()).then(me => {
+  if (!me.authenticated) { location.href = "/login"; return; }
+  if (me.status !== "approved") { location.href = "/pending"; return; }
+  $("who").append("Вы: ", Object.assign(document.createElement("b"), { textContent: me.login }));
+  if (me.is_admin) $("adminLink").hidden = false;
+});
+
+const el = (tag, cls, text) => {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text !== undefined) n.textContent = text;
+  return n;
+};
+const pct = v => v === null ? "—" : `${Math.round(v * 100)}%`;
+
+function renderTemp(ev) {
+  const box = el("div", "tcard");
+  const h = el("h3");
+  h.append(`temperature = ${ev.temperature}`);
+  h.appendChild(el("span", "tag", `${ev.samples.length} выборок · ${ev.total_tokens} токенов · ${ev.elapsed} с`));
+  box.appendChild(h);
+
+  ev.samples.forEach((s, i) => {
+    const d = el("div", "sample " + (s.correct === true ? "ok" : s.correct === false ? "no" : ""));
+    d.appendChild(el("span", "n", `выборка ${i + 1}` + (s.correct === true ? " · верно" : s.correct === false ? " · неверно" : "")));
+    d.append(s.text);
+    box.appendChild(d);
+  });
+
+  const stats = el("div", "stats");
+  stats.innerHTML =
+    `<span>точность <b>${pct(ev.accuracy)}</b></span>` +
+    `<span>разных ответов <b>${ev.unique}</b></span>` +
+    `<span>разнообразие <b>${ev.diversity}</b></span>` +
+    `<span>уник. слов <b>${ev.lexical_richness}</b></span>`;
+  box.appendChild(stats);
+  $("results").appendChild(box);
+}
+
+function renderSummary() {
+  const tbody = $("summaryRows");
+  tbody.innerHTML = "";
+  for (const r of results) {
+    const tr = el("tr");
+    tr.appendChild(el("td", "mono", String(r.temperature)));
+    tr.appendChild(el("td", "mono", pct(r.accuracy)));
+    tr.appendChild(el("td", "mono", `${r.unique} из ${r.samples.length}`));
+
+    const div = el("td");
+    const wrap = el("div"); wrap.style.display = "flex"; wrap.style.alignItems = "center"; wrap.style.gap = "8px";
+    const bar = el("div", "bar"); const fill = el("i"); fill.style.width = `${r.diversity * 100}%`; bar.appendChild(fill);
+    wrap.append(bar, Object.assign(el("span", "mono"), { textContent: r.diversity.toFixed(3) }));
+    div.appendChild(wrap); tr.appendChild(div);
+
+    tr.appendChild(el("td", "mono", r.lexical_richness.toFixed(3)));
+    tr.appendChild(el("td", "mono", String(r.avg_words)));
+    tr.appendChild(el("td", "mono", String(r.total_tokens)));
+    tbody.appendChild(tr);
+  }
+
+  const parts = [];
+  const lo = results[0], hi = results[results.length - 1];
+  if (results.length > 1) {
+    const grew = hi.diversity - lo.diversity;
+    parts.push(grew > 0.05
+      ? `Разнообразие растёт с температурой: ${lo.diversity.toFixed(3)} при t=${lo.temperature} против ${hi.diversity.toFixed(3)} при t=${hi.temperature}.`
+      : `Разнообразие почти не изменилось (${lo.diversity.toFixed(3)} → ${hi.diversity.toFixed(3)}) — на коротких ответах температуре негде развернуться.`);
+  }
+  const graded = results.filter(r => r.accuracy !== null);
+  if (graded.length) {
+    const worst = graded.reduce((a, b) => a.accuracy <= b.accuracy ? a : b);
+    const best = graded.reduce((a, b) => a.accuracy >= b.accuracy ? a : b);
+    parts.push(best.accuracy === worst.accuracy
+      ? `Точность одинакова на всех температурах (${pct(best.accuracy)}) — задача для модели простая.`
+      : `Точность выше всего при t=${best.temperature} (${pct(best.accuracy)}), ниже всего при t=${worst.temperature} (${pct(worst.accuracy)}).`);
+  } else {
+    parts.push("Эталон не задан — точность не оценивалась, сравнивались только разброс и формулировки.");
+  }
+  if (lo.diversity > 0) parts.push(`При t=${lo.temperature} ответы тоже не совпали дословно: одинаковый результат температура не гарантирует.`);
+  $("conclusion").textContent = parts.join(" ");
+  $("summary").hidden = false;
+}
+
+$("run").addEventListener("click", async () => {
+  if (busy) return;
+  const prompt = $("prompt").value.trim();
+  if (!prompt) return;
+
+  const temps = $("temps").value.split(",").map(s => parseFloat(s.trim())).filter(n => !isNaN(n));
+  if (!temps.length) { alert("Укажите хотя бы одну температуру"); return; }
+
+  busy = true; $("run").disabled = true;
+  $("results").innerHTML = ""; $("summary").hidden = true; results = [];
+
+  const waiting = el("div", "waiting", "Работаю… каждая температура прогоняется несколько раз, результаты появятся по очереди.");
+  $("results").appendChild(waiting);
+
+  try {
+    const res = await fetch("/api/temperature", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        prompt, reference: $("reference").value.trim(),
+        samples: Number($("samples").value) || 3, temperatures: temps,
+      }),
+    });
+    if (res.status === 401) { location.href = "/login"; return; }
+    if (!res.ok) throw new Error("HTTP " + res.status);
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "", total = temps.length;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const chunks = buf.split("\n\n");
+      buf = chunks.pop();
+      for (const chunk of chunks) {
+        if (!chunk.startsWith("data: ")) continue;
+        const ev = JSON.parse(chunk.slice(6));
+        if (ev.type === "start") { total = ev.total; $("progress").textContent = `0 / ${total}`; }
+        else if (ev.type === "result") {
+          waiting.remove(); results.push(ev); renderTemp(ev);
+          $("progress").textContent = `${results.length} / ${total}`;
+        }
+        else if (ev.type === "error") { waiting.textContent = ev.message; waiting.className = "waiting error"; }
+        else if (ev.type === "done") { $("progress").textContent = "готово"; renderSummary(); }
+      }
+    }
+  } catch (err) {
+    waiting.textContent = "Сбой запроса: " + err.message;
+  } finally {
+    busy = false; $("run").disabled = false;
+  }
+});
+</script>
+</body>
+</html>

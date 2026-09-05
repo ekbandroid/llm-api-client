@@ -19,6 +19,7 @@ import auth
 import db
 import llm
 import reasoning
+import temperature as temperature_mod
 
 STATIC = Path(__file__).parent / "static"
 
@@ -257,6 +258,17 @@ async def reasoning_page(request: Request):
     return FileResponse(STATIC / "reasoning.html")
 
 
+@app.get("/temperature")
+async def temperature_page(request: Request):
+    """Режим сравнения температур — для подтверждённых пользователей."""
+    user = current_user(request)
+    if user is None:
+        return RedirectResponse("/login", status_code=302)
+    if user["status"] != db.APPROVED:
+        return RedirectResponse("/pending", status_code=302)
+    return FileResponse(STATIC / "temperature.html")
+
+
 @app.get("/admin")
 async def admin_page(request: Request):
     user = current_user(request)
@@ -368,6 +380,63 @@ async def api_reasoning(
                 "calls": res.calls,
                 "prompt_tokens": res.prompt_tokens,
                 "completion_tokens": res.completion_tokens,
+                "total_tokens": res.total_tokens,
+                "elapsed": res.elapsed,
+            })
+        yield sse({"type": "done"})
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# ---------- сравнение температур ----------
+
+class TemperatureRequest(BaseModel):
+    prompt: str
+    reference: str = ""
+    samples: int = Field(default=3, ge=1, le=8)
+    temperatures: list[float] = Field(default=[0.0, 0.7, 1.2], max_length=6)
+    model: str | None = None
+
+
+@app.post("/api/temperature")
+async def api_temperature(
+    request: TemperatureRequest, _: dict = Depends(require_approved)
+) -> StreamingResponse:
+    """Гоняет один запрос при разных температурах, отдавая результат по мере готовности."""
+    prompt = request.prompt.strip()
+    if not prompt:
+        raise HTTPException(400, "Запрос не может быть пустым")
+    if any(not 0.0 <= t <= 2.0 for t in request.temperatures):
+        raise HTTPException(400, "Температура должна быть от 0 до 2")
+
+    async def events() -> AsyncIterator[str]:
+        yield sse({"type": "start", "total": len(request.temperatures)})
+        for value in request.temperatures:
+            try:
+                res = await asyncio.to_thread(
+                    temperature_mod.run_temperature, prompt, value,
+                    samples=request.samples, reference=request.reference,
+                    model=request.model,
+                )
+            except llm.LLMError as err:
+                yield sse({"type": "error", "message": str(err)})
+                return
+            yield sse({
+                "type": "result",
+                "temperature": res.temperature,
+                "samples": [
+                    {"text": s.text, "correct": s.correct, "tokens": s.tokens}
+                    for s in res.samples
+                ],
+                "unique": res.unique,
+                "diversity": res.diversity,
+                "lexical_richness": res.lexical_richness,
+                "avg_words": res.avg_words,
+                "accuracy": res.accuracy,
                 "total_tokens": res.total_tokens,
                 "elapsed": res.elapsed,
             })
