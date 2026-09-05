@@ -1,5 +1,6 @@
 """Веб-интерфейс к LLM: потоковый ответ и настройка ограничений из браузера."""
 
+import asyncio
 import json
 import os
 import secrets
@@ -17,6 +18,7 @@ from starlette.middleware.sessions import SessionMiddleware
 import auth
 import db
 import llm
+import reasoning
 
 STATIC = Path(__file__).parent / "static"
 
@@ -244,6 +246,17 @@ async def pending_page(request: Request):
     return FileResponse(STATIC / "pending.html")
 
 
+@app.get("/reasoning")
+async def reasoning_page(request: Request):
+    """Режим сравнения способов рассуждения — для подтверждённых пользователей."""
+    user = current_user(request)
+    if user is None:
+        return RedirectResponse("/login", status_code=302)
+    if user["status"] != db.APPROVED:
+        return RedirectResponse("/pending", status_code=302)
+    return FileResponse(STATIC / "reasoning.html")
+
+
 @app.get("/admin")
 async def admin_page(request: Request):
     user = current_user(request)
@@ -314,6 +327,57 @@ def api_login(request: Request, creds: Credentials) -> dict:
     auth.throttle_reset(login)
     db.touch_login(user["id"])
     return _finish_login(request, user)
+
+
+# ---------- сравнение способов рассуждения ----------
+
+class ReasoningRequest(BaseModel):
+    task: str
+    reference: str = ""
+    model: str | None = None
+
+
+@app.post("/api/reasoning")
+async def api_reasoning(
+    request: ReasoningRequest, _: dict = Depends(require_approved)
+) -> StreamingResponse:
+    """Решает задачу четырьмя способами, отдавая результат каждого по мере готовности."""
+    task = request.task.strip()
+    if not task:
+        raise HTTPException(400, "Задача не может быть пустой")
+
+    async def events() -> AsyncIterator[str]:
+        yield sse({"type": "start", "total": len(reasoning.METHODS)})
+        for method in reasoning.METHODS:
+            try:
+                # Способы синхронные и идут по несколько секунд: в отдельном
+                # потоке, иначе они заблокируют событийный цикл целиком.
+                res = await asyncio.to_thread(method, task, request.model)
+            except llm.LLMError as err:
+                yield sse({"type": "error", "message": str(err)})
+                return
+            yield sse({
+                "type": "result",
+                "key": res.key,
+                "title": res.title,
+                "note": res.note,
+                "answer": res.answer,
+                "extracted": reasoning.extract_answer(res.answer),
+                "correct": reasoning.is_correct(res.answer, request.reference),
+                "stages": [{"title": s.title, "text": s.text} for s in res.stages],
+                "calls": res.calls,
+                "prompt_tokens": res.prompt_tokens,
+                "completion_tokens": res.completion_tokens,
+                "total_tokens": res.total_tokens,
+                "elapsed": res.elapsed,
+            })
+        yield sse({"type": "done"})
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 # ---------- OAuth ----------

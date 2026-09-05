@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Способы рассуждения — LLM чат</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="bar">
+  <a href="/">← К чату</a>
+  <b>Способы рассуждения</b>
+  <span class="grow"></span>
+  <span class="who" id="who"></span>
+  <a class="btn ghost small" href="/admin" id="adminLink" hidden>Пользователи</a>
+  <a class="btn ghost small" href="/auth/logout">Выйти</a>
+</header>
+
+<div class="wrap wide">
+  <h1>Одна задача — четыре способа</h1>
+  <div class="sub">Прямой ответ · пошагово · промпт от самой модели · группа экспертов. Thinking выключен, чтобы единственной переменной остался промпт.</div>
+
+  <div class="setup">
+    <label><span>Задача</span><textarea id="task" placeholder="Условие задачи" autofocus></textarea></label>
+    <div class="go">
+      <label><span>Эталонный ответ — необязательно</span><input type="text" id="reference" placeholder="например 99"></label>
+      <button id="run">Решить четырьмя способами</button>
+      <span class="progress" id="progress"></span>
+    </div>
+  </div>
+
+  <div id="results"></div>
+  <div class="summary" id="summary" hidden>
+    <h2>Сравнение</h2>
+    <table>
+      <thead><tr><th>Способ</th><th>Ответ</th><th>Вердикт</th><th>Вызовов</th><th>Токенов</th><th>Время</th></tr></thead>
+      <tbody id="summaryRows"></tbody>
+    </table>
+    <div class="hint" id="conclusion"></div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let results = [], busy = false;
+
+fetch("/api/me").then(r => r.json()).then(me => {
+  if (!me.authenticated) { location.href = "/login"; return; }
+  if (me.status !== "approved") { location.href = "/pending"; return; }
+  $("who").append("Вы: ", Object.assign(document.createElement("b"), { textContent: me.login }));
+  if (me.is_admin) $("adminLink").hidden = false;
+});
+
+const el = (tag, cls, text) => {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text !== undefined) n.textContent = text;
+  return n;
+};
+
+function verdictBadge(correct) {
+  if (correct === true)  return el("span", "verdict ok", "верно");
+  if (correct === false) return el("span", "verdict no", "неверно");
+  return el("span", "verdict na", "без эталона");
+}
+
+function renderMethod(ev) {
+  const box = el("div", "method " + (ev.correct === true ? "correct" : ev.correct === false ? "wrong" : ""));
+
+  const h = el("h3");
+  h.append(ev.title, verdictBadge(ev.correct));
+  box.appendChild(h);
+  box.appendChild(el("div", "note", ev.note));
+
+  const short = el("div", "short");
+  short.append("Ответ: ", Object.assign(document.createElement("b"), { textContent: ev.extracted || "—" }));
+  box.appendChild(short);
+
+  for (const st of ev.stages) {
+    const d = document.createElement("details");
+    d.appendChild(el("summary", null, st.title));
+    d.appendChild(el("pre", null, st.text));
+    box.appendChild(d);
+  }
+
+  const full = document.createElement("details");
+  full.appendChild(el("summary", null, ev.stages.length ? "Итоговый ответ целиком" : "Ответ целиком"));
+  full.appendChild(el("pre", null, ev.answer));
+  box.appendChild(full);
+
+  const stats = el("div", "stats");
+  stats.innerHTML =
+    `<span>вызовов <b>${ev.calls}</b></span>` +
+    `<span>токенов <b>${ev.total_tokens}</b></span>` +
+    `<span>время <b>${ev.elapsed} с</b></span>`;
+  box.appendChild(stats);
+
+  $("results").appendChild(box);
+}
+
+function renderSummary() {
+  const tbody = $("summaryRows");
+  tbody.innerHTML = "";
+  const cheapest = Math.min(...results.map(r => r.total_tokens));
+  for (const r of results) {
+    const tr = el("tr");
+    tr.appendChild(el("td", null, r.title));
+    tr.appendChild(el("td", "mono", r.extracted.slice(0, 40)));
+    const v = el("td"); v.appendChild(verdictBadge(r.correct)); tr.appendChild(v);
+    tr.appendChild(el("td", "mono", String(r.calls)));
+    tr.appendChild(el("td", "mono", `${r.total_tokens} (×${(r.total_tokens / cheapest).toFixed(1)})`));
+    tr.appendChild(el("td", "mono", r.elapsed + " с"));
+    tbody.appendChild(tr);
+  }
+
+  const graded = results.filter(r => r.correct !== null);
+  const parts = [];
+  if (graded.length === results.length) {
+    // Есть эталон — судим по нему. Сравнивать тексты бессмысленно: «0.7»
+    // и «0.7 больше, чем 0.65» это один ответ, а не два разных.
+    const ok = graded.filter(r => r.correct).length;
+    parts.push(ok === graded.length ? "Все четыре способа дали верный ответ."
+      : ok === 0 ? "Ни один способ не дал верного ответа."
+      : `Верный ответ дали ${ok} способа из ${graded.length}.`);
+  } else {
+    const answers = new Set(results.map(r => r.extracted.trim().toLowerCase()));
+    parts.push(answers.size === 1
+      ? "Все четыре способа сформулировали ответ одинаково."
+      : `Формулировки разошлись: ${answers.size} варианта. Эталон не задан, сверить не с чем.`);
+  }
+  const dearest = results.reduce((a, b) => a.total_tokens > b.total_tokens ? a : b);
+  parts.push(`Дороже всех — «${dearest.title}»: ${dearest.total_tokens} токенов за ${dearest.calls} вызова.`);
+  $("conclusion").textContent = parts.join(" ");
+  $("summary").hidden = false;
+}
+
+$("run").addEventListener("click", async () => {
+  if (busy) return;
+  const task = $("task").value.trim();
+  if (!task) return;
+
+  busy = true;
+  $("run").disabled = true;
+  $("results").innerHTML = "";
+  $("summary").hidden = true;
+  results = [];
+  $("progress").textContent = "";
+
+  const waiting = el("div", "waiting", "Работаю… способы считаются по очереди, результат каждого появится сразу.");
+  $("results").appendChild(waiting);
+
+  try {
+    const res = await fetch("/api/reasoning", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task, reference: $("reference").value.trim() }),
+    });
+    if (res.status === 401) { location.href = "/login"; return; }
+    if (!res.ok) throw new Error("HTTP " + res.status);
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "", total = 4;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const parts = buf.split("\n\n");
+      buf = parts.pop();
+      for (const part of parts) {
+        if (!part.startsWith("data: ")) continue;
+        const ev = JSON.parse(part.slice(6));
+        if (ev.type === "start") { total = ev.total; $("progress").textContent = `0 / ${total}`; }
+        else if (ev.type === "result") {
+          waiting.remove();
+          results.push(ev);
+          renderMethod(ev);
+          $("progress").textContent = `${results.length} / ${total}`;
+        }
+        else if (ev.type === "error") { waiting.textContent = ev.message; waiting.className = "waiting error"; }
+        else if (ev.type === "done") { $("progress").textContent = "готово"; renderSummary(); }
+      }
+    }
+  } catch (err) {
+    waiting.textContent = "Сбой запроса: " + err.message;
+  } finally {
+    busy = false;
+    $("run").disabled = false;
+  }
+});
+</script>
+</body>
+</html>

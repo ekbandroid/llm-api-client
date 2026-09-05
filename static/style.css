@@ -142,3 +142,28 @@ td.actions button { margin-left: 6px; }
   margin-bottom: 14px; padding: 9px 11px; border-radius: 6px; font-size: 13px;
   background: var(--danger-soft); color: var(--danger); text-align: left;
 }
+
+/* ---------- режим сравнения способов рассуждения ---------- */
+.wrap.wide { max-width: 1100px; }
+.setup { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 18px; margin-bottom: 22px; }
+.setup textarea { min-height: 96px; font-family: inherit; font-size: 14px; }
+.setup .go { display: flex; gap: 12px; align-items: flex-end; }
+.setup .go label { flex: 0 0 160px; margin: 0; }
+.setup .go button { flex: 0 0 auto; padding: 10px 24px; }
+.progress { margin-left: auto; font-size: 13px; color: var(--muted); font-family: var(--mono); }
+
+.method { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px; margin-bottom: 14px; }
+.method.correct { border-left: 3px solid var(--accent); }
+.method.wrong { border-left: 3px solid var(--danger); }
+.method h3 { margin: 0 0 2px; font-size: 15px; display: flex; align-items: center; gap: 10px; }
+.method .note { color: var(--muted); font-size: 13px; margin-bottom: 12px; }
+.verdict { font-size: 11px; font-weight: 700; padding: 3px 9px; border-radius: 999px; }
+.verdict.ok { background: var(--accent); color: var(--accent-text); }
+.verdict.no { background: var(--danger-soft); color: var(--danger); }
+.verdict.na { background: var(--border); color: var(--muted); }
+.short { font-size: 15px; padding: 10px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; margin-bottom: 10px; }
+.short b { font-family: var(--mono); }
+.method .stats { margin-top: 4px; }
+.waiting { color: var(--muted); font-size: 14px; padding: 14px 0; }
+.summary { margin-top: 26px; }
+.summary h2 { font-size: 16px; margin: 0 0 12px; }
