@@ -183,3 +183,17 @@ td.actions button { margin-left: 6px; }
 .guide dt { font-family: var(--mono); font-weight: 600; margin-top: 12px; }
 .guide dt:first-of-type { margin-top: 0; }
 .guide dd { margin: 4px 0 0; color: var(--muted); font-size: 14px; }
+
+/* ---------- режим сравнения моделей ---------- */
+.cfg { display: flex; gap: 10px; align-items: center; margin-bottom: 8px; }
+.cfg select { flex: 1 1 220px; }
+.cfg .price { flex: 0 0 110px; }
+.cfg .chk { flex: 0 0 auto; display: flex; align-items: center; gap: 6px; font-size: 13px; white-space: nowrap; }
+.cfg .drop { flex: 0 0 auto; padding: 6px 10px; font-size: 16px; line-height: 1; background: transparent; color: var(--muted); border: 1px solid var(--border); font-weight: 400; }
+.cfghead { display: flex; gap: 10px; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; margin-bottom: 6px; }
+.cfghead .a { flex: 1 1 220px; } .cfghead .b { flex: 0 0 110px; } .cfghead .c { flex: 0 0 130px; }
+.mcard { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px; margin-bottom: 14px; }
+.mcard h3 { margin: 0 0 10px; font-size: 15px; font-family: var(--mono); }
+.mcard .answer { white-space: pre-wrap; font-size: 14px; padding: 12px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; }
+.links { font-size: 13px; color: var(--muted); }
+.links a { color: var(--text); }

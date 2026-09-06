@@ -17,6 +17,7 @@ from starlette.middleware.sessions import SessionMiddleware
 
 import auth
 import db
+import benchmark
 import llm
 import reasoning
 import temperature as temperature_mod
@@ -174,6 +175,8 @@ async def config(_: dict = Depends(require_approved)) -> dict:
         "models": models,
         "default_model": llm.MODEL,
         "formats": [{"id": k, "label": v["label"]} for k, v in FORMAT_PRESETS.items()],
+        "prices": benchmark.DEFAULT_PRICES,
+        "price_note": "USD за 1 млн токенов, пиковые ставки без попадания в кэш",
     }
 
 
@@ -267,6 +270,17 @@ async def temperature_page(request: Request):
     if user["status"] != db.APPROVED:
         return RedirectResponse("/pending", status_code=302)
     return FileResponse(STATIC / "temperature.html")
+
+
+@app.get("/models")
+async def models_page(request: Request):
+    """Режим сравнения моделей — для подтверждённых пользователей."""
+    user = current_user(request)
+    if user is None:
+        return RedirectResponse("/login", status_code=302)
+    if user["status"] != db.APPROVED:
+        return RedirectResponse("/pending", status_code=302)
+    return FileResponse(STATIC / "models.html")
 
 
 @app.get("/admin")
@@ -439,6 +453,69 @@ async def api_temperature(
                 "accuracy": res.accuracy,
                 "total_tokens": res.total_tokens,
                 "elapsed": res.elapsed,
+            })
+        yield sse({"type": "done"})
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# ---------- сравнение моделей ----------
+
+class BenchConfig(BaseModel):
+    model: str
+    thinking: bool = False
+    price_in: float = Field(default=0.0, ge=0)
+    price_out: float = Field(default=0.0, ge=0)
+
+
+class BenchRequest(BaseModel):
+    prompt: str
+    reference: str = ""
+    configs: list[BenchConfig] = Field(min_length=1, max_length=6)
+
+
+@app.post("/api/benchmark")
+async def api_benchmark(
+    request: BenchRequest, _: dict = Depends(require_approved)
+) -> StreamingResponse:
+    """Гоняет один запрос по нескольким моделям, отдавая замеры по мере готовности."""
+    prompt = request.prompt.strip()
+    if not prompt:
+        raise HTTPException(400, "Запрос не может быть пустым")
+
+    async def events() -> AsyncIterator[str]:
+        yield sse({"type": "start", "total": len(request.configs)})
+        for item in request.configs:
+            config = benchmark.ModelConfig(
+                model=item.model, thinking=item.thinking,
+                price_in=item.price_in, price_out=item.price_out,
+            )
+            try:
+                res = await asyncio.to_thread(
+                    benchmark.run_config, prompt, config, reference=request.reference
+                )
+            except llm.LLMError as err:
+                yield sse({"type": "error", "message": f"{config.title}: {err}"})
+                return
+            yield sse({
+                "type": "result",
+                "title": config.title,
+                "model": config.model,
+                "thinking": config.thinking,
+                "text": res.text,
+                "reasoning": res.reasoning,
+                "prompt_tokens": res.prompt_tokens,
+                "completion_tokens": res.completion_tokens,
+                "reasoning_tokens": res.reasoning_tokens,
+                "total_tokens": res.total_tokens,
+                "elapsed": res.elapsed,
+                "tokens_per_second": res.tokens_per_second,
+                "correct": res.correct,
+                "cost": res.cost,
             })
         yield sse({"type": "done"})
 

@@ -34,6 +34,7 @@ class Completion:
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+    reasoning_tokens: int
     elapsed: float
 
     @property
@@ -102,6 +103,8 @@ def complete(messages: list[dict], *, timeout: int = 120, **options) -> Completi
         prompt_tokens=usage.get("prompt_tokens", 0),
         completion_tokens=usage.get("completion_tokens", 0),
         total_tokens=usage.get("total_tokens", 0),
+        # Сколько из выходных токенов ушло в рассуждение, а не в сам ответ.
+        reasoning_tokens=(usage.get("completion_tokens_details") or {}).get("reasoning_tokens", 0),
         elapsed=elapsed,
     )
 
