@@ -63,6 +63,7 @@ class BenchResult:
     reasoning_tokens: int
     elapsed: float
     correct: bool | None
+    request: dict = field(default_factory=dict)
 
     @property
     def cost(self) -> float | None:
@@ -101,6 +102,7 @@ def run_config(
         reasoning_tokens=completion.reasoning_tokens,
         elapsed=round(completion.elapsed, 2),
         correct=is_correct(text, reference),
+        request=completion.request,
     )
 
 

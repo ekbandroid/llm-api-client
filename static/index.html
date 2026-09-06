@@ -64,6 +64,7 @@
 </main>
 </div>
 
+<script src="/static/common.js"></script>
 <script>
 const $ = id => document.getElementById(id);
 const log = $("log");
@@ -158,7 +159,10 @@ async function send(text) {
         if (!part.startsWith("data: ")) continue;
         const ev = JSON.parse(part.slice(6));
 
-        if (ev.type === "meta") {
+        if (ev.type === "request") {
+          const d = requestDetails(ev.request);
+          if (d) el.appendChild(d);
+        } else if (ev.type === "meta") {
           const d = document.createElement("details");
           d.innerHTML = `<summary>Системный промпт (${ev.model})</summary><pre></pre>`;
           d.querySelector("pre").textContent = ev.system;

@@ -58,6 +58,7 @@
   </div>
 </div>
 
+<script src="/static/common.js"></script>
 <script>
 const $ = id => document.getElementById(id);
 let results = [], busy = false;
@@ -90,6 +91,9 @@ function renderTemp(ev) {
     d.append(s.text);
     box.appendChild(d);
   });
+
+  const req = requestDetails(ev.request);
+  if (req) box.appendChild(req);
 
   const stats = el("div", "stats");
   stats.innerHTML =

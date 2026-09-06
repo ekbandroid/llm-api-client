@@ -40,6 +40,7 @@
   </div>
 </div>
 
+<script src="/static/common.js"></script>
 <script>
 const $ = id => document.getElementById(id);
 let results = [], busy = false;
@@ -82,6 +83,9 @@ function renderMethod(ev) {
     d.appendChild(el("pre", null, st.text));
     box.appendChild(d);
   }
+
+  const req = requestDetails(ev.requests);
+  if (req) box.appendChild(req);
 
   const full = document.createElement("details");
   full.appendChild(el("summary", null, ev.stages.length ? "Итоговый ответ целиком" : "Ответ целиком"));

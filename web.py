@@ -391,6 +391,7 @@ async def api_reasoning(
                 "extracted": reasoning.extract_answer(res.answer),
                 "correct": reasoning.is_correct(res.answer, request.reference),
                 "stages": [{"title": s.title, "text": s.text} for s in res.stages],
+                "requests": res.requests,
                 "calls": res.calls,
                 "prompt_tokens": res.prompt_tokens,
                 "completion_tokens": res.completion_tokens,
@@ -453,6 +454,7 @@ async def api_temperature(
                 "accuracy": res.accuracy,
                 "total_tokens": res.total_tokens,
                 "elapsed": res.elapsed,
+                "request": res.request,
             })
         yield sse({"type": "done"})
 
@@ -516,6 +518,7 @@ async def api_benchmark(
                 "tokens_per_second": res.tokens_per_second,
                 "correct": res.correct,
                 "cost": res.cost,
+                "request": res.request,
             })
         yield sse({"type": "done"})
 

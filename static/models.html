@@ -67,6 +67,7 @@
   </div>
 </div>
 
+<script src="/static/common.js"></script>
 <script>
 const $ = id => document.getElementById(id);
 let models = [], defaultPrices = {}, results = [], busy = false;
@@ -153,6 +154,8 @@ function renderResult(ev) {
     box.appendChild(d);
   }
   box.appendChild(el("div", "answer", ev.text));
+  const req = requestDetails(ev.request);
+  if (req) box.appendChild(req);
   const stats = el("div", "stats");
   stats.innerHTML =
     `<span>время <b>${ev.elapsed} с</b></span>` +

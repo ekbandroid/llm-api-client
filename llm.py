@@ -4,7 +4,7 @@ import json
 import os
 import time
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import httpx
 import requests
@@ -36,6 +36,7 @@ class Completion:
     total_tokens: int
     reasoning_tokens: int
     elapsed: float
+    request: dict = field(default_factory=dict)
 
     @property
     def truncated(self) -> bool:
@@ -69,6 +70,20 @@ def build_payload(
     if temperature is not None:
         payload["temperature"] = temperature
     return payload
+
+
+def describe_request(payload: dict) -> dict:
+    """Как выглядит запрос к API — для показа в интерфейсе.
+
+    Ключ подменяется звёздочками: он передаётся заголовком и наружу
+    попадать не должен ни при каких обстоятельствах.
+    """
+    return {
+        "method": "POST",
+        "url": f"{BASE_URL}/chat/completions",
+        "headers": {"Authorization": "Bearer ***", "Content-Type": "application/json"},
+        "body": payload,
+    }
 
 
 def _headers() -> dict:
@@ -106,6 +121,7 @@ def complete(messages: list[dict], *, timeout: int = 120, **options) -> Completi
         # Сколько из выходных токенов ушло в рассуждение, а не в сам ответ.
         reasoning_tokens=(usage.get("completion_tokens_details") or {}).get("reasoning_tokens", 0),
         elapsed=elapsed,
+        request=describe_request(payload),
     )
 
 
@@ -115,6 +131,7 @@ async def stream(
     """Потоковый вызов: отдаёт куски ответа по мере генерации.
 
     Генерирует события:
+      {"type": "request", "request": {...}} — что именно уходит в API;
       {"type": "reasoning", "text": ...} — кусок рассуждения (если thinking включён);
       {"type": "content",   "text": ...} — кусок ответа;
       {"type": "done", "finish_reason": ..., "usage": {...}, "elapsed": ...}.
@@ -122,6 +139,8 @@ async def stream(
     payload = build_payload(messages, **options)
     payload["stream"] = True
     payload["stream_options"] = {"include_usage": True}
+
+    yield {"type": "request", "request": describe_request(payload)}
 
     started = time.monotonic()
     finish_reason = "unknown"

@@ -57,6 +57,8 @@ class TempResult:
 
     temperature: float
     samples: list[Sample] = field(default_factory=list)
+    # Запрос одинаков для всех выборок одной температуры — хранится один раз.
+    request: dict = field(default_factory=dict)
 
     @property
     def texts(self) -> list[str]:
@@ -122,6 +124,7 @@ def run_temperature(
             model=model,
         )
         text = completion.content.strip()
+        result.request = completion.request
         result.samples.append(Sample(
             text=text,
             correct=is_correct(text, reference),
