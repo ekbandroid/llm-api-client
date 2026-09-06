@@ -67,6 +67,7 @@
   </div>
 </div>
 
+<script src="/static/markdown.js"></script>
 <script src="/static/common.js"></script>
 <script>
 const $ = id => document.getElementById(id);
@@ -153,7 +154,7 @@ function renderResult(ev) {
     d.appendChild(el("pre", null, ev.reasoning));
     box.appendChild(d);
   }
-  box.appendChild(el("div", "answer", ev.text));
+  const ans = el("div", "answer"); setMarkdown(ans, ev.text); box.appendChild(ans);
   const req = requestDetails(ev.request);
   if (req) box.appendChild(req);
   const stats = el("div", "stats");

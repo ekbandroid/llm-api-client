@@ -64,6 +64,7 @@
 </main>
 </div>
 
+<script src="/static/markdown.js"></script>
 <script src="/static/common.js"></script>
 <script>
 const $ = id => document.getElementById(id);
@@ -178,7 +179,7 @@ async function send(text) {
           reasoningBox.textContent = reasoning;
         } else if (ev.type === "content") {
           answer += ev.text;
-          body.textContent = answer;
+          setMarkdown(body, answer);
           log.scrollTop = log.scrollHeight;
         } else if (ev.type === "error") {
           body.classList.add("error");
