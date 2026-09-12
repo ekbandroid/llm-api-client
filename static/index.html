@@ -69,22 +69,42 @@ fetch("/api/me").then(r => r.json()).then(me => {
   if (me.is_admin) $("adminLink").hidden = false;
 });
 
-/** Ставит модель диалога, даже если провайдер её больше не перечисляет.
- *  Иначе сохранённая настройка молча пропадала бы из поля, а следующая
+// Список моделей приходит отдельным запросом. Пока он не пришёл, поле пустое,
+// и любая попытка выставить модель приняла бы её за отсутствующую — отсюда
+// брался дубликат «(нет в списке)» рядом с настоящим пунктом.
+const modelsReady = fetch("/api/config").then(r => r.json()).then(cfg => {
+  cfg.models.forEach(m => $("model").add(new Option(m, m)));
+  return cfg;
+}).catch(() => {
+  $("model").add(new Option("(список недоступен)", ""));
+  return { default_model: "" };
+});
+
+/** Ставит модель диалога, дождавшись списка.
+ *  Модель, которую провайдер больше не перечисляет, добавляется отдельным
+ *  пунктом: иначе сохранённая настройка молча пропала бы из поля, а следующая
  *  правка записала бы в диалог пустое значение. */
-function applyModel(name) {
+async function applyModel(name) {
   const sel = $("model");
-  if (!name) return;
-  if (![...sel.options].some(o => o.value === name)) {
-    sel.add(new Option(name + " (нет в списке)", name));
+  const cfg = await modelsReady;
+  const target = name || cfg.default_model;
+  if (!target) return;
+
+  if (![...sel.options].some(o => o.value === target)) {
+    const option = new Option(target + " (нет в списке)", target);
+    option.dataset.unlisted = "1";
+    sel.add(option);
   }
-  sel.value = name;
+  sel.value = target;
+
+  // Пункты, добавленные для других диалогов, больше не нужны — иначе при
+  // переключении в списке копились бы чужие модели.
+  [...sel.options]
+    .filter(o => o.dataset.unlisted && o.value !== target)
+    .forEach(o => o.remove());
 }
 
-fetch("/api/config").then(r => r.json()).then(cfg => {
-  cfg.models.forEach(m => $("model").add(new Option(m, m)));
-  applyModel(current && current.model ? current.model : cfg.default_model);
-}).catch(() => $("model").add(new Option("(список недоступен)", "")));
+modelsReady.then(cfg => applyModel(current && current.model ? current.model : cfg.default_model));
 
 // ---------- список диалогов ----------
 
@@ -210,6 +230,7 @@ function renderStored(m) {
 
 async function ensureConversation() {
   if (current) return current;
+  await modelsReady;
   const res = await fetch("/api/conversations", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -328,6 +349,7 @@ $("thinking").addEventListener("change", () => patchCurrent({ thinking: $("think
 $("titleInput").addEventListener("change", () => patchCurrent({ title: $("titleInput").value }));
 
 $("newConv").addEventListener("click", async () => {
+  await modelsReady;
   const res = await fetch("/api/conversations", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
