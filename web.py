@@ -528,6 +528,8 @@ async def conversation_send(
                     reasoning += event["text"]
                 elif event["type"] == "request":
                     meta["request"] = event["request"]
+                elif event["type"] == "response":
+                    meta["response"] = event["response"]
                 elif event["type"] == "done":
                     usage = event.get("usage") or {}
                     completion_tokens = usage.get("completion_tokens", 0)
@@ -624,6 +626,7 @@ async def api_reasoning(
                 "correct": reasoning.is_correct(res.answer, request.reference),
                 "stages": [{"title": s.title, "text": s.text} for s in res.stages],
                 "requests": res.requests,
+                "responses": res.responses,
                 "calls": res.calls,
                 "prompt_tokens": res.prompt_tokens,
                 "completion_tokens": res.completion_tokens,
@@ -687,6 +690,7 @@ async def api_temperature(
                 "total_tokens": res.total_tokens,
                 "elapsed": res.elapsed,
                 "request": res.request,
+                "responses": res.responses,
             })
         yield sse({"type": "done"})
 
@@ -751,6 +755,7 @@ async def api_benchmark(
                 "correct": res.correct,
                 "cost": res.cost,
                 "request": res.request,
+                "response": res.response,
             })
         yield sse({"type": "done"})
 

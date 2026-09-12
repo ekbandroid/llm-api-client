@@ -1,16 +1,17 @@
 // Общее для всех режимов: показ запроса, который приложение отправляет в API.
 // Ключ на сервере уже заменён звёздочками, наружу он не уходит.
 
-function requestDetails(requests, label) {
-  const list = Array.isArray(requests) ? requests : [requests];
+/** Сворачиваемый блок с JSON одного или нескольких вызовов. */
+function jsonDetails(items, label) {
+  const list = Array.isArray(items) ? items : [items];
   if (!list.length || !list[0]) return null;
 
   const d = document.createElement("details");
-  const s = document.createElement("summary");
-  s.textContent = label || (list.length > 1 ? `Запросы к API (${list.length})` : "Запрос к API");
-  d.appendChild(s);
+  const summary = document.createElement("summary");
+  summary.textContent = label;
+  d.appendChild(summary);
 
-  list.forEach((req, i) => {
+  list.forEach((item, i) => {
     if (list.length > 1) {
       const h = document.createElement("div");
       h.className = "hint";
@@ -19,10 +20,22 @@ function requestDetails(requests, label) {
       d.appendChild(h);
     }
     const pre = document.createElement("pre");
-    pre.textContent = JSON.stringify(req, null, 2);
+    pre.textContent = JSON.stringify(item, null, 2);
     d.appendChild(pre);
   });
   return d;
+}
+
+/** Что приложение отправило в API. Ключ на сервере уже заменён звёздочками. */
+function requestDetails(requests, label) {
+  const n = Array.isArray(requests) ? requests.length : 1;
+  return jsonDetails(requests, label || (n > 1 ? `Запросы к API (${n})` : "Запрос к API"));
+}
+
+/** Что API вернуло. Текст ответа вырезан на сервере — он показан выше. */
+function responseDetails(responses, label) {
+  const n = Array.isArray(responses) ? responses.length : 1;
+  return jsonDetails(responses, label || (n > 1 ? `Ответы API (${n})` : "Ответ API"));
 }
 
 // ---------------------------------------------------------------------------

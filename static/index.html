@@ -250,6 +250,10 @@ function renderStored(m) {
     const d = requestDetails(meta.request);
     if (d) box.appendChild(d);
   }
+  if (meta.response) {
+    const d = responseDetails(meta.response);
+    if (d) box.appendChild(d);
+  }
   box.appendChild(statsLine(m));
   if (meta.finish_reason === "length") {
     box.appendChild(el("div", "truncated", "Генерация оборвана лимитом max_tokens — ответ не дописан."));
@@ -313,6 +317,9 @@ async function send(text) {
 
         if (ev.type === "request") {
           const d = requestDetails(ev.request);
+          if (d) box.appendChild(d);
+        } else if (ev.type === "response") {
+          const d = responseDetails(ev.response);
           if (d) box.appendChild(d);
         } else if (ev.type === "reasoning") {
           if (!reasoningBox) {

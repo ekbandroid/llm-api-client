@@ -97,6 +97,8 @@ function renderTemp(ev) {
 
   const req = requestDetails(ev.request);
   if (req) box.appendChild(req);
+  const resp = responseDetails(ev.responses);
+  if (resp) box.appendChild(resp);
 
   const stats = el("div", "stats");
   stats.innerHTML =

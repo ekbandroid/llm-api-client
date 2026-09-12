@@ -63,6 +63,7 @@ class BenchResult:
     elapsed: float
     correct: bool | None
     request: dict = field(default_factory=dict)
+    response: dict = field(default_factory=dict)
 
     @property
     def cost(self) -> float | None:
@@ -102,6 +103,7 @@ def run_config(
         elapsed=round(completion.elapsed, 2),
         correct=is_correct(text, reference),
         request=completion.request,
+        response=completion.response,
     )
 
 

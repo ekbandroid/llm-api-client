@@ -161,6 +161,9 @@ async function send(text) {
         if (ev.type === "request") {
           const d = requestDetails(ev.request);
           if (d) el.appendChild(d);
+        } else if (ev.type === "response") {
+          const d = responseDetails(ev.response);
+          if (d) el.appendChild(d);
         } else if (ev.type === "meta") {
           const d = document.createElement("details");
           d.innerHTML = `<summary>Системный промпт (${ev.model})</summary><pre></pre>`;

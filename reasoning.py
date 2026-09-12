@@ -43,6 +43,7 @@ class MethodResult:
     answer: str
     stages: list[Stage] = field(default_factory=list)
     requests: list[dict] = field(default_factory=list)
+    responses: list[dict] = field(default_factory=list)
     calls: int = 0
     prompt_tokens: int = 0
     completion_tokens: int = 0
@@ -59,6 +60,7 @@ class _Runner:
     def __init__(self, model: str | None = None) -> None:
         self.model = model
         self.requests: list[dict] = []
+        self.responses: list[dict] = []
         self.calls = 0
         self.prompt_tokens = 0
         self.completion_tokens = 0
@@ -71,6 +73,7 @@ class _Runner:
             thinking=False,
         )
         self.requests.append(result.request)
+        self.responses.append(result.response)
         self.calls += 1
         self.prompt_tokens += result.prompt_tokens
         self.completion_tokens += result.completion_tokens
@@ -80,7 +83,7 @@ class _Runner:
     def finish(self, key: str, title: str, note: str, answer: str, stages: list[Stage]) -> MethodResult:
         return MethodResult(
             key=key, title=title, note=note, answer=answer, stages=stages,
-            requests=self.requests,
+            requests=self.requests, responses=self.responses,
             calls=self.calls, prompt_tokens=self.prompt_tokens,
             completion_tokens=self.completion_tokens, elapsed=round(self.elapsed, 2),
         )

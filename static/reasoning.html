@@ -87,6 +87,8 @@ function renderMethod(ev) {
 
   const req = requestDetails(ev.requests);
   if (req) box.appendChild(req);
+  const resp = responseDetails(ev.responses);
+  if (resp) box.appendChild(resp);
 
   const full = document.createElement("details");
   full.appendChild(el("summary", null, ev.stages.length ? "Итоговый ответ целиком" : "Ответ целиком"));

@@ -1,5 +1,6 @@
 """Клиент к LLM по OpenAI-совместимому API: синхронный вызов и потоковый."""
 
+import copy
 import json
 import os
 import time
@@ -37,6 +38,7 @@ class Completion:
     reasoning_tokens: int
     elapsed: float
     request: dict = field(default_factory=dict)
+    response: dict = field(default_factory=dict)
 
     @property
     def truncated(self) -> bool:
@@ -86,6 +88,33 @@ def describe_request(payload: dict) -> dict:
     }
 
 
+def describe_response(body: dict, *, streamed: bool = False) -> dict:
+    """Ответ API без самого текста ответа.
+
+    Текст уже отрисован пользователю выше, повторять его в JSON незачем —
+    он только мешает разглядеть служебные поля: usage, finish_reason,
+    идентификатор запроса. Вместо текста остаётся его длина.
+    """
+    trimmed = copy.deepcopy(body)
+    for choice in trimmed.get("choices") or []:
+        for part_name in ("message", "delta"):
+            part = choice.get(part_name)
+            if not isinstance(part, dict):
+                continue
+            for field in ("content", "reasoning_content"):
+                value = part.get(field)
+                # Пустую строку оставляем как есть: в последнем куске потока
+                # текста и правда нет, подпись «0 символов» только путала бы.
+                if isinstance(value, str) and value:
+                    part[field] = f"<{len(value)} символов, показано выше>"
+    if streamed:
+        trimmed["примечание"] = (
+            "последний кусок потока: ответ пришёл частями, "
+            "usage и finish_reason приходят в самом конце"
+        )
+    return trimmed
+
+
 def _headers() -> dict:
     if not API_KEY:
         raise LLMError("Не задан LLM_API_KEY. Скопируйте .env.example в .env и впишите ключ.")
@@ -122,6 +151,7 @@ def complete(messages: list[dict], *, timeout: int = 120, **options) -> Completi
         reasoning_tokens=(usage.get("completion_tokens_details") or {}).get("reasoning_tokens", 0),
         elapsed=elapsed,
         request=describe_request(payload),
+        response=describe_response(body),
     )
 
 
@@ -134,6 +164,7 @@ async def stream(
       {"type": "request", "request": {...}} — что именно уходит в API;
       {"type": "reasoning", "text": ...} — кусок рассуждения (если thinking включён);
       {"type": "content",   "text": ...} — кусок ответа;
+      {"type": "response", "response": {...}} — ответ API без текста;
       {"type": "done", "finish_reason": ..., "usage": {...}, "elapsed": ...}.
     """
     payload = build_payload(messages, **options)
@@ -145,6 +176,7 @@ async def stream(
     started = time.monotonic()
     finish_reason = "unknown"
     usage: dict = {}
+    last_chunk: dict = {}
 
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
@@ -166,6 +198,7 @@ async def stream(
                     except json.JSONDecodeError:
                         continue
 
+                    last_chunk = chunk
                     if chunk.get("usage"):
                         usage = chunk["usage"]
                     for choice in chunk.get("choices") or []:
@@ -178,6 +211,9 @@ async def stream(
                             yield {"type": "content", "text": content}
     except httpx.HTTPError as err:
         raise LLMError(f"Ошибка сети: {err}") from err
+
+    if last_chunk:
+        yield {"type": "response", "response": describe_response(last_chunk, streamed=True)}
 
     yield {
         "type": "done",

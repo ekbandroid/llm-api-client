@@ -157,6 +157,8 @@ function renderResult(ev) {
   const ans = el("div", "answer"); setMarkdown(ans, ev.text); box.appendChild(ans);
   const req = requestDetails(ev.request);
   if (req) box.appendChild(req);
+  const resp = responseDetails(ev.response);
+  if (resp) box.appendChild(resp);
   const stats = el("div", "stats");
   stats.innerHTML =
     `<span>время <b>${ev.elapsed} с</b></span>` +
