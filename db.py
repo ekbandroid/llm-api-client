@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS conversations (
     title      TEXT    NOT NULL,
     model      TEXT,
     thinking   INTEGER NOT NULL DEFAULT 0,
+    max_tokens INTEGER,
     created_at TEXT    NOT NULL,
     updated_at TEXT    NOT NULL
 );
@@ -73,10 +74,26 @@ def connect() -> sqlite3.Connection:
     return conn
 
 
+# Колонки, добавленные после первого выпуска. CREATE TABLE IF NOT EXISTS
+# их не создаст в уже существующей таблице, поэтому добавляем отдельно.
+MIGRATIONS = {
+    "conversations": {"max_tokens": "INTEGER"},
+}
+
+
+def _apply_migrations(conn: sqlite3.Connection) -> None:
+    for table, columns in MIGRATIONS.items():
+        existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for name, kind in columns.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
+
+
 def init() -> None:
     """Создаёт таблицы, если их ещё нет, и проверяет совместимость схемы."""
     with connect() as conn:
         conn.executescript(SCHEMA)
+        _apply_migrations(conn)
         columns = {r[1] for r in conn.execute("PRAGMA table_info(users)")}
     missing = {"login", "password_hash", "status", "is_admin"} - columns
     if missing:
@@ -232,14 +249,16 @@ TITLE_LIMIT = 60
 
 
 def create_conversation(
-    user_id: int, *, title: str = NEW_TITLE, model: str | None = None, thinking: bool = False
+    user_id: int, *, title: str = NEW_TITLE, model: str | None = None,
+    thinking: bool = False, max_tokens: int | None = None,
 ) -> dict:
     """Заводит пустой диалог и возвращает его."""
     with connect() as conn:
         cur = conn.execute(
-            "INSERT INTO conversations (user_id, title, model, thinking, created_at, updated_at)"
-            " VALUES (?, ?, ?, ?, ?, ?)",
-            (user_id, title.strip()[:TITLE_LIMIT] or NEW_TITLE, model, int(thinking), _now(), _now()),
+            "INSERT INTO conversations (user_id, title, model, thinking, max_tokens,"
+            " created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (user_id, title.strip()[:TITLE_LIMIT] or NEW_TITLE, model, int(thinking),
+             max_tokens, _now(), _now()),
         )
         row = conn.execute("SELECT * FROM conversations WHERE id = ?", (cur.lastrowid,)).fetchone()
     return dict(row)
@@ -269,6 +288,7 @@ def list_conversations(user_id: int) -> list[dict]:
 def update_conversation(
     conversation_id: int, user_id: int, *, title: str | None = None,
     model: str | None = None, thinking: bool | None = None,
+    max_tokens: int | None = None, clear_max_tokens: bool = False,
 ) -> dict | None:
     """Меняет название или настройки. Возвращает None, если диалог чужой или его нет."""
     sets, values = [], []
@@ -281,6 +301,13 @@ def update_conversation(
     if thinking is not None:
         sets.append("thinking = ?")
         values.append(int(thinking))
+    # Снять лимит и не трогать его — разные намерения, поэтому отдельный флаг:
+    # по одному лишь max_tokens=None их не различить.
+    if clear_max_tokens:
+        sets.append("max_tokens = NULL")
+    elif max_tokens is not None:
+        sets.append("max_tokens = ?")
+        values.append(max_tokens)
     if not sets:
         return get_conversation(conversation_id, user_id)
 

@@ -30,7 +30,8 @@
     <legend>Модель</legend>
     <label><span>Название</span><select id="model"></select></label>
     <div class="check"><input type="checkbox" id="thinking"><label for="thinking" style="margin:0">Режим thinking</label></div>
-    <div class="hint">Настройки принадлежат диалогу и сохраняются вместе с ним.</div>
+    <label style="margin-top:10px"><span>max_tokens — потолок ответа</span><input type="number" id="maxTokens" min="1" max="384000" placeholder="без лимита"></label>
+    <div class="hint">Настройки принадлежат диалогу и сохраняются вместе с ним. При включённом thinking рассуждение расходует этот же бюджет.</div>
   </fieldset>
 
   <fieldset>
@@ -174,6 +175,7 @@ async function openConversation(id) {
   $("titleInput").value = current.title;
   applyModel(current.model);
   $("thinking").checked = !!current.thinking;
+  $("maxTokens").value = current.max_tokens || "";
 
   log.innerHTML = "";
   if (!data.messages.length) {
@@ -268,7 +270,11 @@ async function ensureConversation() {
   const res = await fetch("/api/conversations", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model: $("model").value || null, thinking: $("thinking").checked }),
+    body: JSON.stringify({
+      model: $("model").value || null,
+      thinking: $("thinking").checked,
+      max_tokens: Number($("maxTokens").value) || null,
+    }),
   });
   current = await res.json();
   $("convTitle").hidden = false;
@@ -388,6 +394,11 @@ $("model").addEventListener("change", () => {
   if ($("model").value) patchCurrent({ model: $("model").value });
 });
 $("thinking").addEventListener("change", () => patchCurrent({ thinking: $("thinking").checked }));
+// Ноль на сервере означает «снять лимит»; пустое поле — это он и есть.
+$("maxTokens").addEventListener("change", () => {
+  const raw = $("maxTokens").value.trim();
+  patchCurrent({ max_tokens: raw === "" ? 0 : Number(raw) });
+});
 $("titleInput").addEventListener("change", () => patchCurrent({ title: $("titleInput").value }));
 
 $("newConv").addEventListener("click", async () => {
@@ -395,7 +406,11 @@ $("newConv").addEventListener("click", async () => {
   const res = await fetch("/api/conversations", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model: $("model").value || null, thinking: $("thinking").checked }),
+    body: JSON.stringify({
+      model: $("model").value || null,
+      thinking: $("thinking").checked,
+      max_tokens: Number($("maxTokens").value) || null,
+    }),
   });
   const created = await res.json();
   current = null;

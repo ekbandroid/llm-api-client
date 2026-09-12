@@ -400,12 +400,16 @@ class ConversationCreate(BaseModel):
     title: str = ""
     model: str | None = None
     thinking: bool = False
+    max_tokens: int | None = Field(default=None, ge=1, le=384_000)
 
 
 class ConversationPatch(BaseModel):
     title: str | None = None
     model: str | None = None
     thinking: bool | None = None
+    # Ноль означает «снять лимит». Пропущенное поле означает «не трогать» —
+    # по одному None эти два намерения не различить.
+    max_tokens: int | None = Field(default=None, ge=0, le=384_000)
 
 
 class NewMessage(BaseModel):
@@ -450,6 +454,7 @@ async def conversation_create(
         title=payload.title or db.NEW_TITLE,
         model=payload.model,
         thinking=payload.thinking,
+        max_tokens=payload.max_tokens,
     )
 
 
@@ -472,6 +477,8 @@ async def conversation_patch(
     updated = db.update_conversation(
         conversation_id, user["id"],
         title=payload.title, model=payload.model, thinking=payload.thinking,
+        max_tokens=payload.max_tokens or None,
+        clear_max_tokens=payload.max_tokens == 0,
     )
     if updated is None:
         raise HTTPException(404, "Диалог не найден")
@@ -504,6 +511,7 @@ async def conversation_send(
     system_prompt = llm.SYSTEM_PROMPT
     model = conversation["model"] or llm.MODEL
     thinking = bool(conversation["thinking"])
+    max_tokens = conversation["max_tokens"] or None
 
     db.add_message(conversation_id, "user", content)
     # Первое сообщение даёт диалогу имя — иначе список будет из «Новых диалогов».
@@ -521,7 +529,9 @@ async def conversation_send(
         elapsed = 0.0
 
         try:
-            async for event in llm.stream(messages, model=model, thinking=thinking):
+            async for event in llm.stream(
+                messages, model=model, thinking=thinking, max_tokens=max_tokens
+            ):
                 if event["type"] == "content":
                     answer += event["text"]
                 elif event["type"] == "reasoning":
