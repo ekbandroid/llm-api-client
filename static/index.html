@@ -12,6 +12,7 @@
   <b>LLM чат</b>
   <span class="grow"></span>
   <span class="who" id="who"></span>
+  <a class="btn ghost small" href="/legacy">Старый чат</a>
   <a class="btn ghost small" href="/reasoning">Способы рассуждения</a>
   <a class="btn ghost small" href="/temperature">Температура</a>
   <a class="btn ghost small" href="/models">Модели</a>
@@ -20,43 +21,23 @@
 </header>
 
 <div class="app">
-<aside>
-  <h1>Параметры</h1>
-  <div class="sub">Стриминг ответа + ограничения на лету</div>
+<aside class="withlist">
+  <button class="newconv" id="newConv">+ Новый диалог</button>
+  <div class="convlist" id="convList"></div>
 
   <fieldset>
     <legend>Модель</legend>
     <label><span>Название</span><select id="model"></select></label>
     <div class="check"><input type="checkbox" id="thinking"><label for="thinking" style="margin:0">Режим thinking</label></div>
-    <div class="hint">При включённом thinking рассуждение расходует бюджет <code>max_tokens</code> наравне с ответом.</div>
+    <div class="hint">Настройки принадлежат диалогу и сохраняются вместе с ним.</div>
   </fieldset>
-
-  <fieldset>
-    <legend>Формат ответа</legend>
-    <label><span>Пресет</span><select id="format"></select></label>
-    <label id="customWrap" hidden><span>Своя инструкция</span><textarea id="customFormat" placeholder="Опишите требуемый формат ответа"></textarea></label>
-  </fieldset>
-
-  <fieldset>
-    <legend>Длина</legend>
-    <div class="row">
-      <label><span>Лимит слов</span><input type="number" id="wordLimit" min="1" max="5000" placeholder="без лимита"></label>
-      <label><span>max_tokens</span><input type="number" id="maxTokens" min="1" max="8192" placeholder="без лимита"></label>
-    </div>
-    <div class="hint">Слова — инструкция модели, <code>max_tokens</code> — жёсткий обрыв на стороне API.</div>
-  </fieldset>
-
-  <fieldset>
-    <legend>Завершение</legend>
-    <label><span>Стоп-последовательность</span><input type="text" id="stop" placeholder="например ###END###"></label>
-    <div class="hint">Передаётся в <code>stop</code> и добавляется инструкцией в системный промпт.</div>
-  </fieldset>
-
-  <button class="ghost" id="clear" style="width:100%">Очистить диалог</button>
 </aside>
 
 <main>
-  <div id="log"><div class="empty">Задайте вопрос — ответ придёт потоком.</div></div>
+  <div class="convtitle" id="convTitle" hidden>
+    <b>Диалог:</b><input type="text" id="titleInput" maxlength="60">
+  </div>
+  <div id="log"><div class="empty">Создайте диалог или напишите сообщение — диалог заведётся сам.</div></div>
   <form id="form" class="composer">
     <textarea id="prompt" placeholder="Ваш вопрос…  (Enter — отправить, Shift+Enter — перенос строки)"></textarea>
     <button id="send" type="submit">Отправить</button>
@@ -69,10 +50,16 @@
 <script>
 const $ = id => document.getElementById(id);
 const log = $("log");
-let history = [];      // диалог живёт только в памяти вкладки
-let busy = false;
+let conversations = [], current = null, busy = false;
 
-// ---------- кто вошёл ----------
+const el = (tag, cls, text) => {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text !== undefined) n.textContent = text;
+  return n;
+};
+const words = t => t.trim() ? t.trim().split(/\s+/).length : 0;
+
 fetch("/api/me").then(r => r.json()).then(me => {
   if (!me.authenticated) { location.href = "/login"; return; }
   if (me.status !== "approved") { location.href = "/pending"; return; }
@@ -80,69 +67,174 @@ fetch("/api/me").then(r => r.json()).then(me => {
   if (me.is_admin) $("adminLink").hidden = false;
 });
 
-// ---------- начальная конфигурация ----------
-fetch("/api/config").then(r => r.json()).then(cfg => {
-  cfg.models.forEach(m => {
-    $("model").add(new Option(m, m, m === cfg.default_model, m === cfg.default_model));
-  });
-  cfg.formats.forEach(f => $("format").add(new Option(f.label, f.id)));
-}).catch(() => {
-  $("model").add(new Option("(не удалось загрузить список)", ""));
-});
-
-$("format").addEventListener("change", e => {
-  $("customWrap").hidden = e.target.value !== "custom";
-});
-
-// ---------- отрисовка ----------
-function addMessage(role, who) {
-  if (log.querySelector(".empty")) log.innerHTML = "";
-  const el = document.createElement("div");
-  el.className = "msg " + role;
-  el.innerHTML = `<div class="who"></div><div class="body"></div>`;
-  el.querySelector(".who").textContent = who;
-  log.appendChild(el);
-  log.scrollTop = log.scrollHeight;
-  return el;
+/** Ставит модель диалога, даже если провайдер её больше не перечисляет.
+ *  Иначе сохранённая настройка молча пропадала бы из поля, а следующая
+ *  правка записала бы в диалог пустое значение. */
+function applyModel(name) {
+  const sel = $("model");
+  if (!name) return;
+  if (![...sel.options].some(o => o.value === name)) {
+    sel.add(new Option(name + " (нет в списке)", name));
+  }
+  sel.value = name;
 }
 
-function num(v) { return v === "" || v === null ? null : Number(v); }
+fetch("/api/config").then(r => r.json()).then(cfg => {
+  cfg.models.forEach(m => $("model").add(new Option(m, m)));
+  applyModel(current && current.model ? current.model : cfg.default_model);
+}).catch(() => $("model").add(new Option("(список недоступен)", "")));
 
-function constraints() {
-  return {
-    model: $("model").value || null,
-    format_preset: $("format").value || "free",
-    custom_format: $("customFormat").value,
-    word_limit: num($("wordLimit").value),
-    max_tokens: num($("maxTokens").value),
-    stop: $("stop").value,
-    thinking: $("thinking").checked,
-  };
+// ---------- список диалогов ----------
+
+async function loadConversations(openId) {
+  conversations = (await (await fetch("/api/conversations")).json()).conversations;
+  renderList();
+  if (openId) return openConversation(openId);
+  if (conversations.length && !current) return openConversation(conversations[0].id);
+}
+
+function renderList() {
+  const box = $("convList");
+  box.innerHTML = "";
+  if (!conversations.length) {
+    box.appendChild(el("div", "convempty", "Диалогов пока нет."));
+    return;
+  }
+  for (const c of conversations) {
+    const row = el("div", "conv" + (current && c.id === current.id ? " active" : ""));
+    row.appendChild(el("span", "name", c.title));
+    row.appendChild(el("span", "count", String(c.message_count ?? 0)));
+    const kill = el("button", "kill", "×");
+    kill.title = "Удалить диалог";
+    kill.onclick = async e => {
+      e.stopPropagation();
+      if (!confirm(`Удалить диалог «${c.title}» вместе с сообщениями?`)) return;
+      await fetch(`/api/conversations/${c.id}`, { method: "DELETE" });
+      if (current && current.id === c.id) { current = null; showEmpty(); }
+      loadConversations();
+    };
+    row.appendChild(kill);
+    row.onclick = () => openConversation(c.id);
+    box.appendChild(row);
+  }
+}
+
+function showEmpty() {
+  log.innerHTML = "";
+  log.appendChild(el("div", "empty", "Создайте диалог или напишите сообщение — диалог заведётся сам."));
+  $("convTitle").hidden = true;
+}
+
+async function openConversation(id) {
+  const res = await fetch(`/api/conversations/${id}`);
+  if (!res.ok) { current = null; showEmpty(); return loadConversations(); }
+  const data = await res.json();
+  current = data.conversation;
+
+  $("convTitle").hidden = false;
+  $("titleInput").value = current.title;
+  applyModel(current.model);
+  $("thinking").checked = !!current.thinking;
+
+  log.innerHTML = "";
+  if (!data.messages.length) {
+    log.appendChild(el("div", "empty", "Диалог пуст — напишите первое сообщение."));
+  } else {
+    for (const m of data.messages) renderStored(m);
+  }
+  log.scrollTop = log.scrollHeight;
+  renderList();
+}
+
+// ---------- отрисовка сообщений ----------
+
+function addMessage(role, who) {
+  if (log.querySelector(".empty")) log.innerHTML = "";
+  const box = el("div", "msg " + role);
+  box.appendChild(el("div", "who", who));
+  box.appendChild(el("div", "body"));
+  log.appendChild(box);
+  log.scrollTop = log.scrollHeight;
+  return box;
+}
+
+function statsLine(m) {
+  const meta = m.meta || {};
+  const line = el("div", "stats");
+  line.innerHTML =
+    `<span>finish_reason <b>${meta.finish_reason ?? "—"}</b></span>` +
+    `<span>токенов ответа <b>${m.tokens_completion ?? "—"}</b></span>` +
+    `<span>всего <b>${m.tokens_total ?? "—"}</b></span>` +
+    `<span>слов <b>${words(m.content)}</b></span>` +
+    `<span>время <b>${meta.elapsed ?? "—"} с</b></span>`;
+  return line;
+}
+
+/** Сообщение, поднятое из базы, — со всей сохранённой телеметрией. */
+function renderStored(m) {
+  const box = addMessage(m.role === "user" ? "user" : "assistant", m.role === "user" ? "Вы" : "Модель");
+  const body = box.querySelector(".body");
+  if (m.role === "user") { body.textContent = m.content; return; }
+
+  const meta = m.meta || {};
+  if (m.reasoning) {
+    const d = document.createElement("details");
+    d.appendChild(el("summary", null, "Рассуждение"));
+    d.appendChild(el("pre", null, m.reasoning));
+    box.insertBefore(d, body);
+  }
+  setMarkdown(body, m.content);
+  if (meta.system) {
+    const d = document.createElement("details");
+    d.appendChild(el("summary", null, `Системный промпт (${meta.model || ""})`));
+    d.appendChild(el("pre", null, meta.system));
+    box.appendChild(d);
+  }
+  if (meta.request) {
+    const d = requestDetails(meta.request);
+    if (d) box.appendChild(d);
+  }
+  box.appendChild(statsLine(m));
+  if (meta.finish_reason === "length") {
+    box.appendChild(el("div", "truncated", "Генерация оборвана лимитом max_tokens — ответ не дописан."));
+  }
 }
 
 // ---------- отправка ----------
+
+async function ensureConversation() {
+  if (current) return current;
+  const res = await fetch("/api/conversations", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: $("model").value || null, thinking: $("thinking").checked }),
+  });
+  current = await res.json();
+  $("convTitle").hidden = false;
+  $("titleInput").value = current.title;
+  return current;
+}
+
 async function send(text) {
   if (busy) return;
   busy = true;
   $("send").disabled = true;
 
+  await ensureConversation();
   addMessage("user", "Вы").querySelector(".body").textContent = text;
-  history.push({ role: "user", content: text });
 
-  const el = addMessage("assistant", "Модель");
-  const body = el.querySelector(".body");
+  const box = addMessage("assistant", "Модель");
+  const body = box.querySelector(".body");
   body.classList.add("cursor");
-
   let answer = "", reasoning = "", reasoningBox = null;
 
   try {
-    const res = await fetch("/api/chat", {
+    const res = await fetch(`/api/conversations/${current.id}/messages`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ messages: history, constraints: constraints() }),
+      body: JSON.stringify({ content: text }),
     });
     if (res.status === 401) { location.href = "/login"; return; }
-    if (res.status === 403) { location.href = "/pending"; return; }
     if (!res.ok) throw new Error("HTTP " + res.status);
 
     const reader = res.body.getReader();
@@ -162,18 +254,15 @@ async function send(text) {
 
         if (ev.type === "request") {
           const d = requestDetails(ev.request);
-          if (d) el.appendChild(d);
-        } else if (ev.type === "meta") {
-          const d = document.createElement("details");
-          d.innerHTML = `<summary>Системный промпт (${ev.model})</summary><pre></pre>`;
-          d.querySelector("pre").textContent = ev.system;
-          el.appendChild(d);
+          if (d) box.appendChild(d);
         } else if (ev.type === "reasoning") {
           if (!reasoningBox) {
             const d = document.createElement("details");
-            d.innerHTML = `<summary>Рассуждение</summary><pre></pre>`;
-            el.insertBefore(d, body);
-            reasoningBox = d.querySelector("pre");
+            d.appendChild(el("summary", null, "Рассуждение"));
+            const pre = el("pre");
+            d.appendChild(pre);
+            box.insertBefore(d, body);
+            reasoningBox = pre;
           }
           reasoning += ev.text;
           reasoningBox.textContent = reasoning;
@@ -186,26 +275,23 @@ async function send(text) {
           body.textContent = ev.message;
         } else if (ev.type === "done") {
           const u = ev.usage || {};
-          const stats = document.createElement("div");
-          stats.className = "stats";
-          stats.innerHTML =
-            `<span>finish_reason <b>${ev.finish_reason}</b></span>` +
-            `<span>токенов ответа <b>${u.completion_tokens ?? "—"}</b></span>` +
-            `<span>всего <b>${u.total_tokens ?? "—"}</b></span>` +
-            `<span>слов <b>${answer.trim() ? answer.trim().split(/\s+/).length : 0}</b></span>` +
-            `<span>время <b>${ev.elapsed} с</b></span>`;
-          el.appendChild(stats);
+          box.appendChild(statsLine({
+            content: answer,
+            tokens_completion: u.completion_tokens,
+            tokens_total: u.total_tokens,
+            meta: { finish_reason: ev.finish_reason, elapsed: ev.elapsed },
+          }));
           if (ev.finish_reason === "length") {
-            const w = document.createElement("div");
-            w.className = "truncated";
-            w.textContent = "Генерация оборвана лимитом max_tokens — ответ не дописан. " +
-              (reasoning ? "Часть бюджета ушла на рассуждение." : "");
-            el.appendChild(w);
+            box.appendChild(el("div", "truncated", "Генерация оборвана лимитом max_tokens — ответ не дописан."));
           }
+        } else if (ev.type === "saved") {
+          // Первое сообщение дало диалогу имя — обновляем список и поле заголовка.
+          current.title = ev.title;
+          $("titleInput").value = ev.title;
+          loadConversations();
         }
       }
     }
-    if (answer) history.push({ role: "assistant", content: answer });
   } catch (err) {
     body.classList.add("error");
     body.textContent = "Сбой запроса: " + err.message;
@@ -217,7 +303,38 @@ async function send(text) {
   }
 }
 
+// ---------- настройки диалога ----------
+
+async function patchCurrent(payload) {
+  if (!current) return;
+  const res = await fetch(`/api/conversations/${current.id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (res.ok) { current = await res.json(); renderList(); }
+}
+
+$("model").addEventListener("change", () => {
+  if ($("model").value) patchCurrent({ model: $("model").value });
+});
+$("thinking").addEventListener("change", () => patchCurrent({ thinking: $("thinking").checked }));
+$("titleInput").addEventListener("change", () => patchCurrent({ title: $("titleInput").value }));
+
+$("newConv").addEventListener("click", async () => {
+  const res = await fetch("/api/conversations", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: $("model").value || null, thinking: $("thinking").checked }),
+  });
+  const created = await res.json();
+  current = null;
+  await loadConversations(created.id);
+  $("prompt").focus();
+});
+
 // ---------- события ----------
+
 $("form").addEventListener("submit", e => {
   e.preventDefault();
   const text = $("prompt").value.trim();
@@ -230,10 +347,7 @@ $("prompt").addEventListener("keydown", e => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("form").requestSubmit(); }
 });
 
-$("clear").addEventListener("click", () => {
-  history = [];
-  log.innerHTML = '<div class="empty">Задайте вопрос — ответ придёт потоком.</div>';
-});
+loadConversations();
 </script>
 </body>
 </html>

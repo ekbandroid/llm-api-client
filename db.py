@@ -29,6 +29,34 @@ CREATE TABLE IF NOT EXISTS users (
     created_at    TEXT    NOT NULL,
     last_login_at TEXT
 );
+
+-- Диалоги и их сообщения. Настройки (модель, thinking) живут на диалоге:
+-- вернувшись к старой переписке, возвращаемся и к условиям, при которых она шла.
+CREATE TABLE IF NOT EXISTS conversations (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    title      TEXT    NOT NULL,
+    model      TEXT,
+    thinking   INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT    NOT NULL,
+    updated_at TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations(user_id, updated_at DESC);
+
+-- tokens_* вынесены в колонки: по ним будет считаться месячный расход.
+-- Остальная телеметрия ответа лежит в meta — она только показывается.
+CREATE TABLE IF NOT EXISTS messages (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id   INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    role              TEXT    NOT NULL,
+    content           TEXT    NOT NULL,
+    reasoning         TEXT,
+    tokens_completion INTEGER NOT NULL DEFAULT 0,
+    tokens_total      INTEGER NOT NULL DEFAULT 0,
+    meta              TEXT,
+    created_at        TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, id);
 """
 
 
@@ -192,3 +220,135 @@ def count_admins() -> int:
     """Число админов — чтобы не остаться без единого администратора."""
     with connect() as conn:
         return conn.execute("SELECT COUNT(*) FROM users WHERE is_admin = 1").fetchone()[0]
+
+
+# ---------- диалоги ----------
+#
+# Владелец проверяется прямо в запросе: во всех функциях есть условие
+# user_id = ?. Иначе чужую переписку можно было бы открыть, подставив чужой id.
+
+NEW_TITLE = "Новый диалог"
+TITLE_LIMIT = 60
+
+
+def create_conversation(
+    user_id: int, *, title: str = NEW_TITLE, model: str | None = None, thinking: bool = False
+) -> dict:
+    """Заводит пустой диалог и возвращает его."""
+    with connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO conversations (user_id, title, model, thinking, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, title.strip()[:TITLE_LIMIT] or NEW_TITLE, model, int(thinking), _now(), _now()),
+        )
+        row = conn.execute("SELECT * FROM conversations WHERE id = ?", (cur.lastrowid,)).fetchone()
+    return dict(row)
+
+
+def get_conversation(conversation_id: int, user_id: int) -> dict | None:
+    """Диалог по id, только если он принадлежит этому пользователю."""
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM conversations WHERE id = ? AND user_id = ?", (conversation_id, user_id)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def list_conversations(user_id: int) -> list[dict]:
+    """Диалоги пользователя, свежие сверху, с числом сообщений в каждом."""
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT c.*, (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id)"
+            " AS message_count FROM conversations c WHERE c.user_id = ?"
+            " ORDER BY c.updated_at DESC, c.id DESC",
+            (user_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def update_conversation(
+    conversation_id: int, user_id: int, *, title: str | None = None,
+    model: str | None = None, thinking: bool | None = None,
+) -> dict | None:
+    """Меняет название или настройки. Возвращает None, если диалог чужой или его нет."""
+    sets, values = [], []
+    if title is not None:
+        sets.append("title = ?")
+        values.append(title.strip()[:TITLE_LIMIT] or NEW_TITLE)
+    if model is not None:
+        sets.append("model = ?")
+        values.append(model)
+    if thinking is not None:
+        sets.append("thinking = ?")
+        values.append(int(thinking))
+    if not sets:
+        return get_conversation(conversation_id, user_id)
+
+    sets.append("updated_at = ?")
+    values.extend([_now(), conversation_id, user_id])
+    with connect() as conn:
+        cur = conn.execute(
+            f"UPDATE conversations SET {', '.join(sets)} WHERE id = ? AND user_id = ?", values
+        )
+    return get_conversation(conversation_id, user_id) if cur.rowcount else None
+
+
+def delete_conversation(conversation_id: int, user_id: int) -> bool:
+    """Удаляет диалог вместе с сообщениями (каскадом по внешнему ключу)."""
+    with connect() as conn:
+        cur = conn.execute(
+            "DELETE FROM conversations WHERE id = ? AND user_id = ?", (conversation_id, user_id)
+        )
+    return cur.rowcount > 0
+
+
+def touch_conversation(conversation_id: int) -> None:
+    """Отмечает диалог как недавно изменённый — он всплывает в списке."""
+    with connect() as conn:
+        conn.execute(
+            "UPDATE conversations SET updated_at = ? WHERE id = ?", (_now(), conversation_id)
+        )
+
+
+# ---------- сообщения ----------
+
+def add_message(
+    conversation_id: int, role: str, content: str, *, reasoning: str | None = None,
+    tokens_completion: int = 0, tokens_total: int = 0, meta: str | None = None,
+) -> dict:
+    """Добавляет сообщение в диалог и поднимает диалог в списке."""
+    with connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO messages (conversation_id, role, content, reasoning,"
+            " tokens_completion, tokens_total, meta, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (conversation_id, role, content, reasoning, tokens_completion,
+             tokens_total, meta, _now()),
+        )
+        conn.execute(
+            "UPDATE conversations SET updated_at = ? WHERE id = ?", (_now(), conversation_id)
+        )
+        row = conn.execute("SELECT * FROM messages WHERE id = ?", (cur.lastrowid,)).fetchone()
+    return dict(row)
+
+
+def list_messages(conversation_id: int) -> list[dict]:
+    """Все сообщения диалога в порядке добавления."""
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM messages WHERE conversation_id = ? ORDER BY id", (conversation_id,)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def history_for_api(conversation_id: int) -> list[dict]:
+    """История в том виде, в каком она уходит в API: только роль и текст.
+
+    Ограничения на длину пока нет — вся переписка отправляется целиком.
+    """
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY id",
+            (conversation_id,),
+        ).fetchall()
+    return [{"role": r["role"], "content": r["content"]} for r in rows]

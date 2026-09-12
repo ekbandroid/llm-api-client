@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Старый чат — LLM чат</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header class="bar">
+  <a href="/">← К диалогам</a>
+  <b>Старый чат</b>
+  <span class="grow"></span>
+  <span class="who" id="who"></span>
+  <a class="btn ghost small" href="/admin" id="adminLink" hidden>Пользователи</a>
+  <a class="btn ghost small" href="/auth/logout">Выйти</a>
+</header>
+
+<div class="app">
+<aside>
+  <h1>Параметры</h1>
+  <div class="sub">Прежний чат без сохранения: ограничения формата, длины и завершения. Диалог живёт только в памяти вкладки.</div>
+
+  <fieldset>
+    <legend>Модель</legend>
+    <label><span>Название</span><select id="model"></select></label>
+    <div class="check"><input type="checkbox" id="thinking"><label for="thinking" style="margin:0">Режим thinking</label></div>
+    <div class="hint">При включённом thinking рассуждение расходует бюджет <code>max_tokens</code> наравне с ответом.</div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Формат ответа</legend>
+    <label><span>Пресет</span><select id="format"></select></label>
+    <label id="customWrap" hidden><span>Своя инструкция</span><textarea id="customFormat" placeholder="Опишите требуемый формат ответа"></textarea></label>
+  </fieldset>
+
+  <fieldset>
+    <legend>Длина</legend>
+    <div class="row">
+      <label><span>Лимит слов</span><input type="number" id="wordLimit" min="1" max="5000" placeholder="без лимита"></label>
+      <label><span>max_tokens</span><input type="number" id="maxTokens" min="1" max="8192" placeholder="без лимита"></label>
+    </div>
+    <div class="hint">Слова — инструкция модели, <code>max_tokens</code> — жёсткий обрыв на стороне API.</div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Завершение</legend>
+    <label><span>Стоп-последовательность</span><input type="text" id="stop" placeholder="например ###END###"></label>
+    <div class="hint">Передаётся в <code>stop</code> и добавляется инструкцией в системный промпт.</div>
+  </fieldset>
+
+  <button class="ghost" id="clear" style="width:100%">Очистить диалог</button>
+</aside>
+
+<main>
+  <div id="log"><div class="empty">Задайте вопрос — ответ придёт потоком.</div></div>
+  <form id="form" class="composer">
+    <textarea id="prompt" placeholder="Ваш вопрос…  (Enter — отправить, Shift+Enter — перенос строки)"></textarea>
+    <button id="send" type="submit">Отправить</button>
+  </form>
+</main>
+</div>
+
+<script src="/static/markdown.js"></script>
+<script src="/static/common.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const log = $("log");
+let history = [];      // диалог живёт только в памяти вкладки
+let busy = false;
+
+// ---------- кто вошёл ----------
+fetch("/api/me").then(r => r.json()).then(me => {
+  if (!me.authenticated) { location.href = "/login"; return; }
+  if (me.status !== "approved") { location.href = "/pending"; return; }
+  $("who").append("Вы: ", Object.assign(document.createElement("b"), { textContent: me.login }));
+  if (me.is_admin) $("adminLink").hidden = false;
+});
+
+// ---------- начальная конфигурация ----------
+fetch("/api/config").then(r => r.json()).then(cfg => {
+  cfg.models.forEach(m => {
+    $("model").add(new Option(m, m, m === cfg.default_model, m === cfg.default_model));
+  });
+  cfg.formats.forEach(f => $("format").add(new Option(f.label, f.id)));
+}).catch(() => {
+  $("model").add(new Option("(не удалось загрузить список)", ""));
+});
+
+$("format").addEventListener("change", e => {
+  $("customWrap").hidden = e.target.value !== "custom";
+});
+
+// ---------- отрисовка ----------
+function addMessage(role, who) {
+  if (log.querySelector(".empty")) log.innerHTML = "";
+  const el = document.createElement("div");
+  el.className = "msg " + role;
+  el.innerHTML = `<div class="who"></div><div class="body"></div>`;
+  el.querySelector(".who").textContent = who;
+  log.appendChild(el);
+  log.scrollTop = log.scrollHeight;
+  return el;
+}
+
+function num(v) { return v === "" || v === null ? null : Number(v); }
+
+function constraints() {
+  return {
+    model: $("model").value || null,
+    format_preset: $("format").value || "free",
+    custom_format: $("customFormat").value,
+    word_limit: num($("wordLimit").value),
+    max_tokens: num($("maxTokens").value),
+    stop: $("stop").value,
+    thinking: $("thinking").checked,
+  };
+}
+
+// ---------- отправка ----------
+async function send(text) {
+  if (busy) return;
+  busy = true;
+  $("send").disabled = true;
+
+  addMessage("user", "Вы").querySelector(".body").textContent = text;
+  history.push({ role: "user", content: text });
+
+  const el = addMessage("assistant", "Модель");
+  const body = el.querySelector(".body");
+  body.classList.add("cursor");
+
+  let answer = "", reasoning = "", reasoningBox = null;
+
+  try {
+    const res = await fetch("/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ messages: history, constraints: constraints() }),
+    });
+    if (res.status === 401) { location.href = "/login"; return; }
+    if (res.status === 403) { location.href = "/pending"; return; }
+    if (!res.ok) throw new Error("HTTP " + res.status);
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const parts = buf.split("\n\n");
+      buf = parts.pop();
+
+      for (const part of parts) {
+        if (!part.startsWith("data: ")) continue;
+        const ev = JSON.parse(part.slice(6));
+
+        if (ev.type === "request") {
+          const d = requestDetails(ev.request);
+          if (d) el.appendChild(d);
+        } else if (ev.type === "meta") {
+          const d = document.createElement("details");
+          d.innerHTML = `<summary>Системный промпт (${ev.model})</summary><pre></pre>`;
+          d.querySelector("pre").textContent = ev.system;
+          el.appendChild(d);
+        } else if (ev.type === "reasoning") {
+          if (!reasoningBox) {
+            const d = document.createElement("details");
+            d.innerHTML = `<summary>Рассуждение</summary><pre></pre>`;
+            el.insertBefore(d, body);
+            reasoningBox = d.querySelector("pre");
+          }
+          reasoning += ev.text;
+          reasoningBox.textContent = reasoning;
+        } else if (ev.type === "content") {
+          answer += ev.text;
+          setMarkdown(body, answer);
+          log.scrollTop = log.scrollHeight;
+        } else if (ev.type === "error") {
+          body.classList.add("error");
+          body.textContent = ev.message;
+        } else if (ev.type === "done") {
+          const u = ev.usage || {};
+          const stats = document.createElement("div");
+          stats.className = "stats";
+          stats.innerHTML =
+            `<span>finish_reason <b>${ev.finish_reason}</b></span>` +
+            `<span>токенов ответа <b>${u.completion_tokens ?? "—"}</b></span>` +
+            `<span>всего <b>${u.total_tokens ?? "—"}</b></span>` +
+            `<span>слов <b>${answer.trim() ? answer.trim().split(/\s+/).length : 0}</b></span>` +
+            `<span>время <b>${ev.elapsed} с</b></span>`;
+          el.appendChild(stats);
+          if (ev.finish_reason === "length") {
+            const w = document.createElement("div");
+            w.className = "truncated";
+            w.textContent = "Генерация оборвана лимитом max_tokens — ответ не дописан. " +
+              (reasoning ? "Часть бюджета ушла на рассуждение." : "");
+            el.appendChild(w);
+          }
+        }
+      }
+    }
+    if (answer) history.push({ role: "assistant", content: answer });
+  } catch (err) {
+    body.classList.add("error");
+    body.textContent = "Сбой запроса: " + err.message;
+  } finally {
+    body.classList.remove("cursor");
+    busy = false;
+    $("send").disabled = false;
+    log.scrollTop = log.scrollHeight;
+  }
+}
+
+// ---------- события ----------
+$("form").addEventListener("submit", e => {
+  e.preventDefault();
+  const text = $("prompt").value.trim();
+  if (!text) return;
+  $("prompt").value = "";
+  send(text);
+});
+
+$("prompt").addEventListener("keydown", e => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("form").requestSubmit(); }
+});
+
+$("clear").addEventListener("click", () => {
+  history = [];
+  log.innerHTML = '<div class="empty">Задайте вопрос — ответ придёт потоком.</div>';
+});
+</script>
+</body>
+</html>

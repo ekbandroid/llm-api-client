@@ -226,6 +226,17 @@ async def index(request: Request):
     return FileResponse(STATIC / "index.html")
 
 
+@app.get("/legacy")
+async def legacy_page(request: Request):
+    """Прежний чат с ограничениями — без сохранения истории."""
+    user = current_user(request)
+    if user is None:
+        return RedirectResponse("/login", status_code=302)
+    if user["status"] != db.APPROVED:
+        return RedirectResponse("/pending", status_code=302)
+    return FileResponse(STATIC / "legacy.html")
+
+
 @app.get("/login")
 async def login_page(request: Request):
     if current_user(request):
@@ -353,6 +364,167 @@ def api_login(request: Request, creds: Credentials) -> dict:
     auth.throttle_reset(login)
     db.touch_login(user["id"])
     return _finish_login(request, user)
+
+
+# ---------- диалоги ----------
+
+class ConversationCreate(BaseModel):
+    title: str = ""
+    model: str | None = None
+    thinking: bool = False
+
+
+class ConversationPatch(BaseModel):
+    title: str | None = None
+    model: str | None = None
+    thinking: bool | None = None
+
+
+class NewMessage(BaseModel):
+    content: str
+
+
+def _owned(conversation_id: int, user: dict) -> dict:
+    """Достаёт диалог, убеждаясь, что он принадлежит этому пользователю."""
+    conversation = db.get_conversation(conversation_id, user["id"])
+    if conversation is None:
+        # Не различаем «нет такого» и «чужой»: иначе по коду ответа можно
+        # перебором узнать, какие идентификаторы существуют.
+        raise HTTPException(404, "Диалог не найден")
+    return conversation
+
+
+def _public_message(row: dict) -> dict:
+    """Сообщение в том виде, в каком его ждёт страница."""
+    return {
+        "id": row["id"],
+        "role": row["role"],
+        "content": row["content"],
+        "reasoning": row["reasoning"],
+        "tokens_completion": row["tokens_completion"],
+        "tokens_total": row["tokens_total"],
+        "meta": json.loads(row["meta"]) if row["meta"] else None,
+        "created_at": row["created_at"],
+    }
+
+
+@app.get("/api/conversations")
+async def conversations_list(user: dict = Depends(require_approved)) -> dict:
+    return {"conversations": db.list_conversations(user["id"])}
+
+
+@app.post("/api/conversations")
+async def conversation_create(
+    payload: ConversationCreate, user: dict = Depends(require_approved)
+) -> dict:
+    return db.create_conversation(
+        user["id"],
+        title=payload.title or db.NEW_TITLE,
+        model=payload.model,
+        thinking=payload.thinking,
+    )
+
+
+@app.get("/api/conversations/{conversation_id}")
+async def conversation_get(
+    conversation_id: int, user: dict = Depends(require_approved)
+) -> dict:
+    conversation = _owned(conversation_id, user)
+    return {
+        "conversation": conversation,
+        "messages": [_public_message(m) for m in db.list_messages(conversation_id)],
+    }
+
+
+@app.patch("/api/conversations/{conversation_id}")
+async def conversation_patch(
+    conversation_id: int, payload: ConversationPatch, user: dict = Depends(require_approved)
+) -> dict:
+    _owned(conversation_id, user)
+    updated = db.update_conversation(
+        conversation_id, user["id"],
+        title=payload.title, model=payload.model, thinking=payload.thinking,
+    )
+    if updated is None:
+        raise HTTPException(404, "Диалог не найден")
+    return updated
+
+
+@app.delete("/api/conversations/{conversation_id}")
+async def conversation_delete(
+    conversation_id: int, user: dict = Depends(require_approved)
+) -> dict:
+    _owned(conversation_id, user)
+    return {"ok": db.delete_conversation(conversation_id, user["id"])}
+
+
+@app.post("/api/conversations/{conversation_id}/messages")
+async def conversation_send(
+    conversation_id: int, payload: NewMessage, user: dict = Depends(require_approved)
+) -> StreamingResponse:
+    """Принимает новое сообщение, историю поднимает сам и стримит ответ.
+
+    Клиент присылает только текст: историю он не передаёт и подменить её
+    не может. Оба сообщения сохраняются, поэтому после перезапуска диалог
+    продолжается с того же места.
+    """
+    conversation = _owned(conversation_id, user)
+    content = payload.content.strip()
+    if not content:
+        raise HTTPException(400, "Пустое сообщение")
+
+    system_prompt = llm.SYSTEM_PROMPT
+    model = conversation["model"] or llm.MODEL
+    thinking = bool(conversation["thinking"])
+
+    db.add_message(conversation_id, "user", content)
+    # Первое сообщение даёт диалогу имя — иначе список будет из «Новых диалогов».
+    if conversation["title"] == db.NEW_TITLE:
+        db.update_conversation(conversation_id, user["id"], title=content)
+
+    messages = [{"role": "system", "content": system_prompt}]
+    messages += db.history_for_api(conversation_id)
+
+    async def events() -> AsyncIterator[str]:
+        answer, reasoning = "", ""
+        meta: dict = {"system": system_prompt, "model": model}
+        completion_tokens = total_tokens = 0
+        finish_reason = "unknown"
+        elapsed = 0.0
+
+        try:
+            async for event in llm.stream(messages, model=model, thinking=thinking):
+                if event["type"] == "content":
+                    answer += event["text"]
+                elif event["type"] == "reasoning":
+                    reasoning += event["text"]
+                elif event["type"] == "request":
+                    meta["request"] = event["request"]
+                elif event["type"] == "done":
+                    usage = event.get("usage") or {}
+                    completion_tokens = usage.get("completion_tokens", 0)
+                    total_tokens = usage.get("total_tokens", 0)
+                    finish_reason = event["finish_reason"]
+                    elapsed = event["elapsed"]
+                yield sse(event)
+        except llm.LLMError as err:
+            yield sse({"type": "error", "message": str(err)})
+            return
+
+        meta.update(finish_reason=finish_reason, elapsed=elapsed)
+        saved = db.add_message(
+            conversation_id, "assistant", answer,
+            reasoning=reasoning or None,
+            tokens_completion=completion_tokens, tokens_total=total_tokens,
+            meta=json.dumps(meta, ensure_ascii=False),
+        )
+        yield sse({"type": "saved", "message_id": saved["id"], "title": _owned(conversation_id, user)["title"]})
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 # ---------- сравнение способов рассуждения ----------

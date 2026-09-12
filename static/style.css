@@ -214,3 +214,26 @@ td.actions button { margin-left: 6px; }
 .md th, .md td { padding: 7px 10px; }
 .md hr { border: 0; border-top: 1px solid var(--border); margin: 14px 0; }
 .md a { color: var(--accent); }
+
+/* ---------- список диалогов ---------- */
+aside.withlist { display: flex; flex-direction: column; }
+.newconv { width: 100%; margin-bottom: 12px; }
+.convlist { flex: 1 1 auto; overflow-y: auto; margin: 0 -8px 14px; min-height: 80px; }
+.conv {
+  display: flex; align-items: center; gap: 6px; padding: 8px 10px; margin-bottom: 2px;
+  border-radius: 6px; cursor: pointer; font-size: 13px; color: var(--muted);
+}
+.conv:hover { background: var(--bg); }
+.conv.active { background: var(--bg); color: var(--text); font-weight: 600; }
+.conv .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.conv .count { font-family: var(--mono); font-size: 11px; opacity: .7; }
+.conv .kill {
+  flex: 0 0 auto; border: 0; background: transparent; color: var(--muted);
+  font-size: 15px; line-height: 1; padding: 2px 4px; opacity: 0; font-weight: 400;
+}
+.conv:hover .kill, .conv.active .kill { opacity: 1; }
+.conv .kill:hover { color: var(--danger); }
+.convempty { color: var(--muted); font-size: 13px; padding: 10px; }
+.convtitle { display: flex; align-items: center; gap: 10px; padding: 10px 24px; border-bottom: 1px solid var(--border); background: var(--panel); }
+.convtitle b { font-size: 14px; }
+.convtitle input { flex: 1; max-width: 420px; }
