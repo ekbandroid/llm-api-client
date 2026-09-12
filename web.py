@@ -102,6 +102,22 @@ app.add_middleware(
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
 
+@app.middleware("http")
+async def revalidate_assets(request: Request, call_next):
+    """Заставляет браузер проверять, не изменились ли страницы и статика.
+
+    Без Cache-Control браузер сам решает, сколько считать файл свежим, и после
+    выкатки показывает старый CSS, не спрашивая сервер. «no-cache» означает не
+    «не кэшировать», а «кэшируй, но каждый раз переспрашивай»: вместе с ETag
+    проверка стоит один ответ 304 без тела.
+    """
+    response = await call_next(request)
+    is_page = response.headers.get("content-type", "").startswith("text/html")
+    if is_page or request.url.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
+
+
 # ---------- доступ ----------
 
 def current_user(request: Request) -> dict | None:
