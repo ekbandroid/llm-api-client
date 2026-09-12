@@ -58,7 +58,7 @@ FORMAT_PRESETS: dict[str, dict[str, str]] = {
     "custom": {"label": "Свой формат", "spec": ""},
 }
 
-FALLBACK_MODELS = ["deepseek-v4-flash", "deepseek-v4-pro"]
+FALLBACK_MODELS = ["deepseek-flash", "deepseek-v4-pro"]
 
 
 class Constraints(BaseModel):

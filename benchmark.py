@@ -21,9 +21,8 @@ from reasoning import extract_answer, is_correct
 # не оказалась заниженной. В непиковые часы вдвое дешевле, а при попадании
 # в кэш входные токены дешевле примерно в тридцать раз.
 DEFAULT_PRICES: dict[str, dict[str, float]] = {
-    "deepseek-v4-flash": {"in": 0.44, "out": 1.32},
+    "deepseek-flash": {"in": 0.30, "out": 1.20},
     "deepseek-v4-pro": {"in": 1.32, "out": 3.96},
-    "deepseek-v4-flash-vision-exp": {"in": 0.44, "out": 1.32},
 }
 
 DEFAULT_PROMPT = (
@@ -115,7 +114,7 @@ def compare(
 def default_configs() -> list[ModelConfig]:
     """Ступени мощности на том, что доступно в аккаунте DeepSeek."""
     return [
-        ModelConfig("deepseek-v4-flash"),
+        ModelConfig("deepseek-flash"),
         ModelConfig("deepseek-v4-pro"),
         ModelConfig("deepseek-v4-pro", thinking=True),
     ]

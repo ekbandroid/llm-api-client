@@ -36,7 +36,7 @@ python app.py
 | Провайдер | `LLM_BASE_URL` | `LLM_MODEL` |
 |---|---|---|
 | OpenAI | `https://api.openai.com/v1` | `gpt-4o-mini` |
-| DeepSeek | `https://api.deepseek.com` | `deepseek-v4-flash` (дешёвая) / `deepseek-v4-pro` |
+| DeepSeek | `https://api.deepseek.com` | `deepseek-flash` (дешёвая) / `deepseek-v4-pro` |
 | OpenRouter | `https://openrouter.ai/api/v1` | `anthropic/claude-sonnet-4.5` |
 | Ollama (локально) | `http://localhost:11434/v1` | `llama3.2` |
 
@@ -201,7 +201,7 @@ thinking тратит на ответ заметно больше вычисле
 
 | Ступень | Конфигурация |
 |---|---|
-| слабее, дешевле | `deepseek-v4-flash` |
+| слабее, дешевле | `deepseek-flash` |
 | сильнее | `deepseek-v4-pro` |
 | сильнее всего, дороже | `deepseek-v4-pro` + thinking |
 

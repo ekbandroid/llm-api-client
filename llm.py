@@ -14,7 +14,7 @@ load_dotenv()
 
 API_KEY = os.getenv("LLM_API_KEY")
 BASE_URL = os.getenv("LLM_BASE_URL", "https://api.deepseek.com")
-MODEL = os.getenv("LLM_MODEL", "deepseek-v4-flash")
+MODEL = os.getenv("LLM_MODEL", "deepseek-flash")
 THINKING = os.getenv("LLM_THINKING", "true").lower() == "true"
 REASONING_EFFORT = os.getenv("LLM_REASONING_EFFORT", "high")
 SYSTEM_PROMPT = os.getenv("LLM_SYSTEM_PROMPT", "You are a helpful assistant.")
