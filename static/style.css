@@ -1,6 +1,8 @@
 :root {
   --bg: #f6f7f9; --panel: #ffffff; --border: #dfe3e8; --text: #1a1d21;
   --muted: #6b7280; --accent: #16a34a; --accent-text: #052e14;
+  /* Кнопки приглушённее значков: крупная заливка не должна бить в глаза. */
+  --btn: #1d7a45; --btn-text: #ffffff;
   --user: #eef2ff; --warn: #b45309; --warn-soft: #fef3c7;
   --danger: #b91c1c; --danger-soft: #fee2e2;
   --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -9,6 +11,7 @@
   :root {
     --bg: #14161a; --panel: #1c1f24; --border: #2c3138; --text: #e6e8ea;
     --muted: #9aa3ad; --accent: #4ade80; --accent-text: #052e14;
+    --btn: #2f6a4a; --btn-text: #e8f4ec;
     --user: #1e2533; --warn: #fbbf24; --warn-soft: #2c2313;
     --danger: #f87171; --danger-soft: #2a1616;
   }
@@ -41,7 +44,7 @@ textarea { font-family: var(--mono); font-size: 12px; resize: vertical; min-heig
 
 button, .btn {
   display: inline-block; padding: 8px 18px; border: 0; border-radius: 6px;
-  background: var(--accent); color: var(--accent-text);
+  background: var(--btn); color: var(--btn-text);
   font: inherit; font-weight: 600; cursor: pointer; white-space: nowrap; text-decoration: none;
 }
 button:disabled { opacity: .5; cursor: default; }
@@ -220,13 +223,13 @@ aside.withlist { display: flex; flex-direction: column; }
 .newconv { width: 100%; margin-bottom: 12px; }
 .convlist { flex: 1 1 auto; overflow-y: auto; margin: 0 -8px 14px; min-height: 80px; }
 .conv {
-  display: flex; align-items: center; gap: 6px; padding: 8px 10px; margin-bottom: 2px;
+  display: flex; align-items: center; gap: 14px; padding: 8px 10px; margin-bottom: 2px;
   border-radius: 6px; cursor: pointer; font-size: 13px; color: var(--muted);
 }
 .conv:hover { background: var(--bg); }
 .conv.active { background: var(--bg); color: var(--text); font-weight: 600; }
-.conv .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.conv .count { font-family: var(--mono); font-size: 11px; opacity: .7; }
+.conv .name { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.conv .count { flex: 0 0 auto; font-family: var(--mono); font-size: 11px; opacity: .7; }
 .conv .kill {
   flex: 0 0 auto; border: 0; background: transparent; color: var(--muted);
   font-size: 15px; line-height: 1; padding: 2px 4px; opacity: 0; font-weight: 400;

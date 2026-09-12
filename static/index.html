@@ -59,6 +59,8 @@ const el = (tag, cls, text) => {
   return n;
 };
 const words = t => t.trim() ? t.trim().split(/\s+/).length : 0;
+const TITLE_CHARS = 34;
+const shortTitle = t => t.length > TITLE_CHARS ? t.slice(0, TITLE_CHARS).trimEnd() + "…" : t;
 
 fetch("/api/me").then(r => r.json()).then(me => {
   if (!me.authenticated) { location.href = "/login"; return; }
@@ -102,7 +104,11 @@ function renderList() {
   }
   for (const c of conversations) {
     const row = el("div", "conv" + (current && c.id === current.id ? " active" : ""));
-    row.appendChild(el("span", "name", c.title));
+    // Имена режем до одной длины: иначе список выглядит рваным, когда рядом
+    // стоят однословный заголовок и первая фраза на две строки.
+    const name = el("span", "name", shortTitle(c.title));
+    name.title = c.title;
+    row.appendChild(name);
     row.appendChild(el("span", "count", String(c.message_count ?? 0)));
     const kill = el("button", "kill", "×");
     kill.title = "Удалить диалог";
