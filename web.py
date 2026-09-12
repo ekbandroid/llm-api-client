@@ -21,6 +21,7 @@ import benchmark
 import llm
 import reasoning
 import temperature as temperature_mod
+import tokens as tokens_mod
 
 STATIC = Path(__file__).parent / "static"
 
@@ -310,6 +311,17 @@ async def models_page(request: Request):
     return FileResponse(STATIC / "models.html")
 
 
+@app.get("/tokens")
+async def tokens_page(request: Request):
+    """Режим разбора расхода токенов."""
+    user = current_user(request)
+    if user is None:
+        return RedirectResponse("/login", status_code=302)
+    if user["status"] != db.APPROVED:
+        return RedirectResponse("/pending", status_code=302)
+    return FileResponse(STATIC / "tokens.html")
+
+
 @app.get("/admin")
 async def admin_page(request: Request):
     user = current_user(request)
@@ -541,6 +553,38 @@ async def conversation_send(
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# ---------- разбор расхода токенов ----------
+
+@app.get("/api/conversations/{conversation_id}/tokens")
+async def conversation_tokens(
+    conversation_id: int, draft: str = "", user: dict = Depends(require_approved)
+) -> dict:
+    """Расход по обменам, накопительные суммы и оценка следующего запроса."""
+    conversation = _owned(conversation_id, user)
+    model = conversation["model"] or llm.MODEL
+    turns = tokens_mod.dialog_growth(conversation_id, model)
+
+    return {
+        "model": model,
+        "priced": model in benchmark.DEFAULT_PRICES,
+        "turns": [
+            {
+                "index": t.index,
+                "question": t.question[:120],
+                "prompt_tokens": t.prompt_tokens,
+                "completion_tokens": t.completion_tokens,
+                "total_tokens": t.total_tokens,
+                "turn_cost": t.turn_cost,
+                "cumulative_tokens": t.cumulative_tokens,
+                "cumulative_cost": t.cumulative_cost,
+            }
+            for t in turns
+        ],
+        "next_request": tokens_mod.next_request_estimate(conversation_id, draft),
+        "ratios": tokens_mod.RATIOS,
+    }
 
 
 # ---------- сравнение способов рассуждения ----------

@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Токены — LLM чат</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="bar">
+  <a href="/">← К диалогам</a>
+  <b>Токены</b>
+  <span class="grow"></span>
+  <span class="who" id="who"></span>
+  <a class="btn ghost small" href="/admin" id="adminLink" hidden>Пользователи</a>
+  <a class="btn ghost small" href="/auth/logout">Выйти</a>
+</header>
+
+<div class="wrap wide">
+  <h1>Расход токенов по диалогу</h1>
+  <div class="sub">Точные числа берутся из поля <code>usage</code> ответа API и хранятся вместе с сообщением. Оценка размера следующего запроса считается локально по числу символов — это приближение.</div>
+
+  <div class="tokhead">
+    <label><span>Диалог</span><select id="conv"></select></label>
+    <span class="progress" id="status"></span>
+  </div>
+
+  <div class="cards" id="cards" hidden></div>
+
+  <div class="growth" id="growth" hidden>
+    <h2>Как растёт расход по ходу диалога</h2>
+    <div class="sub hint">Каждая новая реплика заново отправляет всю переписку, поэтому входные токены растут от обмена к обмену, а суммарный расход — быстрее, чем линейно.</div>
+    <div id="bars"></div>
+    <div class="legend">
+      <span><i style="background:var(--btn)"></i>входные — вся история</span>
+      <span><i style="background:var(--warn);opacity:.75"></i>выходные — ответ модели</span>
+    </div>
+  </div>
+
+  <div class="summary" id="tableWrap" hidden>
+    <h2>По обменам</h2>
+    <table>
+      <thead><tr><th>#</th><th>Вопрос</th><th>Вход</th><th>Выход</th><th>Всего</th><th>Цена обмена</th><th>Накопительно</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+
+  <div class="growth" id="nextWrap" hidden>
+    <h2>Следующий запрос</h2>
+    <div class="sub hint">Оценка по символам: сколько будет стоить отправить эту переписку ещё раз. На коротких репликах отклонение доходит до 25 процентов, на длинных заметно меньше.</div>
+    <div id="nextStats" class="stats"></div>
+    <div class="gauge"><i id="gaugeFill"></i></div>
+    <div class="hint" id="gaugeText"></div>
+  </div>
+
+  <div class="guide">
+    <h2>Что ломается и когда</h2>
+    <dl>
+      <dt>Стоимость растёт быстрее длины</dt>
+      <dd>История отправляется целиком при каждой реплике, поэтому суммарный расход за диалог из N обменов растёт примерно как квадрат N, а не линейно. Это заметно задолго до любых технических пределов.</dd>
+      <dt>Предел контекста — 1 млн токенов</dt>
+      <dd>Заявлен для обеих моделей DeepSeek, но порог мягкий: проверочный запрос на <b>1 028 577</b> токенов прошёл успешно, с ответом HTTP 200. Упереться в него в обычной переписке практически невозможно.</dd>
+      <dt>Раньше упираешься в деньги и время</dt>
+      <dd>Тот же проверочный запрос стоил <b>31 цент</b> и занял <b>27 секунд</b> только на передачу — и это одна реплика. Именно цена и задержка делают длинный диалог непригодным, а не отказ модели.</dd>
+      <dt>Одна реплика больше 1 МБ не пройдёт</dt>
+      <dd>nginx отвечает <code>413</code> до того, как запрос дойдёт до приложения. Длину диалога это не ограничивает: историю подставляет сервер, в теле запроса едет только новая реплика.</dd>
+      <dt>Русский текст дороже английского</dt>
+      <dd>Измерено на этом же API: <b>3.33</b> символа на токен против <b>5.85</b> у английского и <b>2.41</b> у кода. Одна и та же мысль по-русски обходится почти вдвое дороже.</dd>
+    </dl>
+  </div>
+</div>
+
+<script src="/static/common.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const el = (tag, cls, text) => {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text !== undefined) n.textContent = text;
+  return n;
+};
+const num = n => n.toLocaleString("ru-RU");
+const money = v => v === null || v === undefined ? "—" : "$" + v.toFixed(6);
+
+fetch("/api/me").then(r => r.json()).then(me => {
+  if (!me.authenticated) { location.href = "/login"; return; }
+  if (me.status !== "approved") { location.href = "/pending"; return; }
+  $("who").append("Вы: ", Object.assign(document.createElement("b"), { textContent: me.login }));
+  if (me.is_admin) $("adminLink").hidden = false;
+});
+
+fetch("/api/conversations").then(r => r.json()).then(d => {
+  if (!d.conversations.length) { $("status").textContent = "диалогов нет"; return; }
+  d.conversations.forEach(c => $("conv").add(new Option(`${c.title} (${c.message_count})`, c.id)));
+  load($("conv").value);
+});
+
+$("conv").addEventListener("change", () => load($("conv").value));
+
+function card(value, label) {
+  const c = el("div", "card-stat");
+  c.appendChild(el("div", "v", value));
+  c.appendChild(el("div", "k", label));
+  return c;
+}
+
+async function load(id) {
+  $("status").textContent = "считаю…";
+  const d = await (await fetch(`/api/conversations/${id}/tokens`)).json();
+  const turns = d.turns;
+
+  const totalIn = turns.reduce((s, t) => s + t.prompt_tokens, 0);
+  const totalOut = turns.reduce((s, t) => s + t.completion_tokens, 0);
+  const last = turns[turns.length - 1];
+
+  const cards = $("cards");
+  cards.innerHTML = "";
+  cards.append(
+    card(num(turns.length), "обменов"),
+    card(num(totalIn), "входных токенов"),
+    card(num(totalOut), "выходных токенов"),
+    card(num(totalIn + totalOut), "всего"),
+    card(last && last.cumulative_cost !== null ? money(last.cumulative_cost) : "—", "потрачено"),
+  );
+  cards.hidden = false;
+
+  // Столбики: длина пропорциональна самому дорогому обмену.
+  const bars = $("bars");
+  bars.innerHTML = "";
+  const peak = Math.max(1, ...turns.map(t => t.total_tokens));
+  for (const t of turns) {
+    const row = el("div", "gbar");
+    row.appendChild(el("span", "n", "#" + t.index));
+    const track = el("div", "track");
+    const i1 = el("i", "in"); i1.style.width = (t.prompt_tokens / peak * 100) + "%";
+    const i2 = el("i", "out"); i2.style.width = (t.completion_tokens / peak * 100) + "%";
+    track.append(i1, i2);
+    row.appendChild(track);
+    row.appendChild(el("span", "val", `${num(t.prompt_tokens)} + ${num(t.completion_tokens)}`));
+    bars.appendChild(row);
+  }
+  $("growth").hidden = turns.length === 0;
+
+  const tbody = $("rows");
+  tbody.innerHTML = "";
+  for (const t of turns) {
+    const tr = el("tr");
+    tr.appendChild(el("td", "mono", String(t.index)));
+    tr.appendChild(el("td", null, t.question || "—"));
+    tr.appendChild(el("td", "mono", num(t.prompt_tokens)));
+    tr.appendChild(el("td", "mono", num(t.completion_tokens)));
+    tr.appendChild(el("td", "mono", num(t.total_tokens)));
+    tr.appendChild(el("td", "mono", money(t.turn_cost)));
+    tr.appendChild(el("td", "mono", money(t.cumulative_cost)));
+    tbody.appendChild(tr);
+  }
+  $("tableWrap").hidden = turns.length === 0;
+
+  const n = d.next_request;
+  $("nextStats").innerHTML =
+    `<span>история <b>${num(n.history_tokens)}</b> токенов</span>` +
+    `<span>сообщений <b>${n.messages}</b></span>` +
+    `<span>модель <b>${d.model}</b></span>` +
+    (d.priced ? `<span>отправить снова <b>${money(n.request_tokens / 1e6 * 0.30)}</b></span>` : "");
+  const pct = Math.min(100, n.context_used);
+  $("gaugeFill").style.width = Math.max(pct, 0.4) + "%";
+  $("gaugeText").textContent =
+    `${num(n.request_tokens)} из ${num(n.context_limit)} токенов контекста — ${n.context_used}%.`;
+  $("nextWrap").hidden = false;
+  $("status").textContent = "";
+}
+</script>
+</body>
+</html>

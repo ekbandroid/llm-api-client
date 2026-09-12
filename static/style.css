@@ -251,3 +251,24 @@ aside.withlist { display: flex; flex-direction: column; overflow: hidden; }
 .convtitle { display: flex; align-items: center; gap: 10px; padding: 10px 24px; border-bottom: 1px solid var(--border); background: var(--panel); }
 .convtitle b { font-size: 14px; }
 .convtitle input { flex: 1; max-width: 420px; }
+
+/* ---------- разбор расхода токенов ---------- */
+.tokhead { display: flex; gap: 12px; align-items: flex-end; margin-bottom: 20px; }
+.tokhead label { flex: 1; max-width: 460px; margin: 0; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 24px; }
+.card-stat { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+.card-stat .v { font-size: 22px; font-weight: 600; font-family: var(--mono); }
+.card-stat .k { font-size: 12px; color: var(--muted); margin-top: 2px; }
+.growth { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 18px; margin-bottom: 22px; }
+.growth h2 { font-size: 15px; margin: 0 0 4px; }
+.growth .sub { font-size: 13px; margin-bottom: 16px; }
+.gbar { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; font-size: 12px; font-family: var(--mono); }
+.gbar .n { flex: 0 0 28px; color: var(--muted); text-align: right; }
+.gbar .track { flex: 1; height: 18px; background: var(--bg); border-radius: 4px; overflow: hidden; display: flex; }
+.gbar .in { background: var(--btn); height: 100%; }
+.gbar .out { background: var(--warn); height: 100%; opacity: .75; }
+.gbar .val { flex: 0 0 130px; color: var(--muted); }
+.legend { display: flex; gap: 16px; font-size: 12px; color: var(--muted); margin-top: 12px; }
+.legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: middle; }
+.gauge { height: 10px; background: var(--bg); border: 1px solid var(--border); border-radius: 5px; overflow: hidden; margin: 8px 0 6px; }
+.gauge > i { display: block; height: 100%; background: var(--btn); }

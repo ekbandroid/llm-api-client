@@ -16,6 +16,7 @@
   <a class="btn ghost small" href="/reasoning">Способы рассуждения</a>
   <a class="btn ghost small" href="/temperature">Температура</a>
   <a class="btn ghost small" href="/models">Модели</a>
+  <a class="btn ghost small" href="/tokens">Токены</a>
   <a class="btn ghost small" href="/admin" id="adminLink" hidden>Пользователи</a>
   <a class="btn ghost small" href="/auth/logout">Выйти</a>
 </header>
@@ -30,6 +31,12 @@
     <label><span>Название</span><select id="model"></select></label>
     <div class="check"><input type="checkbox" id="thinking"><label for="thinking" style="margin:0">Режим thinking</label></div>
     <div class="hint">Настройки принадлежат диалогу и сохраняются вместе с ним.</div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Токены</legend>
+    <div class="stats" id="tokenStats" style="margin:0"></div>
+    <div class="hint">История уходит в запрос целиком, поэтому размер следующего запроса растёт с каждой репликой. Оценка приблизительная; точное число приходит с ответом.</div>
   </fieldset>
 </aside>
 
@@ -51,6 +58,10 @@
 const $ = id => document.getElementById(id);
 const log = $("log");
 let conversations = [], current = null, busy = false;
+let loadedTotals = 0;   // сумма tokens_total по сообщениям открытого диалога
+// Исходные тексты сообщений: в DOM markdown уже отрисован, и оценка по нему
+// занижала бы размер запроса — символы разметки там потеряны.
+let loadedTexts = [];
 
 const el = (tag, cls, text) => {
   const n = document.createElement(tag);
@@ -146,6 +157,8 @@ function renderList() {
 }
 
 function showEmpty() {
+  loadedTexts = [];
+  loadedTotals = 0;
   log.innerHTML = "";
   log.appendChild(el("div", "empty", "Создайте диалог или напишите сообщение — диалог заведётся сам."));
   $("convTitle").hidden = true;
@@ -168,6 +181,9 @@ async function openConversation(id) {
   } else {
     for (const m of data.messages) renderStored(m);
   }
+  loadedTotals = data.messages.reduce((s, m) => s + (m.tokens_total || 0), 0);
+  loadedTexts = data.messages.map(m => m.content);
+  updateTokenStats();
   log.scrollTop = log.scrollHeight;
   renderList();
 }
@@ -182,6 +198,20 @@ function addMessage(role, who) {
   log.appendChild(box);
   log.scrollTop = log.scrollHeight;
   return box;
+}
+
+/** Показывает расход диалога и оценку следующего запроса. */
+function updateTokenStats() {
+  const box = $("tokenStats");
+  if (!current) { box.innerHTML = '<span>диалог не выбран</span>'; return; }
+
+  const draft = $("prompt").value;
+  const next = estimateMessages(loadedTexts) + (draft ? estimateTokens(draft) + 4 : 0);
+  const spent = loadedTotals;
+
+  box.innerHTML =
+    `<span>потрачено <b>${spent.toLocaleString("ru-RU")}</b></span>` +
+    `<span>следующий запрос ~<b>${next.toLocaleString("ru-RU")}</b></span>`;
 }
 
 function statsLine(m) {
@@ -249,6 +279,8 @@ async function send(text) {
 
   await ensureConversation();
   addMessage("user", "Вы").querySelector(".body").textContent = text;
+  loadedTexts.push(text);
+  updateTokenStats();
 
   const box = addMessage("assistant", "Модель");
   const body = box.querySelector(".body");
@@ -311,6 +343,9 @@ async function send(text) {
           if (ev.finish_reason === "length") {
             box.appendChild(el("div", "truncated", "Генерация оборвана лимитом max_tokens — ответ не дописан."));
           }
+          loadedTotals += u.total_tokens || 0;
+          loadedTexts.push(answer);
+          updateTokenStats();
         } else if (ev.type === "saved") {
           // Первое сообщение дало диалогу имя — обновляем список и поле заголовка.
           current.title = ev.title;
@@ -371,11 +406,14 @@ $("form").addEventListener("submit", e => {
   send(text);
 });
 
+$("prompt").addEventListener("input", updateTokenStats);
+
 $("prompt").addEventListener("keydown", e => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("form").requestSubmit(); }
 });
 
 loadConversations();
+updateTokenStats();
 </script>
 </body>
 </html>
