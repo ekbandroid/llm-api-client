@@ -257,7 +257,7 @@ $("run").addEventListener("click", async () => {
         else if (ev.type === "error") {
           waiting.textContent = ev.message;
           waiting.className = "waiting error";
-          const d = responseDetails(ev.response, "Ответ API (ошибка)");
+          const d = errorDetails(ev);
           if (d) waiting.after(d);
         }
         else if (ev.type === "done") { $("progress").textContent = "готово"; renderSummary(); }

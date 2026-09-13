@@ -29,10 +29,13 @@ class LLMError(RuntimeError):
     ответ. У сетевых сбоев ответа нет вовсе — тогда response остаётся None.
     """
 
-    def __init__(self, message: str, *, status: int | None = None, body=None) -> None:
+    def __init__(self, message: str, *, status: int | None = None, body=None,
+                 diagnostics: dict | None = None) -> None:
         super().__init__(message)
         self.status = status
         self.body = body
+        # Для сетевых сбоев ответа нет, но сказать о них есть что.
+        self.diagnostics = diagnostics
 
     @property
     def response(self) -> dict | None:
@@ -44,6 +47,28 @@ class LLMError(RuntimeError):
             "status": self.status,
             "body": self.body,
         }
+
+
+def _network_message(err: Exception) -> str:
+    """Текст сетевой ошибки.
+
+    Имя класса подставляется всегда: у части исключений httpx строковое
+    представление пустое, и сообщение вырождалось в «Ошибка сети: » без
+    единого слова — как раз в самом частом случае, при таймауте.
+    """
+    detail = str(err).strip()
+    return f"Ошибка сети: {type(err).__name__}" + (f" — {detail}" if detail else "")
+
+
+def _network_diagnostics(err: Exception, timeout: int) -> dict:
+    """Что известно о сбое, когда ответа от сервера не было."""
+    return {
+        "тип": type(err).__name__,
+        "url": f"{BASE_URL}/chat/completions",
+        "сообщение": str(err) or "исключение без текста",
+        "таймаут_секунд": timeout,
+        "примечание": "ответа от сервера не поступило, тела ответа не существует",
+    }
 
 
 def _parse_body(text: str):
@@ -167,7 +192,9 @@ def complete(messages: list[dict], *, timeout: int = 120, **options) -> Completi
             body=_parse_body(err.response.text),
         ) from err
     except requests.RequestException as err:
-        raise LLMError(f"Ошибка сети: {err}") from err
+        raise LLMError(
+            _network_message(err), diagnostics=_network_diagnostics(err, timeout)
+        ) from err
     elapsed = time.monotonic() - started
 
     body = response.json()
@@ -247,7 +274,9 @@ async def stream(
                         if content := delta.get("content"):
                             yield {"type": "content", "text": content}
     except httpx.HTTPError as err:
-        raise LLMError(f"Ошибка сети: {err}") from err
+        raise LLMError(
+            _network_message(err), diagnostics=_network_diagnostics(err, timeout)
+        ) from err
 
     if last_chunk:
         yield {"type": "response", "response": describe_response(last_chunk, streamed=True)}

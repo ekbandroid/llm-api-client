@@ -88,3 +88,15 @@ function httpErrorHint(status) {
     504: "сервер не дождался ответа модели",
   }[status] || "";
 }
+
+/** Блок под сообщением об ошибке.
+ *
+ *  Если сервер ответил — показываем его ответ. Если ответа не было вовсе
+ *  (сетевой сбой), показываем диагностику: называть её «ответом» было бы
+ *  неправдой, отвечать было некому.
+ */
+function errorDetails(ev) {
+  if (ev.response) return responseDetails(ev.response, "Ответ API (ошибка)");
+  if (ev.diagnostics) return jsonDetails(ev.diagnostics, "Диагностика сбоя");
+  return null;
+}
