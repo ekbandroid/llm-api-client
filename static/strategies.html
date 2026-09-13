@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Стратегии контекста — LLM чат</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="bar">
+  <a href="/">← К диалогам</a>
+  <b>Стратегии контекста</b>
+  <span class="grow"></span>
+  <span class="who" id="who"></span>
+  <a class="btn ghost small" href="/admin" id="adminLink" hidden>Пользователи</a>
+  <a class="btn ghost small" href="/auth/logout">Выйти</a>
+</header>
+
+<div class="wrap wide">
+  <h1>Один вопрос, четыре стратегии</h1>
+  <div class="sub">Один и тот же вопрос задаётся по каждой стратегии сборки контекста. Диалог при этом не меняется: ни вопрос, ни ответы в него не пишутся.</div>
+
+  <div class="setup">
+    <label><span>Диалог</span><select id="conv"></select></label>
+    <label style="margin-top:12px"><span>Вопрос — лучше такой, ответ на который требует помнить начало разговора</span>
+      <input type="text" id="question" placeholder="Например: о чём мы договорились в самом начале?"></label>
+    <div class="go">
+      <button id="run">Сравнить</button>
+      <span class="progress" id="status"></span>
+    </div>
+  </div>
+
+  <div id="results"></div>
+
+  <div class="summary" id="summaryWrap" hidden>
+    <h2>Расход</h2>
+    <table>
+      <thead><tr><th>Стратегия</th><th>Дословно</th><th>Свёрнуто</th><th>Отброшено</th><th>Вход</th><th>Выход</th><th>Цена</th><th>Время</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <div class="hint" id="verdict"></div>
+  </div>
+
+  <div class="growth" id="summaryText" hidden>
+    <h2>Что подставляется вместо переписки</h2>
+    <pre id="summaryBody" style="white-space:pre-wrap"></pre>
+    <pre id="factsBody" style="white-space:pre-wrap"></pre>
+  </div>
+
+  <div class="guide">
+    <h2>Как устроено сжатие</h2>
+    <dl>
+      <dt>Вся история</dt>
+      <dd>Переписка уходит целиком. Ничего не теряется, но запрос растёт с каждой репликой, а вместе с ним цена и задержка.</dd>
+      <dt>Последние N (Sliding Window)</dt>
+      <dd>В запрос идут только последние N сообщений, остальное отбрасывается безвозвратно. Самый дешёвый способ и самый забывчивый: договорённости из начала разговора исчезают. Служебных вызовов не делает вовсе.</dd>
+      <dt>Факты + последние N</dt>
+      <dd>Отдельная карточка ключ-значение с целью, ограничениями, решениями и договорённостями. Обновляется после каждого обмена отдельным вызовом — за это и приходится платить.</dd>
+      <dt>Конспект + хвост</dt>
+      <dd>Всё, что старше хвоста, заменяется конспектом. Конспект наращивается и пересобирается не каждый раз, а по накоплении — поэтому окупается на длинных разговорах.</dd>
+      <dt>Ветки</dt>
+      <dd>Отдельная ось: ветка копирует диалог до выбранного сообщения и дальше живёт сама по себе. Кнопка «⑂ Ветка отсюда» есть под каждым ответом в чате.</dd>
+    </dl>
+  </div>
+</div>
+
+<script src="/static/markdown.js"></script>
+<script src="/static/common.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const el = (tag, cls, text) => {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text !== undefined) n.textContent = text;
+  return n;
+};
+const num = n => n.toLocaleString("ru-RU");
+const money = v => v === null || v === undefined ? "—" : "$" + v.toFixed(6);
+
+fetch("/api/me").then(r => r.json()).then(me => {
+  if (!me.authenticated) { location.href = "/login"; return; }
+  if (me.status !== "approved") { location.href = "/pending"; return; }
+  $("who").append("Вы: ", Object.assign(document.createElement("b"), { textContent: me.login }));
+  if (me.is_admin) $("adminLink").hidden = false;
+});
+
+fetch("/api/conversations").then(r => r.json()).then(d => {
+  if (!d.conversations.length) { $("status").textContent = "диалогов нет"; return; }
+  d.conversations.forEach(c => $("conv").add(new Option(`${c.title} (${c.message_count})`, c.id)));
+});
+
+function card(title, note, data) {
+  const box = el("div", "mcard");
+  const h = el("h3");
+  h.append(title);
+  h.appendChild(el("span", "tag", note));
+  box.appendChild(h);
+  const ans = el("div", "answer");
+  setMarkdown(ans, data.answer);
+  box.appendChild(ans);
+  const req = requestDetails(data.request);
+  if (req) box.appendChild(req);
+  const stats = el("div", "stats");
+  stats.innerHTML =
+    `<span>вход <b>${num(data.prompt_tokens)}</b></span>` +
+    `<span>выход <b>${num(data.completion_tokens)}</b></span>` +
+    `<span>цена <b>${money(data.cost)}</b></span>` +
+    `<span>время <b>${data.elapsed} с</b></span>`;
+  box.appendChild(stats);
+  return box;
+}
+
+$("run").addEventListener("click", async () => {
+  const id = $("conv").value;
+  const question = $("question").value.trim();
+  if (!id || !question) { $("status").textContent = "выберите диалог и впишите вопрос"; return; }
+
+  $("run").disabled = true;
+  $("status").textContent = "спрашиваю дважды…";
+  $("results").innerHTML = "";
+  $("summaryWrap").hidden = true;
+  $("summaryText").hidden = true;
+
+  try {
+    const res = await fetch(`/api/conversations/${id}/strategy-test`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question }),
+    });
+    if (!res.ok) {
+      const info = await httpErrorResponse(res);
+      $("status").textContent = (info.body && info.body.detail) || `Ошибка ${res.status}`;
+      const d = responseDetails(info, "Ответ сервера (ошибка)");
+      if (d) $("results").appendChild(d);
+      return;
+    }
+    const d = await res.json();
+    const NAMES = { full: "Вся история", window: `Последние ${d.context_n}`,
+                    facts: `Факты + последние ${d.context_n}`, summary: "Конспект + хвост" };
+
+    for (const r of d.results) {
+      const note = [
+        `${r.verbatim} дословно`,
+        r.folded ? `${r.folded} свёрнуто` : null,
+        r.dropped ? `${r.dropped} отброшено` : null,
+        r.facts ? `${r.facts} фактов` : null,
+      ].filter(Boolean).join(" · ");
+      $("results").appendChild(card(NAMES[r.strategy] || r.strategy, note, r));
+    }
+
+    const tbody = $("rows");
+    tbody.innerHTML = "";
+    for (const r of d.results) {
+      const tr = el("tr");
+      tr.appendChild(el("td", null, NAMES[r.strategy] || r.strategy));
+      tr.appendChild(el("td", "mono", String(r.verbatim)));
+      tr.appendChild(el("td", "mono", r.folded ? String(r.folded) : "—"));
+      tr.appendChild(el("td", "mono", r.dropped ? String(r.dropped) : "—"));
+      tr.appendChild(el("td", "mono", num(r.prompt_tokens)));
+      tr.appendChild(el("td", "mono", num(r.completion_tokens)));
+      tr.appendChild(el("td", "mono", money(r.cost)));
+      tr.appendChild(el("td", "mono", r.elapsed + " с"));
+      tbody.appendChild(tr);
+    }
+
+    const base = d.results.find(r => r.strategy === "full");
+    const parts = [`В диалоге ${d.messages_total} сообщений, N = ${d.context_n}.`];
+    if (base) {
+      const cheapest = d.results.reduce((a, b) => a.prompt_tokens <= b.prompt_tokens ? a : b);
+      if (cheapest.strategy !== "full") {
+        const saved = base.prompt_tokens - cheapest.prompt_tokens;
+        parts.push(`Дешевле всех «${NAMES[cheapest.strategy]}»: ${num(saved)} входных токенов меньше полной истории — ${
+          Math.round(saved / base.prompt_tokens * 100)}%.`);
+      }
+    }
+    if (d.upkeep_tokens) {
+      parts.push(`Построение конспекта и карточки фактов стоило ${num(d.upkeep_tokens)} токенов — это разовая плата, но у стратегии «факты» она повторяется после каждого обмена.`);
+    }
+    parts.push("Качество и полноту ответов сравните сами: они выше, рядом.");
+    $("verdict").textContent = parts.join(" ");
+    $("summaryWrap").hidden = false;
+
+    $("summaryBody").textContent = d.summary ? "Конспект:\n" + d.summary : "";
+    const factsText = Object.entries(d.facts || {}).map(([k, v]) => `${k}: ${v}`).join("\n");
+    $("factsBody").textContent = factsText ? "\nКарточка фактов:\n" + factsText : "";
+    $("summaryText").hidden = !(d.summary || factsText);
+
+    $("status").textContent = "готово";
+  } catch (err) {
+    $("status").textContent = "сбой: " + err.message;
+  } finally {
+    $("run").disabled = false;
+  }
+});
+</script>
+</body>
+</html>

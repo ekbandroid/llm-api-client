@@ -17,7 +17,7 @@
   <a class="btn ghost small" href="/temperature">Температура</a>
   <a class="btn ghost small" href="/models">Модели</a>
   <a class="btn ghost small" href="/tokens">Токены</a>
-  <a class="btn ghost small" href="/compression">Сжатие</a>
+  <a class="btn ghost small" href="/strategies">Стратегии</a>
   <a class="btn ghost small" href="/admin" id="adminLink" hidden>Пользователи</a>
   <a class="btn ghost small" href="/auth/logout">Выйти</a>
 </header>
@@ -32,8 +32,19 @@
     <label><span>Название</span><select id="model"></select></label>
     <div class="check"><input type="checkbox" id="thinking"><label for="thinking" style="margin:0">Режим thinking</label></div>
     <label style="margin-top:10px"><span>max_tokens — потолок ответа</span><input type="number" id="maxTokens" min="1" max="384000" placeholder="без лимита"></label>
-    <div class="check" style="margin-top:10px"><input type="checkbox" id="compress"><label for="compress" style="margin:0">Сжимать историю</label></div>
-    <div class="hint" id="compressState"></div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Контекст</legend>
+    <label><span>Стратегия</span><select id="strategy">
+      <option value="full">Вся история</option>
+      <option value="window">Последние N сообщений</option>
+      <option value="facts">Факты + последние N</option>
+      <option value="summary">Конспект + хвост</option>
+    </select></label>
+    <label><span>N — сколько сообщений дословно</span><input type="number" id="contextN" min="1" max="200" value="10"></label>
+    <div class="hint" id="strategyState"></div>
+    <details id="factsBox" hidden><summary>Карточка фактов</summary><pre id="factsBody"></pre></details>
     <div class="hint">Настройки принадлежат диалогу и сохраняются вместе с ним. При включённом thinking рассуждение расходует этот же бюджет.</div>
   </fieldset>
 
@@ -142,7 +153,7 @@ function renderList() {
     // Имена режем до одной длины: иначе список выглядит рваным, когда рядом
     // стоят однословный заголовок и первая фраза на две строки.
     const name = el("span", "name", shortTitle(c.title));
-    name.title = c.title;
+    name.title = c.parent_id ? `${c.title}\n(ветка диалога №${c.parent_id})` : c.title;
     row.appendChild(name);
     row.appendChild(el("span", "count", String(c.message_count ?? 0)));
     const kill = el("button", "kill", "×");
@@ -179,8 +190,9 @@ async function openConversation(id) {
   applyModel(current.model);
   $("thinking").checked = !!current.thinking;
   $("maxTokens").value = current.max_tokens || "";
-  $("compress").checked = !!current.compress;
-  showCompression(current);
+  $("strategy").value = current.strategy || "full";
+  $("contextN").value = current.context_n || 10;
+  showStrategy(current);
 
   log.innerHTML = "";
   if (!data.messages.length) {
@@ -207,16 +219,37 @@ function addMessage(role, who) {
   return box;
 }
 
-/** Поясняет, что сейчас со сжатием этого диалога. */
-function showCompression(conv) {
-  const box = $("compressState");
-  if (!conv || !conv.compress) {
-    box.textContent = "История уходит в запрос целиком.";
-    return;
+/** Поясняет, как сейчас собирается запрос в этом диалоге. */
+function showStrategy(conv) {
+  const box = $("strategyState");
+  const factsBox = $("factsBox");
+  factsBox.hidden = true;
+  if (!conv) { box.textContent = ""; return; }
+
+  const n = conv.context_n || 10;
+  const texts = {
+    full: "В запрос уходит вся переписка целиком.",
+    window: `В запрос уходят только последние ${n} сообщений, остальное отбрасывается безвозвратно.`,
+    facts: `В запрос уходят карточка фактов и последние ${n} сообщений.`,
+    summary: "В запрос уходят конспект свёрнутой части и хвост последних сообщений.",
+  };
+  box.textContent = texts[conv.strategy] || texts.full;
+
+  if (conv.strategy === "facts") {
+    const facts = parseFacts(conv.facts);
+    const count = Object.keys(facts).length;
+    factsBox.hidden = false;
+    factsBox.querySelector("summary").textContent = `Карточка фактов (${count})`;
+    $("factsBody").textContent = count
+      ? Object.entries(facts).map(([k, v]) => `${k}: ${v}`).join("\n")
+      : "Пока пусто — карточка заполнится после первого обмена.";
   }
-  box.textContent = conv.summary
-    ? `Свёрнутая часть заменена конспектом (${conv.summary.length} символов); последние сообщения идут как есть.`
-    : "Конспект соберётся, когда накопится достаточно сообщений.";
+}
+
+function parseFacts(raw) {
+  if (!raw) return {};
+  try { const v = JSON.parse(raw); return v && typeof v === "object" ? v : {}; }
+  catch { return {}; }
 }
 
 /** Показывает расход диалога и оценку следующего запроса. */
@@ -231,6 +264,28 @@ function updateTokenStats() {
   box.innerHTML =
     `<span>потрачено <b>${spent.toLocaleString("ru-RU")}</b></span>` +
     `<span>следующий запрос ~<b>${next.toLocaleString("ru-RU")}</b></span>`;
+}
+
+/** Кнопка «Ветка отсюда» под ответом модели. */
+function addBranchButton(box, messageId) {
+  if (!messageId || box.querySelector(".branch")) return;
+  const b = el("button", "ghost small branch", "⑂ Ветка отсюда");
+  b.style.marginTop = "8px";
+  b.title = "Скопировать диалог до этого места и продолжить отдельно";
+  b.onclick = async () => {
+    b.disabled = true;
+    const res = await fetch(`/api/conversations/${current.id}/branch`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ from_message_id: messageId }),
+    });
+    if (!res.ok) { b.disabled = false; alert("Не удалось создать ветку"); return; }
+    const branch = await res.json();
+    current = null;
+    await loadConversations(branch.id);
+    $("prompt").focus();
+  };
+  box.appendChild(b);
 }
 
 function statsLine(m) {
@@ -274,6 +329,7 @@ function renderStored(m) {
     if (d) box.appendChild(d);
   }
   box.appendChild(statsLine(m));
+  addBranchButton(box, m.id);
   if (meta.finish_reason === "length") {
     box.appendChild(el("div", "truncated", "Генерация оборвана лимитом max_tokens — ответ не дописан."));
   }
@@ -291,7 +347,8 @@ async function ensureConversation() {
       model: $("model").value || null,
       thinking: $("thinking").checked,
       max_tokens: Number($("maxTokens").value) || null,
-      compress: $("compress").checked,
+      strategy: $("strategy").value,
+      context_n: Number($("contextN").value) || 10,
     }),
   });
   current = await res.json();
@@ -391,18 +448,29 @@ async function send(text) {
           loadedTotals += u.total_tokens || 0;
           loadedTexts.push(answer);
           updateTokenStats();
+        } else if (ev.type === "facts") {
+          const note = el("div", "hint");
+          note.style.marginTop = "8px";
+          note.textContent = ev.ok
+            ? `Карточка фактов обновлена: ${ev.count} записей` +
+              (ev.added.length ? `, добавлено — ${ev.added.join(", ")}` : "") +
+              `. Обновление стоило ${ev.cost_tokens} токенов.`
+            : `Карточку фактов обновить не удалось: ${ev.reason}. Прежняя сохранена.`;
+          box.appendChild(note);
+          if (current && ev.ok) { current.facts = JSON.stringify(ev.facts); showStrategy(current); }
+        } else if (ev.type === "context_error") {
+          const note = el("div", "truncated");
+          note.textContent = "Обслуживание контекста не удалось: " + ev.message;
+          box.appendChild(note);
         } else if (ev.type === "compressed") {
           const note = el("div", "hint");
           note.style.marginTop = "8px";
           note.textContent = `История свёрнута: ${ev.folded_messages} сообщений заменены конспектом ` +
             `на ${ev.summary_chars} символов, сборка стоила ${ev.cost_tokens} токенов.`;
           box.appendChild(note);
-          if (current) { current.summary = "x".repeat(ev.summary_chars); showCompression(current); }
-        } else if (ev.type === "compress_error") {
-          const note = el("div", "truncated");
-          note.textContent = "Не удалось свернуть историю: " + ev.message;
-          box.appendChild(note);
+          if (current) { current.summary = "x".repeat(ev.summary_chars); showStrategy(current); }
         } else if (ev.type === "saved") {
+          addBranchButton(box, ev.message_id);
           // Первое сообщение дало диалогу имя — обновляем список и поле заголовка.
           current.title = ev.title;
           $("titleInput").value = ev.title;
@@ -438,9 +506,14 @@ $("model").addEventListener("change", () => {
 });
 $("thinking").addEventListener("change", () => patchCurrent({ thinking: $("thinking").checked }));
 // Ноль на сервере означает «снять лимит»; пустое поле — это он и есть.
-$("compress").addEventListener("change", async () => {
-  await patchCurrent({ compress: $("compress").checked });
-  showCompression(current);
+$("strategy").addEventListener("change", async () => {
+  await patchCurrent({ strategy: $("strategy").value });
+  showStrategy(current);
+});
+
+$("contextN").addEventListener("change", async () => {
+  await patchCurrent({ context_n: Number($("contextN").value) || 10 });
+  showStrategy(current);
 });
 
 $("maxTokens").addEventListener("change", () => {
@@ -458,7 +531,8 @@ $("newConv").addEventListener("click", async () => {
       model: $("model").value || null,
       thinking: $("thinking").checked,
       max_tokens: Number($("maxTokens").value) || null,
-      compress: $("compress").checked,
+      strategy: $("strategy").value,
+      context_n: Number($("contextN").value) || 10,
     }),
   });
   const created = await res.json();

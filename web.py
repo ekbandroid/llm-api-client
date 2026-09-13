@@ -312,15 +312,15 @@ async def models_page(request: Request):
     return FileResponse(STATIC / "models.html")
 
 
-@app.get("/compression")
-async def compression_page(request: Request):
-    """Сравнение ответов со сжатой историей и без."""
+@app.get("/strategies")
+async def strategies_page(request: Request):
+    """Сравнение стратегий управления контекстом."""
     user = current_user(request)
     if user is None:
         return RedirectResponse("/login", status_code=302)
     if user["status"] != db.APPROVED:
         return RedirectResponse("/pending", status_code=302)
-    return FileResponse(STATIC / "compression.html")
+    return FileResponse(STATIC / "strategies.html")
 
 
 @app.get("/tokens")
@@ -413,7 +413,8 @@ class ConversationCreate(BaseModel):
     model: str | None = None
     thinking: bool = False
     max_tokens: int | None = Field(default=None, ge=1, le=384_000)
-    compress: bool = False
+    strategy: str = db.FULL
+    context_n: int = Field(default=db.DEFAULT_CONTEXT_N, ge=1, le=200)
 
 
 class ConversationPatch(BaseModel):
@@ -423,7 +424,8 @@ class ConversationPatch(BaseModel):
     # Ноль означает «снять лимит». Пропущенное поле означает «не трогать» —
     # по одному None эти два намерения не различить.
     max_tokens: int | None = Field(default=None, ge=0, le=384_000)
-    compress: bool | None = None
+    strategy: str | None = None
+    context_n: int | None = Field(default=None, ge=1, le=200)
 
 
 class NewMessage(BaseModel):
@@ -469,6 +471,8 @@ async def conversation_create(
         model=payload.model,
         thinking=payload.thinking,
         max_tokens=payload.max_tokens,
+        strategy=payload.strategy,
+        context_n=payload.context_n,
     )
 
 
@@ -493,11 +497,28 @@ async def conversation_patch(
         title=payload.title, model=payload.model, thinking=payload.thinking,
         max_tokens=payload.max_tokens or None,
         clear_max_tokens=payload.max_tokens == 0,
-        compress=payload.compress,
+        strategy=payload.strategy,
+        context_n=payload.context_n,
     )
     if updated is None:
         raise HTTPException(404, "Диалог не найден")
     return updated
+
+
+class BranchRequest(BaseModel):
+    from_message_id: int
+
+
+@app.post("/api/conversations/{conversation_id}/branch")
+async def conversation_branch(
+    conversation_id: int, payload: BranchRequest, user: dict = Depends(require_approved)
+) -> dict:
+    """Создаёт ветку: копию диалога по указанное сообщение включительно."""
+    _owned(conversation_id, user)
+    branch = db.create_branch(conversation_id, user["id"], payload.from_message_id)
+    if branch is None:
+        raise HTTPException(400, "Нечего ветвить: сообщение не найдено")
+    return branch
 
 
 @app.delete("/api/conversations/{conversation_id}")
@@ -573,9 +594,10 @@ async def conversation_send(
 
         meta.update(
             finish_reason=finish_reason, elapsed=elapsed,
-            compression={
-                "enabled": bool(conversation["compress"]),
-                "verbatim": plan.verbatim, "folded": plan.folded, "stale": plan.stale,
+            context={
+                "strategy": plan.strategy, "verbatim": plan.verbatim,
+                "folded": plan.folded, "dropped": plan.dropped,
+                "facts": len(plan.facts),
             },
         )
         saved = db.add_message(
@@ -588,15 +610,24 @@ async def conversation_send(
 
         # Пересборку делаем после ответа: пользователь его уже видит, лишняя
         # задержка на сворачивание истории до него не доходит.
+        # Обслуживание контекста идёт после ответа: пользователь его уже видит,
+        # и задержка на конспект или карточку фактов до него не доходит.
         fresh = _owned(conversation_id, user)
-        if history.needs_refresh(fresh):
-            try:
+        try:
+            if history.needs_refresh(fresh):
                 info = await asyncio.to_thread(history.refresh, fresh, model=model)
-            except llm.LLMError as err:
-                yield sse({"type": "compress_error", "message": str(err)})
-                return
-            if info:
-                yield sse({"type": "compressed", **info})
+                if info:
+                    yield sse({"type": "compressed", **info})
+            elif (fresh["strategy"] or db.FULL) == db.FACTS:
+                exchange = [{"role": "user", "content": content},
+                            {"role": "assistant", "content": answer}]
+                info = await asyncio.to_thread(
+                    history.refresh_facts, fresh, exchange, model=model
+                )
+                if info:
+                    yield sse({"type": "facts", **info})
+        except llm.LLMError as err:
+            yield sse({"type": "context_error", "message": str(err)})
 
     return StreamingResponse(
         events(),
@@ -605,84 +636,87 @@ async def conversation_send(
     )
 
 
-# ---------- сравнение со сжатием и без ----------
+# ---------- сравнение стратегий ----------
 
-class CompressionTest(BaseModel):
+class StrategyTest(BaseModel):
     question: str
+    strategies: list[str] = Field(default_factory=lambda: list(db.STRATEGIES))
 
 
-@app.post("/api/conversations/{conversation_id}/compression-test")
-async def compression_test(
-    conversation_id: int, payload: CompressionTest, user: dict = Depends(require_approved)
+@app.post("/api/conversations/{conversation_id}/strategy-test")
+async def strategy_test(
+    conversation_id: int, payload: StrategyTest, user: dict = Depends(require_approved)
 ) -> dict:
-    """Задаёт один вопрос дважды: по полной истории и по сжатой.
+    """Задаёт один вопрос по каждой стратегии сборки контекста.
 
-    Диалог при этом не меняется — ни вопрос, ни ответы в него не пишутся.
-    Конспект, если его ещё не было, строится и сохраняется: он полезен сам
-    по себе и не зависит от того, включено сжатие или нет.
+    Диалог не меняется: ни вопрос, ни ответы в него не пишутся. Конспект и
+    карточка фактов при необходимости строятся и сохраняются — они полезны
+    сами по себе и не зависят от того, какая стратегия выбрана в диалоге.
     """
     conversation = _owned(conversation_id, user)
     question = payload.question.strip()
     if not question:
         raise HTTPException(400, "Вопрос не может быть пустым")
 
+    unknown = [s for s in payload.strategies if s not in db.STRATEGIES]
+    if unknown:
+        raise HTTPException(400, f"Неизвестные стратегии: {', '.join(unknown)}")
+
     model = conversation["model"] or llm.MODEL
     system_prompt = llm.SYSTEM_PROMPT
     rows = db.list_messages(conversation_id)
-    if len(rows) <= history.KEEP_LAST:
-        raise HTTPException(
-            400,
-            f"В диалоге {len(rows)} сообщений — сворачивать нечего. "
-            f"Сжатие начинает работать, когда их больше {history.KEEP_LAST}.",
+    if len(rows) < 4:
+        raise HTTPException(400, f"В диалоге {len(rows)} сообщений — сравнивать нечего.")
+
+    upkeep = 0
+    if db.SUMMARY in payload.strategies:
+        forced = dict(conversation, strategy=db.SUMMARY)
+        if history.split(rows, conversation["summary_upto"])[1]:
+            info = await asyncio.to_thread(history.refresh, forced, model=model)
+            upkeep += info["cost_tokens"] if info else 0
+    if db.FACTS in payload.strategies and not conversation["facts"]:
+        exchange = [{"role": r["role"], "content": r["content"]} for r in rows]
+        info = await asyncio.to_thread(
+            history.refresh_facts, dict(conversation, strategy=db.FACTS), exchange, model=model
         )
+        upkeep += info["cost_tokens"] if info else 0
 
-    # Конспект нужен обеим веткам сравнения, строим при необходимости.
-    forced = dict(conversation, compress=1)
-    _, stale, _ = history.split(rows, conversation["summary_upto"])
-    summary_cost = 0
-    if stale:
-        info = await asyncio.to_thread(history.refresh, forced, model=model)
-        summary_cost = info["cost_tokens"] if info else 0
-        forced = _owned(conversation_id, user)
-        forced = dict(forced, compress=1)
-
-    full_plan = history.plan_request(dict(conversation, compress=0), system_prompt)
-    small_plan = history.plan_request(forced, system_prompt)
+    conversation = _owned(conversation_id, user)
     ask = {"role": "user", "content": question}
+    results = []
 
-    async def run(messages: list[dict]) -> llm.Completion:
-        return await asyncio.to_thread(
-            llm.complete, messages + [ask], model=model, thinking=False
-        )
-
-    try:
-        full, small = await run(full_plan.messages), await run(small_plan.messages)
-    except llm.LLMError as err:
-        raise HTTPException(502, str(err)) from err
-
-    def described(plan, result: llm.Completion) -> dict:
-        return {
+    for name in payload.strategies:
+        plan = history.plan_request(dict(conversation, strategy=name), system_prompt)
+        try:
+            result = await asyncio.to_thread(
+                llm.complete, plan.messages + [ask], model=model, thinking=False
+            )
+        except llm.LLMError as err:
+            raise HTTPException(502, f"{name}: {err}") from err
+        results.append({
+            "strategy": name,
             "answer": result.content.strip(),
             "prompt_tokens": result.prompt_tokens,
             "completion_tokens": result.completion_tokens,
             "total_tokens": result.total_tokens,
             "cost": tokens_mod.cost(result.prompt_tokens, result.completion_tokens, model),
             "elapsed": round(result.elapsed, 2),
-            "messages_sent": len(plan.messages) + 1,
             "verbatim": plan.verbatim,
+            "dropped": plan.dropped,
             "folded": plan.folded,
+            "facts": len(plan.facts),
             "request": result.request,
-        }
+        })
 
     return {
         "model": model,
         "question": question,
-        "summary": small_plan.summary,
-        "summary_build_tokens": summary_cost,
-        "full": described(full_plan, full),
-        "compressed": described(small_plan, small),
-        "keep_last": history.KEEP_LAST,
-        "compress_every": history.COMPRESS_EVERY,
+        "messages_total": len(rows),
+        "context_n": conversation["context_n"],
+        "summary": conversation["summary"] or "",
+        "facts": history.load_facts(conversation),
+        "upkeep_tokens": upkeep,
+        "results": results,
     }
 
 

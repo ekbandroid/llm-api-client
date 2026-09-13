@@ -39,9 +39,15 @@ CREATE TABLE IF NOT EXISTS conversations (
     model      TEXT,
     thinking   INTEGER NOT NULL DEFAULT 0,
     max_tokens INTEGER,
-    compress   INTEGER NOT NULL DEFAULT 0,
+    -- Стратегия сборки запроса: full, window, facts, summary.
+    strategy   TEXT    NOT NULL DEFAULT 'full',
+    context_n  INTEGER NOT NULL DEFAULT 10,
+    facts      TEXT,
     summary    TEXT,
     summary_upto INTEGER,
+    -- Ветка: откуда отпочковалась и от какого сообщения.
+    parent_id  INTEGER REFERENCES conversations(id) ON DELETE SET NULL,
+    branched_from INTEGER,
     created_at TEXT    NOT NULL,
     updated_at TEXT    NOT NULL
 );
@@ -86,7 +92,19 @@ MIGRATIONS = {
         "summary": "TEXT",
         # id последнего сообщения, вошедшего в конспект
         "summary_upto": "INTEGER",
+        "strategy": "TEXT NOT NULL DEFAULT 'full'",
+        "context_n": "INTEGER NOT NULL DEFAULT 10",
+        "facts": "TEXT",
+        "parent_id": "INTEGER",
+        "branched_from": "INTEGER",
     },
+}
+
+# Что выполнить один раз сразу после появления колонки.
+BACKFILL = {
+    # Прежний переключатель «сжимать историю» стал одной из стратегий.
+    ("conversations", "strategy"):
+        "UPDATE conversations SET strategy = 'summary' WHERE compress = 1",
 }
 
 
@@ -94,8 +112,12 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     for table, columns in MIGRATIONS.items():
         existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
         for name, kind in columns.items():
-            if name not in existing:
-                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
+            if name in existing:
+                continue
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
+            backfill = BACKFILL.get((table, name))
+            if backfill:
+                conn.execute(backfill)
 
 
 def init() -> None:
@@ -256,18 +278,27 @@ def count_admins() -> int:
 NEW_TITLE = "Новый диалог"
 TITLE_LIMIT = 60
 
+# Способы собрать запрос из переписки.
+FULL, WINDOW, FACTS, SUMMARY = "full", "window", "facts", "summary"
+STRATEGIES = (FULL, WINDOW, FACTS, SUMMARY)
+DEFAULT_CONTEXT_N = 10
+
 
 def create_conversation(
     user_id: int, *, title: str = NEW_TITLE, model: str | None = None,
     thinking: bool = False, max_tokens: int | None = None,
+    strategy: str = FULL, context_n: int = DEFAULT_CONTEXT_N,
 ) -> dict:
     """Заводит пустой диалог и возвращает его."""
+    if strategy not in STRATEGIES:
+        raise ValueError(f"Неизвестная стратегия: {strategy}")
     with connect() as conn:
         cur = conn.execute(
             "INSERT INTO conversations (user_id, title, model, thinking, max_tokens,"
-            " created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            " strategy, context_n, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (user_id, title.strip()[:TITLE_LIMIT] or NEW_TITLE, model, int(thinking),
-             max_tokens, _now(), _now()),
+             max_tokens, strategy, max(1, min(context_n, 200)), _now(), _now()),
         )
         row = conn.execute("SELECT * FROM conversations WHERE id = ?", (cur.lastrowid,)).fetchone()
     return dict(row)
@@ -298,7 +329,8 @@ def update_conversation(
     conversation_id: int, user_id: int, *, title: str | None = None,
     model: str | None = None, thinking: bool | None = None,
     max_tokens: int | None = None, clear_max_tokens: bool = False,
-    compress: bool | None = None,
+    compress: bool | None = None, strategy: str | None = None,
+    context_n: int | None = None,
 ) -> dict | None:
     """Меняет название или настройки. Возвращает None, если диалог чужой или его нет."""
     sets, values = [], []
@@ -316,6 +348,14 @@ def update_conversation(
     if compress is not None:
         sets.append("compress = ?")
         values.append(int(compress))
+    if strategy is not None:
+        if strategy not in STRATEGIES:
+            raise ValueError(f"Неизвестная стратегия: {strategy}")
+        sets.append("strategy = ?")
+        values.append(strategy)
+    if context_n is not None:
+        sets.append("context_n = ?")
+        values.append(max(1, min(context_n, 200)))
     if clear_max_tokens:
         sets.append("max_tokens = NULL")
     elif max_tokens is not None:
@@ -369,6 +409,59 @@ def add_message(
             "UPDATE conversations SET updated_at = ? WHERE id = ?", (_now(), conversation_id)
         )
         row = conn.execute("SELECT * FROM messages WHERE id = ?", (cur.lastrowid,)).fetchone()
+    return dict(row)
+
+
+def set_facts(conversation_id: int, facts_json: str) -> None:
+    """Сохраняет блок фактов диалога (JSON-объект ключ-значение)."""
+    with connect() as conn:
+        conn.execute(
+            "UPDATE conversations SET facts = ? WHERE id = ?", (facts_json, conversation_id)
+        )
+
+
+def create_branch(conversation_id: int, user_id: int, from_message_id: int) -> dict | None:
+    """Создаёт ветку: копию диалога по сообщение from_message_id включительно.
+
+    Ветка — отдельный диалог с копией сообщений, а не общее дерево. Так две
+    ветки развиваются совершенно независимо, удаление одной не задевает
+    другую, и весь остальной код работает с веткой как с обычным диалогом.
+    Цена — дублирование уже сказанного; на здешних объёмах это дешевле,
+    чем усложнять выборку сообщений во всех запросах.
+    """
+    source = get_conversation(conversation_id, user_id)
+    if source is None:
+        return None
+
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM messages WHERE conversation_id = ? AND id <= ? ORDER BY id",
+            (conversation_id, from_message_id),
+        ).fetchall()
+        if not rows:
+            return None
+
+        base = source["title"].removeprefix("↳ ")
+        cur = conn.execute(
+            "INSERT INTO conversations (user_id, title, model, thinking, max_tokens,"
+            " strategy, context_n, facts, summary, summary_upto, parent_id, branched_from,"
+            " created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (user_id, f"↳ {base}"[:TITLE_LIMIT], source["model"], source["thinking"],
+             source["max_tokens"], source["strategy"], source["context_n"],
+             source["facts"], source["summary"], source["summary_upto"],
+             conversation_id, from_message_id, _now(), _now()),
+        )
+        branch_id = cur.lastrowid
+        for r in rows:
+            conn.execute(
+                "INSERT INTO messages (conversation_id, role, content, reasoning,"
+                " tokens_completion, tokens_total, meta, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (branch_id, r["role"], r["content"], r["reasoning"], r["tokens_completion"],
+                 r["tokens_total"], r["meta"], r["created_at"]),
+            )
+        row = conn.execute("SELECT * FROM conversations WHERE id = ?", (branch_id,)).fetchone()
     return dict(row)
 
 
