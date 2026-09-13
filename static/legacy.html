@@ -141,7 +141,15 @@ async function send(text) {
     });
     if (res.status === 401) { location.href = "/login"; return; }
     if (res.status === 403) { location.href = "/pending"; return; }
-    if (!res.ok) throw new Error("HTTP " + res.status);
+    if (!res.ok) {
+      const info = await httpErrorResponse(res);
+      const hint = httpErrorHint(res.status);
+      body.classList.add("error");
+      body.textContent = `Сбой запроса: HTTP ${res.status}` + (hint ? ` — ${hint}` : "");
+      const d = responseDetails(info, "Ответ сервера (ошибка)");
+      if (d) el.appendChild(d);
+      return;
+    }
 
     const reader = res.body.getReader();
     const decoder = new TextDecoder();

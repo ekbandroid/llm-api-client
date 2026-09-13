@@ -226,7 +226,15 @@ $("run").addEventListener("click", async () => {
       body: JSON.stringify({ prompt, reference: $("reference").value.trim(), configs }),
     });
     if (res.status === 401) { location.href = "/login"; return; }
-    if (!res.ok) throw new Error("HTTP " + res.status);
+    if (!res.ok) {
+      const info = await httpErrorResponse(res);
+      const hint = httpErrorHint(res.status);
+      waiting.textContent = `Сбой запроса: HTTP ${res.status}` + (hint ? ` — ${hint}` : "");
+      waiting.className = "waiting error";
+      const d = responseDetails(info, "Ответ сервера (ошибка)");
+      if (d) waiting.after(d);
+      return;
+    }
 
     const reader = res.body.getReader();
     const decoder = new TextDecoder();

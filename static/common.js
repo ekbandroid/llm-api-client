@@ -64,3 +64,27 @@ function estimateTokens(text) {
 function estimateMessages(texts) {
   return texts.reduce((sum, t) => sum + estimateTokens(t) + MESSAGE_OVERHEAD, 0);
 }
+
+/** Разбирает неуспешный ответ нашего же сервера.
+ *
+ *  Такие сбои идут мимо потока событий: запрос может не дойти до приложения
+ *  вовсе. Например 413 отдаёт nginx, и тело у него — HTML, а не JSON.
+ */
+async function httpErrorResponse(res) {
+  let body;
+  try {
+    body = await res.clone().json();
+  } catch {
+    body = (await res.text()).slice(0, 2000);
+  }
+  return { url: res.url, status: res.status, statusText: res.statusText, body };
+}
+
+/** Понятное объяснение для кодов, которые пользователь может увидеть. */
+function httpErrorHint(status) {
+  return {
+    413: "сообщение слишком большое, nginx отклоняет запросы тяжелее 1 МБ",
+    502: "приложение не ответило: возможно, идёт перезапуск",
+    504: "сервер не дождался ответа модели",
+  }[status] || "";
+}

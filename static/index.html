@@ -304,7 +304,19 @@ async function send(text) {
       body: JSON.stringify({ content: text }),
     });
     if (res.status === 401) { location.href = "/login"; return; }
-    if (!res.ok) throw new Error("HTTP " + res.status);
+    if (!res.ok) {
+      const info = await httpErrorResponse(res);
+      const hint = httpErrorHint(res.status);
+      body.classList.add("error");
+      body.textContent = `Сбой запроса: HTTP ${res.status}` + (hint ? ` — ${hint}` : "");
+      const d = responseDetails(info, "Ответ сервера (ошибка)");
+      if (d) box.appendChild(d);
+      // Запрос до приложения не дошёл, в историю ничего не записано —
+      // убираем вопрос из подсчёта, иначе оценка следующего запроса завысится.
+      loadedTexts.pop();
+      updateTokenStats();
+      return;
+    }
 
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
