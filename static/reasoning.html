@@ -185,7 +185,12 @@ $("run").addEventListener("click", async () => {
           renderMethod(ev);
           $("progress").textContent = `${results.length} / ${total}`;
         }
-        else if (ev.type === "error") { waiting.textContent = ev.message; waiting.className = "waiting error"; }
+        else if (ev.type === "error") {
+          waiting.textContent = ev.message;
+          waiting.className = "waiting error";
+          const d = responseDetails(ev.response, "Ответ API (ошибка)");
+          if (d) waiting.after(d);
+        }
         else if (ev.type === "done") { $("progress").textContent = "готово"; renderSummary(); }
       }
     }

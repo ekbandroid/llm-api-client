@@ -221,7 +221,7 @@ async def chat(
             ):
                 yield sse(event)
         except llm.LLMError as err:
-            yield sse({"type": "error", "message": str(err)})
+            yield sse({"type": "error", "message": str(err), "response": err.response})
 
     return StreamingResponse(
         events(),
@@ -513,7 +513,7 @@ async def conversation_send(
     thinking = bool(conversation["thinking"])
     max_tokens = conversation["max_tokens"] or None
 
-    db.add_message(conversation_id, "user", content)
+    asked = db.add_message(conversation_id, "user", content)
     # Первое сообщение даёт диалогу имя — иначе список будет из «Новых диалогов».
     if conversation["title"] == db.NEW_TITLE:
         db.update_conversation(conversation_id, user["id"], title=content)
@@ -548,7 +548,11 @@ async def conversation_send(
                     elapsed = event["elapsed"]
                 yield sse(event)
         except llm.LLMError as err:
-            yield sse({"type": "error", "message": str(err)})
+            # Обмен не состоялся — убираем вопрос из истории. Иначе каждая
+            # неудачная попытка оставалась бы в диалоге навсегда и оплачивалась
+            # заново в каждом следующем запросе.
+            db.delete_message(asked["id"])
+            yield sse({"type": "error", "message": str(err), "response": err.response})
             return
 
         meta.update(finish_reason=finish_reason, elapsed=elapsed)
@@ -624,7 +628,7 @@ async def api_reasoning(
                 # потоке, иначе они заблокируют событийный цикл целиком.
                 res = await asyncio.to_thread(method, task, request.model)
             except llm.LLMError as err:
-                yield sse({"type": "error", "message": str(err)})
+                yield sse({"type": "error", "message": str(err), "response": err.response})
                 return
             yield sse({
                 "type": "result",
@@ -683,7 +687,7 @@ async def api_temperature(
                     model=request.model,
                 )
             except llm.LLMError as err:
-                yield sse({"type": "error", "message": str(err)})
+                yield sse({"type": "error", "message": str(err), "response": err.response})
                 return
             yield sse({
                 "type": "result",
@@ -747,7 +751,7 @@ async def api_benchmark(
                     benchmark.run_config, prompt, config, reference=request.reference
                 )
             except llm.LLMError as err:
-                yield sse({"type": "error", "message": f"{config.title}: {err}"})
+                yield sse({"type": "error", "message": f"{config.title}: {err}", "response": err.response})
                 return
             yield sse({
                 "type": "result",

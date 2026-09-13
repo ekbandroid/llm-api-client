@@ -359,6 +359,13 @@ def add_message(
     return dict(row)
 
 
+def delete_message(message_id: int) -> bool:
+    """Удаляет сообщение. Нужно, чтобы откатить неудавшийся обмен."""
+    with connect() as conn:
+        cur = conn.execute("DELETE FROM messages WHERE id = ?", (message_id,))
+    return cur.rowcount > 0
+
+
 def list_messages(conversation_id: int) -> list[dict]:
     """Все сообщения диалога в порядке добавления."""
     with connect() as conn:

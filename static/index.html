@@ -345,6 +345,8 @@ async function send(text) {
         } else if (ev.type === "error") {
           body.classList.add("error");
           body.textContent = ev.message;
+          const d = responseDetails(ev.response, "Ответ API (ошибка)");
+          if (d) box.appendChild(d);
         } else if (ev.type === "done") {
           const u = ev.usage || {};
           box.appendChild(statsLine({

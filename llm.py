@@ -22,7 +22,36 @@ SYSTEM_PROMPT = os.getenv("LLM_SYSTEM_PROMPT", "You are a helpful assistant.")
 
 
 class LLMError(RuntimeError):
-    """Ошибка вызова API — сеть или ненулевой HTTP-статус."""
+    """Ошибка вызова API — сеть или ненулевой HTTP-статус.
+
+    Тело ответа хранится разобранным, а не вклеенным в текст сообщения:
+    иначе его нельзя показать пользователю тем же способом, что и обычный
+    ответ. У сетевых сбоев ответа нет вовсе — тогда response остаётся None.
+    """
+
+    def __init__(self, message: str, *, status: int | None = None, body=None) -> None:
+        super().__init__(message)
+        self.status = status
+        self.body = body
+
+    @property
+    def response(self) -> dict | None:
+        """Ответ сервера для показа в интерфейсе. None — ответа не было."""
+        if self.status is None:
+            return None
+        return {
+            "url": f"{BASE_URL}/chat/completions",
+            "status": self.status,
+            "body": self.body,
+        }
+
+
+def _parse_body(text: str):
+    """Разбирает тело ошибки как JSON, а если не вышло — отдаёт текстом."""
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return text[:2000]
 
 
 @dataclass
@@ -132,7 +161,11 @@ def complete(messages: list[dict], *, timeout: int = 120, **options) -> Completi
         )
         response.raise_for_status()
     except requests.HTTPError as err:
-        raise LLMError(f"Ошибка API {err.response.status_code}: {err.response.text}") from err
+        raise LLMError(
+            f"Ошибка API {err.response.status_code}: {err.response.text[:300]}",
+            status=err.response.status_code,
+            body=_parse_body(err.response.text),
+        ) from err
     except requests.RequestException as err:
         raise LLMError(f"Ошибка сети: {err}") from err
     elapsed = time.monotonic() - started
@@ -185,7 +218,11 @@ async def stream(
             ) as response:
                 if response.status_code != 200:
                     detail = (await response.aread()).decode("utf-8", "replace")
-                    raise LLMError(f"Ошибка API {response.status_code}: {detail}")
+                    raise LLMError(
+                        f"Ошибка API {response.status_code}: {detail[:300]}",
+                        status=response.status_code,
+                        body=_parse_body(detail),
+                    )
 
                 async for line in response.aiter_lines():
                     if not line.startswith("data:"):
