@@ -39,6 +39,9 @@ CREATE TABLE IF NOT EXISTS conversations (
     model      TEXT,
     thinking   INTEGER NOT NULL DEFAULT 0,
     max_tokens INTEGER,
+    compress   INTEGER NOT NULL DEFAULT 0,
+    summary    TEXT,
+    summary_upto INTEGER,
     created_at TEXT    NOT NULL,
     updated_at TEXT    NOT NULL
 );
@@ -77,7 +80,13 @@ def connect() -> sqlite3.Connection:
 # Колонки, добавленные после первого выпуска. CREATE TABLE IF NOT EXISTS
 # их не создаст в уже существующей таблице, поэтому добавляем отдельно.
 MIGRATIONS = {
-    "conversations": {"max_tokens": "INTEGER"},
+    "conversations": {
+        "max_tokens": "INTEGER",
+        "compress": "INTEGER NOT NULL DEFAULT 0",
+        "summary": "TEXT",
+        # id последнего сообщения, вошедшего в конспект
+        "summary_upto": "INTEGER",
+    },
 }
 
 
@@ -289,6 +298,7 @@ def update_conversation(
     conversation_id: int, user_id: int, *, title: str | None = None,
     model: str | None = None, thinking: bool | None = None,
     max_tokens: int | None = None, clear_max_tokens: bool = False,
+    compress: bool | None = None,
 ) -> dict | None:
     """Меняет название или настройки. Возвращает None, если диалог чужой или его нет."""
     sets, values = [], []
@@ -303,6 +313,9 @@ def update_conversation(
         values.append(int(thinking))
     # Снять лимит и не трогать его — разные намерения, поэтому отдельный флаг:
     # по одному лишь max_tokens=None их не различить.
+    if compress is not None:
+        sets.append("compress = ?")
+        values.append(int(compress))
     if clear_max_tokens:
         sets.append("max_tokens = NULL")
     elif max_tokens is not None:
@@ -359,6 +372,15 @@ def add_message(
     return dict(row)
 
 
+def set_summary(conversation_id: int, summary: str, upto_message_id: int) -> None:
+    """Сохраняет конспект и границу, до которой он покрывает переписку."""
+    with connect() as conn:
+        conn.execute(
+            "UPDATE conversations SET summary = ?, summary_upto = ? WHERE id = ?",
+            (summary, upto_message_id, conversation_id),
+        )
+
+
 def delete_message(message_id: int) -> bool:
     """Удаляет сообщение. Нужно, чтобы откатить неудавшийся обмен."""
     with connect() as conn:
@@ -376,10 +398,7 @@ def list_messages(conversation_id: int) -> list[dict]:
 
 
 def history_for_api(conversation_id: int) -> list[dict]:
-    """История в том виде, в каком она уходит в API: только роль и текст.
-
-    Ограничения на длину пока нет — вся переписка отправляется целиком.
-    """
+    """Полная история: только роль и текст, без сжатия."""
     with connect() as conn:
         rows = conn.execute(
             "SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY id",

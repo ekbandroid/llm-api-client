@@ -18,6 +18,7 @@ from starlette.middleware.sessions import SessionMiddleware
 import auth
 import db
 import benchmark
+import history
 import llm
 import reasoning
 import temperature as temperature_mod
@@ -311,6 +312,17 @@ async def models_page(request: Request):
     return FileResponse(STATIC / "models.html")
 
 
+@app.get("/compression")
+async def compression_page(request: Request):
+    """Сравнение ответов со сжатой историей и без."""
+    user = current_user(request)
+    if user is None:
+        return RedirectResponse("/login", status_code=302)
+    if user["status"] != db.APPROVED:
+        return RedirectResponse("/pending", status_code=302)
+    return FileResponse(STATIC / "compression.html")
+
+
 @app.get("/tokens")
 async def tokens_page(request: Request):
     """Режим разбора расхода токенов."""
@@ -401,6 +413,7 @@ class ConversationCreate(BaseModel):
     model: str | None = None
     thinking: bool = False
     max_tokens: int | None = Field(default=None, ge=1, le=384_000)
+    compress: bool = False
 
 
 class ConversationPatch(BaseModel):
@@ -410,6 +423,7 @@ class ConversationPatch(BaseModel):
     # Ноль означает «снять лимит». Пропущенное поле означает «не трогать» —
     # по одному None эти два намерения не различить.
     max_tokens: int | None = Field(default=None, ge=0, le=384_000)
+    compress: bool | None = None
 
 
 class NewMessage(BaseModel):
@@ -479,6 +493,7 @@ async def conversation_patch(
         title=payload.title, model=payload.model, thinking=payload.thinking,
         max_tokens=payload.max_tokens or None,
         clear_max_tokens=payload.max_tokens == 0,
+        compress=payload.compress,
     )
     if updated is None:
         raise HTTPException(404, "Диалог не найден")
@@ -518,8 +533,9 @@ async def conversation_send(
     if conversation["title"] == db.NEW_TITLE:
         db.update_conversation(conversation_id, user["id"], title=content)
 
-    messages = [{"role": "system", "content": system_prompt}]
-    messages += db.history_for_api(conversation_id)
+    # Заново читаем диалог: только что добавленный вопрос должен войти в план.
+    plan = history.plan_request(_owned(conversation_id, user), system_prompt)
+    messages = plan.messages
 
     async def events() -> AsyncIterator[str]:
         answer, reasoning = "", ""
@@ -555,7 +571,13 @@ async def conversation_send(
             yield sse({"type": "error", "message": str(err), "response": err.response, "diagnostics": err.diagnostics})
             return
 
-        meta.update(finish_reason=finish_reason, elapsed=elapsed)
+        meta.update(
+            finish_reason=finish_reason, elapsed=elapsed,
+            compression={
+                "enabled": bool(conversation["compress"]),
+                "verbatim": plan.verbatim, "folded": plan.folded, "stale": plan.stale,
+            },
+        )
         saved = db.add_message(
             conversation_id, "assistant", answer,
             reasoning=reasoning or None,
@@ -564,11 +586,104 @@ async def conversation_send(
         )
         yield sse({"type": "saved", "message_id": saved["id"], "title": _owned(conversation_id, user)["title"]})
 
+        # Пересборку делаем после ответа: пользователь его уже видит, лишняя
+        # задержка на сворачивание истории до него не доходит.
+        fresh = _owned(conversation_id, user)
+        if history.needs_refresh(fresh):
+            try:
+                info = await asyncio.to_thread(history.refresh, fresh, model=model)
+            except llm.LLMError as err:
+                yield sse({"type": "compress_error", "message": str(err)})
+                return
+            if info:
+                yield sse({"type": "compressed", **info})
+
     return StreamingResponse(
         events(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# ---------- сравнение со сжатием и без ----------
+
+class CompressionTest(BaseModel):
+    question: str
+
+
+@app.post("/api/conversations/{conversation_id}/compression-test")
+async def compression_test(
+    conversation_id: int, payload: CompressionTest, user: dict = Depends(require_approved)
+) -> dict:
+    """Задаёт один вопрос дважды: по полной истории и по сжатой.
+
+    Диалог при этом не меняется — ни вопрос, ни ответы в него не пишутся.
+    Конспект, если его ещё не было, строится и сохраняется: он полезен сам
+    по себе и не зависит от того, включено сжатие или нет.
+    """
+    conversation = _owned(conversation_id, user)
+    question = payload.question.strip()
+    if not question:
+        raise HTTPException(400, "Вопрос не может быть пустым")
+
+    model = conversation["model"] or llm.MODEL
+    system_prompt = llm.SYSTEM_PROMPT
+    rows = db.list_messages(conversation_id)
+    if len(rows) <= history.KEEP_LAST:
+        raise HTTPException(
+            400,
+            f"В диалоге {len(rows)} сообщений — сворачивать нечего. "
+            f"Сжатие начинает работать, когда их больше {history.KEEP_LAST}.",
+        )
+
+    # Конспект нужен обеим веткам сравнения, строим при необходимости.
+    forced = dict(conversation, compress=1)
+    _, stale, _ = history.split(rows, conversation["summary_upto"])
+    summary_cost = 0
+    if stale:
+        info = await asyncio.to_thread(history.refresh, forced, model=model)
+        summary_cost = info["cost_tokens"] if info else 0
+        forced = _owned(conversation_id, user)
+        forced = dict(forced, compress=1)
+
+    full_plan = history.plan_request(dict(conversation, compress=0), system_prompt)
+    small_plan = history.plan_request(forced, system_prompt)
+    ask = {"role": "user", "content": question}
+
+    async def run(messages: list[dict]) -> llm.Completion:
+        return await asyncio.to_thread(
+            llm.complete, messages + [ask], model=model, thinking=False
+        )
+
+    try:
+        full, small = await run(full_plan.messages), await run(small_plan.messages)
+    except llm.LLMError as err:
+        raise HTTPException(502, str(err)) from err
+
+    def described(plan, result: llm.Completion) -> dict:
+        return {
+            "answer": result.content.strip(),
+            "prompt_tokens": result.prompt_tokens,
+            "completion_tokens": result.completion_tokens,
+            "total_tokens": result.total_tokens,
+            "cost": tokens_mod.cost(result.prompt_tokens, result.completion_tokens, model),
+            "elapsed": round(result.elapsed, 2),
+            "messages_sent": len(plan.messages) + 1,
+            "verbatim": plan.verbatim,
+            "folded": plan.folded,
+            "request": result.request,
+        }
+
+    return {
+        "model": model,
+        "question": question,
+        "summary": small_plan.summary,
+        "summary_build_tokens": summary_cost,
+        "full": described(full_plan, full),
+        "compressed": described(small_plan, small),
+        "keep_last": history.KEEP_LAST,
+        "compress_every": history.COMPRESS_EVERY,
+    }
 
 
 # ---------- разбор расхода токенов ----------

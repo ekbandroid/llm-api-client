@@ -17,6 +17,7 @@
   <a class="btn ghost small" href="/temperature">Температура</a>
   <a class="btn ghost small" href="/models">Модели</a>
   <a class="btn ghost small" href="/tokens">Токены</a>
+  <a class="btn ghost small" href="/compression">Сжатие</a>
   <a class="btn ghost small" href="/admin" id="adminLink" hidden>Пользователи</a>
   <a class="btn ghost small" href="/auth/logout">Выйти</a>
 </header>
@@ -31,6 +32,8 @@
     <label><span>Название</span><select id="model"></select></label>
     <div class="check"><input type="checkbox" id="thinking"><label for="thinking" style="margin:0">Режим thinking</label></div>
     <label style="margin-top:10px"><span>max_tokens — потолок ответа</span><input type="number" id="maxTokens" min="1" max="384000" placeholder="без лимита"></label>
+    <div class="check" style="margin-top:10px"><input type="checkbox" id="compress"><label for="compress" style="margin:0">Сжимать историю</label></div>
+    <div class="hint" id="compressState"></div>
     <div class="hint">Настройки принадлежат диалогу и сохраняются вместе с ним. При включённом thinking рассуждение расходует этот же бюджет.</div>
   </fieldset>
 
@@ -176,6 +179,8 @@ async function openConversation(id) {
   applyModel(current.model);
   $("thinking").checked = !!current.thinking;
   $("maxTokens").value = current.max_tokens || "";
+  $("compress").checked = !!current.compress;
+  showCompression(current);
 
   log.innerHTML = "";
   if (!data.messages.length) {
@@ -200,6 +205,18 @@ function addMessage(role, who) {
   log.appendChild(box);
   log.scrollTop = log.scrollHeight;
   return box;
+}
+
+/** Поясняет, что сейчас со сжатием этого диалога. */
+function showCompression(conv) {
+  const box = $("compressState");
+  if (!conv || !conv.compress) {
+    box.textContent = "История уходит в запрос целиком.";
+    return;
+  }
+  box.textContent = conv.summary
+    ? `Свёрнутая часть заменена конспектом (${conv.summary.length} символов); последние сообщения идут как есть.`
+    : "Конспект соберётся, когда накопится достаточно сообщений.";
 }
 
 /** Показывает расход диалога и оценку следующего запроса. */
@@ -274,6 +291,7 @@ async function ensureConversation() {
       model: $("model").value || null,
       thinking: $("thinking").checked,
       max_tokens: Number($("maxTokens").value) || null,
+      compress: $("compress").checked,
     }),
   });
   current = await res.json();
@@ -373,6 +391,17 @@ async function send(text) {
           loadedTotals += u.total_tokens || 0;
           loadedTexts.push(answer);
           updateTokenStats();
+        } else if (ev.type === "compressed") {
+          const note = el("div", "hint");
+          note.style.marginTop = "8px";
+          note.textContent = `История свёрнута: ${ev.folded_messages} сообщений заменены конспектом ` +
+            `на ${ev.summary_chars} символов, сборка стоила ${ev.cost_tokens} токенов.`;
+          box.appendChild(note);
+          if (current) { current.summary = "x".repeat(ev.summary_chars); showCompression(current); }
+        } else if (ev.type === "compress_error") {
+          const note = el("div", "truncated");
+          note.textContent = "Не удалось свернуть историю: " + ev.message;
+          box.appendChild(note);
         } else if (ev.type === "saved") {
           // Первое сообщение дало диалогу имя — обновляем список и поле заголовка.
           current.title = ev.title;
@@ -409,6 +438,11 @@ $("model").addEventListener("change", () => {
 });
 $("thinking").addEventListener("change", () => patchCurrent({ thinking: $("thinking").checked }));
 // Ноль на сервере означает «снять лимит»; пустое поле — это он и есть.
+$("compress").addEventListener("change", async () => {
+  await patchCurrent({ compress: $("compress").checked });
+  showCompression(current);
+});
+
 $("maxTokens").addEventListener("change", () => {
   const raw = $("maxTokens").value.trim();
   patchCurrent({ max_tokens: raw === "" ? 0 : Number(raw) });
@@ -424,6 +458,7 @@ $("newConv").addEventListener("click", async () => {
       model: $("model").value || null,
       thinking: $("thinking").checked,
       max_tokens: Number($("maxTokens").value) || null,
+      compress: $("compress").checked,
     }),
   });
   const created = await res.json();
