@@ -23,36 +23,60 @@
 </header>
 
 <div class="app">
-<aside class="withlist">
-  <button class="newconv" id="newConv">+ Новый диалог</button>
-  <div class="convlist" id="convList"></div>
+<nav class="rail" id="rail">
+  <button class="railbtn" data-tab="dialogs" title="Диалоги" aria-label="Диалоги">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+  </button>
+  <button class="railbtn" data-tab="model" title="Настройки модели и контекста" aria-label="Настройки">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>
+  </button>
+  <button class="railbtn" data-tab="tokens" title="Расход токенов" aria-label="Токены">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>
+  </button>
+</nav>
 
-  <fieldset>
-    <legend>Модель</legend>
-    <label><span>Название</span><select id="model"></select></label>
-    <div class="check"><input type="checkbox" id="thinking"><label for="thinking" style="margin:0">Режим thinking</label></div>
-    <label style="margin-top:10px"><span>max_tokens — потолок ответа</span><input type="number" id="maxTokens" min="1" max="384000" placeholder="без лимита"></label>
-  </fieldset>
+<aside class="panel" id="panel">
+  <section class="tab" data-tab="dialogs">
+    <div class="tabhead"><span>Диалоги</span><span class="grow"></span><button class="hide" title="Свернуть панель">‹</button></div>
+    <div class="tabbody">
+      <button class="newconv" id="newConv">+ Новый диалог</button>
+      <div class="convlist" id="convList"></div>
+    </div>
+  </section>
 
-  <fieldset>
-    <legend>Контекст</legend>
-    <label><span>Стратегия</span><select id="strategy">
-      <option value="full">Вся история</option>
-      <option value="window">Последние N сообщений</option>
-      <option value="facts">Факты + последние N</option>
-      <option value="summary">Конспект + хвост</option>
-    </select></label>
-    <label><span>N — сколько сообщений дословно</span><input type="number" id="contextN" min="1" max="200" value="10"></label>
-    <div class="hint" id="strategyState"></div>
-    <details id="factsBox" hidden><summary>Карточка фактов</summary><pre id="factsBody"></pre></details>
-    <div class="hint">Настройки принадлежат диалогу и сохраняются вместе с ним. При включённом thinking рассуждение расходует этот же бюджет.</div>
-  </fieldset>
+  <section class="tab" data-tab="model">
+    <div class="tabhead"><span>Модель и контекст</span><span class="grow"></span><button class="hide" title="Свернуть панель">‹</button></div>
+    <div class="tabbody">
+      <fieldset>
+        <legend>Модель</legend>
+        <label><span>Название</span><select id="model"></select></label>
+        <div class="check"><input type="checkbox" id="thinking"><label for="thinking" style="margin:0">Режим thinking</label></div>
+        <label style="margin-top:10px"><span>max_tokens — потолок ответа</span><input type="number" id="maxTokens" min="1" max="384000" placeholder="без лимита"></label>
+      </fieldset>
 
-  <fieldset>
-    <legend>Токены</legend>
-    <div class="stats" id="tokenStats" style="margin:0"></div>
-    <div class="hint">История уходит в запрос целиком, поэтому размер следующего запроса растёт с каждой репликой. Оценка приблизительная; точное число приходит с ответом.</div>
-  </fieldset>
+      <fieldset>
+        <legend>Контекст</legend>
+        <label><span>Стратегия</span><select id="strategy">
+          <option value="full">Вся история</option>
+          <option value="window">Последние N сообщений</option>
+          <option value="facts">Факты + последние N</option>
+          <option value="summary">Конспект + хвост</option>
+        </select></label>
+        <label><span>N — сколько сообщений дословно</span><input type="number" id="contextN" min="1" max="200" value="10"></label>
+        <div class="hint" id="strategyState"></div>
+        <details id="factsBox" hidden><summary>Карточка фактов</summary><pre id="factsBody"></pre></details>
+        <div class="hint">Настройки принадлежат диалогу и сохраняются вместе с ним. При включённом thinking рассуждение расходует этот же бюджет.</div>
+      </fieldset>
+    </div>
+  </section>
+
+  <section class="tab" data-tab="tokens">
+    <div class="tabhead"><span>Расход токенов</span><span class="grow"></span><button class="hide" title="Свернуть панель">‹</button></div>
+    <div class="tabbody">
+      <div class="stats" id="tokenStats" style="margin:0"></div>
+      <div class="hint">История уходит в запрос целиком, поэтому размер следующего запроса растёт с каждой репликой. Оценка приблизительная; точное число приходит с ответом.</div>
+    </div>
+  </section>
 </aside>
 
 <main>
@@ -542,6 +566,46 @@ $("newConv").addEventListener("click", async () => {
 });
 
 // ---------- события ----------
+
+// ---------- вкладки боковой панели ----------
+// Состояние панели — удобство конкретного пользователя, а не данные диалога,
+// поэтому живёт в браузере, а не на сервере.
+const TAB_KEY = "llmchat.sidebar";
+
+function readTabState() {
+  try { return JSON.parse(localStorage.getItem(TAB_KEY)) || {}; } catch { return {}; }
+}
+function saveTabState(state) {
+  try { localStorage.setItem(TAB_KEY, JSON.stringify(state)); } catch {}
+}
+
+function applyTab(tab, open) {
+  document.querySelector(".app").classList.toggle("rail-only", !open);
+  for (const b of document.querySelectorAll(".railbtn")) {
+    b.classList.toggle("on", open && b.dataset.tab === tab);
+  }
+  for (const s of document.querySelectorAll(".tab")) {
+    s.classList.toggle("on", s.dataset.tab === tab);
+  }
+  saveTabState({ tab, open });
+}
+
+for (const b of document.querySelectorAll(".railbtn")) {
+  b.addEventListener("click", () => {
+    const state = readTabState();
+    // Повторный щелчок по раскрытой вкладке сворачивает панель.
+    const open = !(state.open && state.tab === b.dataset.tab);
+    applyTab(b.dataset.tab, open);
+  });
+}
+for (const b of document.querySelectorAll(".tabhead .hide")) {
+  b.addEventListener("click", () => applyTab(readTabState().tab || "dialogs", false));
+}
+
+(() => {
+  const state = readTabState();
+  applyTab(state.tab || "dialogs", state.open !== false);
+})();
 
 $("form").addEventListener("submit", e => {
   e.preventDefault();

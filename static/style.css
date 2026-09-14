@@ -87,13 +87,20 @@ header.bar .who b { color: var(--text); font-weight: 600; }
    Высота шапки не зашита числом — она может стать выше, если ссылки перенесутся. */
 body.chat { display: flex; flex-direction: column; height: 100dvh; overflow: hidden; }
 body.chat .app { flex: 1 1 auto; min-height: 0; }
-.app { display: grid; grid-template-columns: 320px 1fr; }
+.app { display: grid; grid-template-columns: 52px 320px 1fr; }
+/* Свёрнутое состояние: остаётся только полоса иконок. */
+.app.rail-only { grid-template-columns: 52px 1fr; }
+.app.rail-only .panel { display: none; }
 /* min-height: 0 обязателен: без него grid-элемент не может стать меньше
    содержимого, растёт под длинный чат и выталкивает поле ввода за экран. */
-.app > aside, .app > main { min-height: 0; }
+.app > nav, .app > aside, .app > main { min-height: 0; }
 @media (max-width: 860px) {
-  .app { grid-template-columns: 1fr; height: auto; }
+  .app, .app.rail-only { grid-template-columns: 1fr; height: auto; }
   body.chat { height: auto; overflow: visible; }
+  /* На узком экране полоса иконок ложится горизонтально над содержимым. */
+  .rail { flex-direction: row; border-right: 0; border-bottom: 1px solid var(--border); }
+  .railbtn.on { box-shadow: inset 0 2px 0 var(--btn); }
+  .panel { border-right: 0; border-bottom: 1px solid var(--border); max-height: 50vh; }
 }
 aside { background: var(--panel); border-right: 1px solid var(--border); padding: 20px; overflow-y: auto; }
 aside h1 { font-size: 16px; margin: 0 0 4px; }
@@ -230,7 +237,43 @@ td.actions button { margin-left: 6px; }
 
 /* ---------- список диалогов ---------- */
 /* Прокручивается только список диалогов: настройки внизу должны быть видны всегда. */
-aside.withlist { display: flex; flex-direction: column; overflow: hidden; }
+/* ---------- полоса вкладок и раскрывающаяся панель ---------- */
+.rail {
+  background: var(--panel); border-right: 1px solid var(--border);
+  display: flex; flex-direction: column; align-items: center;
+  gap: 6px; padding: 8px 0; overflow-y: auto;
+}
+.railbtn {
+  flex: 0 0 auto; width: 36px; height: 36px; padding: 0; border: 0;
+  display: grid; place-items: center; border-radius: 8px;
+  background: transparent; color: var(--muted); cursor: pointer; font-weight: 400;
+}
+.railbtn:hover { background: var(--bg); color: var(--text); }
+.railbtn.on { background: var(--bg); color: var(--text); box-shadow: inset 2px 0 0 var(--btn); }
+.railbtn svg { width: 18px; height: 18px; }
+
+.panel {
+  background: var(--panel); border-right: 1px solid var(--border);
+  display: flex; flex-direction: column; min-height: 0; overflow: hidden;
+}
+.tab { display: none; flex-direction: column; min-height: 0; height: 100%; }
+.tab.on { display: flex; }
+.tabhead {
+  flex: 0 0 auto; padding: 11px 18px; border-bottom: 1px solid var(--border);
+  font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted);
+  display: flex; align-items: center; gap: 8px;
+}
+.tabhead .grow { flex: 1; }
+.tabhead button {
+  padding: 2px 8px; font-size: 15px; line-height: 1; background: transparent;
+  color: var(--muted); border: 0; font-weight: 400;
+}
+.tabhead button:hover { color: var(--text); }
+/* Содержимое вкладки прокручивается внутри себя, наружу панель не растёт. */
+.tabbody { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 16px 18px; }
+/* У диалогов прокручивается список, а кнопка остаётся на месте. */
+.tab[data-tab="dialogs"] .tabbody { display: flex; flex-direction: column; overflow: hidden; }
+.tabbody fieldset:last-of-type { margin-bottom: 0; }
 .newconv { width: 100%; margin-bottom: 12px; }
 .convlist { flex: 1 1 auto; overflow-y: auto; margin: 0 -8px 14px; min-height: 60px; }
 .conv {
