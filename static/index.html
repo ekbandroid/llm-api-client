@@ -573,9 +573,12 @@ async function showMemory(conv) {
       $("projectName").textContent = data.project.title;
       $("projectBrief").value = data.project.brief || "";
       $("collectFacts").checked = !!data.project.collect_facts;
-      $("projectState").textContent =
-        `В каждый запрос диалогов проекта: ~${data.tokens} токенов; ` +
-        `фактов ${Object.keys(data.facts).length} из ${data.facts_limit}.`;
+      const factCount = Object.keys(data.facts).length;
+      $("projectState").textContent = (data.project.brief || factCount)
+        ? `В каждый запрос диалогов проекта: ~${data.tokens} токенов; ` +
+          `фактов ${factCount} из ${data.facts_limit}.`
+        : "Пока пусто: в запрос уйдёт только название проекта. " +
+          "Факты появятся после первого обмена — при стратегии «Факты + N».";
       renderProjectFacts(data.facts);
     } else {
       empty.hidden = false;
@@ -905,6 +908,9 @@ async function send(text) {
             : `Карточку фактов обновить не удалось: ${ev.reason}. Прежняя сохранена.`;
           box.appendChild(note);
           if (current && ev.ok) { current.facts = JSON.stringify(ev.facts); showStrategy(current); }
+        } else if (ev.type === "memory") {
+          const line = memoryLine(ev.memory);
+          if (line) box.appendChild(line);
         } else if (ev.type === "project_facts") {
           const note = el("div", "hint");
           note.style.marginTop = "8px";

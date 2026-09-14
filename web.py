@@ -472,12 +472,13 @@ async def project_get(project_id: int, user: dict = Depends(require_approved)) -
         "facts": facts,
         "brief_limit": db.BRIEF_LIMIT,
         "facts_limit": memory.PROJECT_FACTS_LIMIT,
+        # Считаем и для пустого проекта: название всё равно уходит в запрос.
         "tokens": tokens_mod.estimate_tokens(
             memory.project_text(memory.Layers(
-                project_title=project["title"], project_brief=project["brief"] or "",
-                project_facts=facts,
+                project_id=project["id"], project_title=project["title"],
+                project_brief=project["brief"] or "", project_facts=facts,
             ))
-        ) if (project["brief"] or facts) else 0,
+        ),
     }
 
 
@@ -688,6 +689,11 @@ async def conversation_send(
         completion_tokens = total_tokens = 0
         finish_reason = "unknown"
         elapsed = 0.0
+
+        # Состав слоёв показываем до ответа: иначе понять, ушла ли память
+        # в запрос, можно было бы только перезагрузив страницу.
+        if plan.memory:
+            yield sse({"type": "memory", "memory": plan.memory})
 
         try:
             async for event in llm.stream(

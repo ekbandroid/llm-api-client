@@ -27,6 +27,7 @@ PROFILE_PREFIX = "Долговременная память — что изве�
 PROJECT_PREFIX = "Рабочая память. Проект «{title}».\n"
 PROJECT_BRIEF_PREFIX = "Описание задачи:\n"
 PROJECT_FACTS_PREFIX = "Накоплено в диалогах проекта:\n"
+PROJECT_EMPTY = "Пока о проекте ничего не записано — не домысливай за него."
 
 # Фактов у проекта больше, чем у диалога (FACTS_LIMIT = 25): сюда стекается
 # несколько диалогов сразу. Но потолок всё равно нужен — блок уходит в каждый
@@ -46,7 +47,15 @@ class Layers:
 
     @property
     def has_project(self) -> bool:
-        return bool(self.project_brief or self.project_facts)
+        """Проект подключён — блок уходит, даже пока он пуст.
+
+        Пустой проект раньше не давал в запрос ничего, и первый обмен в новом
+        проекте шёл вообще без рабочего слоя: бриф ещё не написан, факты
+        появляются только после ответа. Со стороны это выглядело поломкой —
+        галочка включена, а слоя в запросе нет. Одно название уже задаёт рамку
+        разговора, а строка о пустоте удерживает модель от выдумывания.
+        """
+        return self.project_id is not None
 
 
 def load_facts(raw: str | None) -> dict:
@@ -92,6 +101,8 @@ def project_text(layers: Layers) -> str:
     if layers.project_facts:
         lines = [f"- {k}: {v}" for k, v in list(layers.project_facts.items())[:PROJECT_FACTS_LIMIT]]
         parts.append(PROJECT_FACTS_PREFIX + "\n".join(lines))
+    if not layers.project_brief and not layers.project_facts:
+        parts.append(PROJECT_EMPTY)
     return "\n".join(parts)
 
 
