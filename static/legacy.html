@@ -186,7 +186,18 @@ async function send(text) {
           }
           reasoning += ev.text;
           reasoningBox.textContent = reasoning;
+        } else if (ev.type === "waiting") {
+          // Соединение живо, но текста ещё нет — показываем, что запрос в работе.
+          let wait = el.querySelector(".waitnote");
+          if (!wait) {
+            wait = el("div", "hint waitnote");
+            wait.style.marginTop = "8px";
+            el.appendChild(wait);
+          }
+          wait.textContent = `Модель пока молчит — соединение живо, идёт ${ev.elapsed} с.`;
         } else if (ev.type === "content") {
+          const wait = el.querySelector(".waitnote");
+          if (wait) wait.remove();
           answer += ev.text;
           setMarkdown(body, answer);
           log.scrollTop = log.scrollHeight;

@@ -49,7 +49,10 @@
     <div class="tabbody">
       <fieldset>
         <legend>Модель</legend>
-        <label><span>Название</span><select id="model"></select></label>
+        <label><span>Название</span>
+          <span class="withbtn"><select id="model"></select><button id="reloadModels" class="ghost" title="Обновить список моделей у провайдера">↻</button></span>
+        </label>
+        <div class="hint" id="modelsState"></div>
         <div class="check"><input type="checkbox" id="thinking"><label for="thinking" style="margin:0">Режим thinking</label></div>
         <label style="margin-top:10px"><span>max_tokens — потолок ответа</span><input type="number" id="maxTokens" min="1" max="384000" placeholder="без лимита"></label>
       </fieldset>
@@ -155,6 +158,45 @@ async function applyModel(name) {
 }
 
 modelsReady.then(cfg => applyModel(current && current.model ? current.model : cfg.default_model));
+
+/** Перечитывает список моделей у провайдера.
+ *
+ *  Список приходит от API и может меняться без нашего участия: модели
+ *  переименовывают и выводят из обращения. Кнопка обновляет его, не
+ *  перезагружая страницу.
+ */
+async function reloadModels() {
+  const btn = $("reloadModels");
+  const note = $("modelsState");
+  btn.disabled = true;
+  note.textContent = "запрашиваю…";
+  try {
+    const res = await fetch("/api/config", { cache: "no-store" });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const cfg = await res.json();
+
+    const sel = $("model");
+    const before = [...sel.options].filter(o => !o.dataset.unlisted).map(o => o.value);
+    const keep = sel.value;
+    sel.innerHTML = "";
+    cfg.models.forEach(m => sel.add(new Option(m, m)));
+    await applyModel(keep || cfg.default_model);
+
+    const added = cfg.models.filter(m => !before.includes(m));
+    const gone = before.filter(m => !cfg.models.includes(m));
+    note.textContent = added.length || gone.length
+      ? `Список изменился: ${[added.length ? "добавлены " + added.join(", ") : null,
+                              gone.length ? "исчезли " + gone.join(", ") : null]
+                             .filter(Boolean).join("; ")}.`
+      : `Список не изменился, моделей ${cfg.models.length}.`;
+  } catch (err) {
+    note.textContent = "Не удалось обновить список: " + err.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+$("reloadModels").addEventListener("click", reloadModels);
 
 // ---------- список диалогов ----------
 
@@ -449,7 +491,18 @@ async function send(text) {
           }
           reasoning += ev.text;
           reasoningBox.textContent = reasoning;
+        } else if (ev.type === "waiting") {
+          // Соединение живо, но текста ещё нет — показываем, что запрос в работе.
+          let wait = box.querySelector(".waitnote");
+          if (!wait) {
+            wait = el("div", "hint waitnote");
+            wait.style.marginTop = "8px";
+            box.appendChild(wait);
+          }
+          wait.textContent = `Модель пока молчит — соединение живо, идёт ${ev.elapsed} с.`;
         } else if (ev.type === "content") {
+          const wait = box.querySelector(".waitnote");
+          if (wait) wait.remove();
           answer += ev.text;
           setMarkdown(body, answer);
           log.scrollTop = log.scrollHeight;

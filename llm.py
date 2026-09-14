@@ -21,6 +21,23 @@ REASONING_EFFORT = os.getenv("LLM_REASONING_EFFORT", "high")
 SYSTEM_PROMPT = os.getenv("LLM_SYSTEM_PROMPT", "You are a helpful assistant.")
 
 
+# Сколько ждём установки соединения. Отдельно от ожидания ответа: сервер,
+# который не отвечает вовсе, должен отваливаться быстро.
+CONNECT_TIMEOUT = 10
+
+# Допустимая пауза между кусками потокового ответа. Это не лимит на всю
+# генерацию: отсчёт начинается заново с каждым полученным куском. Нужен,
+# чтобы зависшая модель не держала пользователя перед пустым экраном
+# до самого общего таймаута.
+STALL_TIMEOUT = 60
+
+# Сколько ждём ПЕРВОГО куска текста. Отдельный предел нужен потому, что
+# сервер может держать соединение живым служебными пакетами «: keep-alive»
+# и при этом не начать отвечать вовсе: данные формально идут, таймаут чтения
+# не срабатывает, и пользователь сидит перед пустым экраном до общего лимита.
+FIRST_TOKEN_TIMEOUT = 60
+
+
 class LLMError(RuntimeError):
     """Ошибка вызова API — сеть или ненулевой HTTP-статус.
 
@@ -67,6 +84,8 @@ def _network_diagnostics(err: Exception, timeout: int) -> dict:
         "url": f"{BASE_URL}/chat/completions",
         "сообщение": str(err) or "исключение без текста",
         "таймаут_секунд": timeout,
+        "таймаут_соединения": CONNECT_TIMEOUT,
+        "пауза_между_кусками": STALL_TIMEOUT,
         "примечание": "ответа от сервера не поступило, тела ответа не существует",
     }
 
@@ -182,7 +201,8 @@ def complete(messages: list[dict], *, timeout: int = 120, **options) -> Completi
     started = time.monotonic()
     try:
         response = requests.post(
-            f"{BASE_URL}/chat/completions", headers=_headers(), json=payload, timeout=timeout
+            f"{BASE_URL}/chat/completions", headers=_headers(), json=payload,
+            timeout=(CONNECT_TIMEOUT, timeout),
         )
         response.raise_for_status()
     except requests.HTTPError as err:
@@ -222,6 +242,7 @@ async def stream(
 
     Генерирует события:
       {"type": "request", "request": {...}} — что именно уходит в API;
+      {"type": "waiting", "elapsed": ...} — соединение живо, но текста ещё нет;
       {"type": "reasoning", "text": ...} — кусок рассуждения (если thinking включён);
       {"type": "content",   "text": ...} — кусок ответа;
       {"type": "response", "response": {...}} — ответ API без текста;
@@ -239,7 +260,8 @@ async def stream(
     last_chunk: dict = {}
 
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        limits = httpx.Timeout(timeout, connect=CONNECT_TIMEOUT, read=STALL_TIMEOUT)
+        async with httpx.AsyncClient(timeout=limits) as client:
             async with client.stream(
                 "POST", f"{BASE_URL}/chat/completions", headers=_headers(), json=payload
             ) as response:
@@ -251,7 +273,25 @@ async def stream(
                         body=_parse_body(detail),
                     )
 
+                produced = False
+                notified = 0.0
                 async for line in response.aiter_lines():
+                    waited = time.monotonic() - started
+                    if not produced:
+                        if waited > FIRST_TOKEN_TIMEOUT:
+                            raise LLMError(
+                                f"Модель не начала отвечать за {FIRST_TOKEN_TIMEOUT} с. "
+                                "Сервер принял запрос и держит соединение, но текста не шлёт — "
+                                "похоже на сбой модели на стороне провайдера.",
+                                status=response.status_code,
+                                body={"note": "соединение живо, получены только служебные пакеты",
+                                      "waited_seconds": round(waited, 1)},
+                            )
+                        # Раз в пять секунд сообщаем, что ждём, — иначе окно
+                        # выглядит зависшим, хотя запрос в работе.
+                        if waited - notified >= 5:
+                            notified = waited
+                            yield {"type": "waiting", "elapsed": round(waited, 1)}
                     if not line.startswith("data:"):
                         continue
                     data = line[5:].strip()
@@ -270,8 +310,10 @@ async def stream(
                             finish_reason = choice["finish_reason"]
                         delta = choice.get("delta") or {}
                         if reasoning := delta.get("reasoning_content"):
+                            produced = True
                             yield {"type": "reasoning", "text": reasoning}
                         if content := delta.get("content"):
+                            produced = True
                             yield {"type": "content", "text": content}
     except httpx.HTTPError as err:
         raise LLMError(

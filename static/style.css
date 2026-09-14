@@ -315,3 +315,8 @@ td.actions button { margin-left: 6px; }
 .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: middle; }
 .gauge { height: 10px; background: var(--bg); border: 1px solid var(--border); border-radius: 5px; overflow: hidden; margin: 8px 0 6px; }
 .gauge > i { display: block; height: 100%; background: var(--btn); }
+
+/* Поле с кнопкой справа: выпадающий список моделей и кнопка обновления. */
+.withbtn { display: flex; gap: 6px; align-items: stretch; }
+.withbtn select { flex: 1 1 auto; min-width: 0; }
+.withbtn button { flex: 0 0 auto; padding: 0 10px; font-size: 15px; line-height: 1; }
