@@ -30,6 +30,21 @@ CREATE TABLE IF NOT EXISTS users (
     last_login_at TEXT
 );
 
+-- Проекты — рабочая память: несколько диалогов об одной задаче делят бриф
+-- и накопленные факты. Диалог заводится внутри проекта и остаётся в нём.
+CREATE TABLE IF NOT EXISTS projects (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id       INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    title         TEXT    NOT NULL,
+    -- brief пишет пользователь, facts накапливаются из карточек диалогов.
+    brief         TEXT,
+    facts         TEXT,
+    collect_facts INTEGER NOT NULL DEFAULT 1,
+    created_at    TEXT    NOT NULL,
+    updated_at    TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_projects_user ON projects(user_id, created_at);
+
 -- Диалоги и их сообщения. Настройки (модель, thinking) живут на диалоге:
 -- вернувшись к старой переписке, возвращаемся и к условиям, при которых она шла.
 CREATE TABLE IF NOT EXISTS conversations (
@@ -86,6 +101,10 @@ def connect() -> sqlite3.Connection:
 # Колонки, добавленные после первого выпуска. CREATE TABLE IF NOT EXISTS
 # их не создаст в уже существующей таблице, поэтому добавляем отдельно.
 MIGRATIONS = {
+    "users": {
+        # Долговременная память: что помнить о пользователе во всех диалогах.
+        "profile_memory": "TEXT",
+    },
     "conversations": {
         "max_tokens": "INTEGER",
         "compress": "INTEGER NOT NULL DEFAULT 0",
@@ -97,6 +116,11 @@ MIGRATIONS = {
         "facts": "TEXT",
         "parent_id": "INTEGER",
         "branched_from": "INTEGER",
+        # Слои памяти: к какому проекту относится диалог и какие слои
+        # подключать к его запросам.
+        "project_id": "INTEGER",
+        "use_profile": "INTEGER NOT NULL DEFAULT 1",
+        "use_project": "INTEGER NOT NULL DEFAULT 1",
     },
 }
 
@@ -264,10 +288,131 @@ def set_status(user_id: int, status: str) -> bool:
     return cur.rowcount > 0
 
 
+PROFILE_LIMIT = 4000
+
+
+def set_profile_memory(user_id: int, text: str) -> None:
+    """Сохраняет долговременную память пользователя — текст о нём самом.
+
+    Потолок нужен не ради места в базе: этот текст уходит в каждый запрос
+    всех диалогов, где слой подключён, и оплачивается заново каждый раз.
+    """
+    with connect() as conn:
+        conn.execute(
+            "UPDATE users SET profile_memory = ? WHERE id = ?",
+            (text.strip()[:PROFILE_LIMIT], user_id),
+        )
+
+
 def count_admins() -> int:
     """Число админов — чтобы не остаться без единого администратора."""
     with connect() as conn:
         return conn.execute("SELECT COUNT(*) FROM users WHERE is_admin = 1").fetchone()[0]
+
+
+# ---------- проекты ----------
+#
+# Проект — рабочая память: общий бриф и общая карточка фактов для нескольких
+# диалогов об одной задаче. Владелец проверяется в каждом запросе, как и у диалогов.
+
+NEW_PROJECT_TITLE = "Новый проект"
+PROJECT_TITLE_LIMIT = 60
+BRIEF_LIMIT = 4000
+
+
+def create_project(user_id: int, *, title: str = "", brief: str = "") -> dict:
+    """Заводит проект и возвращает его."""
+    with connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO projects (user_id, title, brief, collect_facts, created_at, updated_at)"
+            " VALUES (?, ?, ?, 1, ?, ?)",
+            (user_id, title.strip()[:PROJECT_TITLE_LIMIT] or NEW_PROJECT_TITLE,
+             brief.strip()[:BRIEF_LIMIT], _now(), _now()),
+        )
+        row = conn.execute("SELECT * FROM projects WHERE id = ?", (cur.lastrowid,)).fetchone()
+    return dict(row)
+
+
+def get_project(project_id: int, user_id: int) -> dict | None:
+    """Проект по id, только если он принадлежит этому пользователю."""
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM projects WHERE id = ? AND user_id = ?", (project_id, user_id)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def list_projects(user_id: int) -> list[dict]:
+    """Проекты пользователя в порядке создания, с числом диалогов в каждом.
+
+    Порядок постоянный, а не по свежести: список проектов — это оглавление,
+    и переставлять его после каждого сообщения значило бы терять место глазами.
+    """
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT p.*, (SELECT COUNT(*) FROM conversations c WHERE c.project_id = p.id)"
+            " AS conversation_count FROM projects p WHERE p.user_id = ?"
+            " ORDER BY p.created_at, p.id",
+            (user_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def update_project(
+    project_id: int, user_id: int, *, title: str | None = None,
+    brief: str | None = None, collect_facts: bool | None = None,
+) -> dict | None:
+    """Меняет название, бриф или сбор фактов. None — проект чужой или его нет."""
+    sets, values = [], []
+    if title is not None:
+        sets.append("title = ?")
+        values.append(title.strip()[:PROJECT_TITLE_LIMIT] or NEW_PROJECT_TITLE)
+    if brief is not None:
+        sets.append("brief = ?")
+        values.append(brief.strip()[:BRIEF_LIMIT])
+    if collect_facts is not None:
+        sets.append("collect_facts = ?")
+        values.append(int(collect_facts))
+    if not sets:
+        return get_project(project_id, user_id)
+
+    sets.append("updated_at = ?")
+    values.extend([_now(), project_id, user_id])
+    with connect() as conn:
+        cur = conn.execute(
+            f"UPDATE projects SET {', '.join(sets)} WHERE id = ? AND user_id = ?", values
+        )
+    return get_project(project_id, user_id) if cur.rowcount else None
+
+
+def set_project_facts(project_id: int, facts_json: str) -> None:
+    """Сохраняет накопленную карточку фактов проекта."""
+    with connect() as conn:
+        conn.execute(
+            "UPDATE projects SET facts = ?, updated_at = ? WHERE id = ?",
+            (facts_json, _now(), project_id),
+        )
+
+
+def delete_project(project_id: int, user_id: int) -> int | None:
+    """Удаляет проект вместе с его диалогами. Возвращает число удалённых диалогов.
+
+    Диалоги удаляются явно, а не каскадом по внешнему ключу: колонка project_id
+    добавлена миграцией, и полагаться на её ограничение в базах, созданных
+    прежними версиями, нельзя. Сообщения уходят следом — этот каскад объявлен
+    при создании таблицы messages и работает везде.
+    """
+    with connect() as conn:
+        if conn.execute(
+            "SELECT 1 FROM projects WHERE id = ? AND user_id = ?", (project_id, user_id)
+        ).fetchone() is None:
+            return None
+        killed = conn.execute(
+            "DELETE FROM conversations WHERE project_id = ? AND user_id = ?",
+            (project_id, user_id),
+        ).rowcount
+        conn.execute("DELETE FROM projects WHERE id = ? AND user_id = ?", (project_id, user_id))
+    return killed
 
 
 # ---------- диалоги ----------
@@ -283,11 +428,16 @@ FULL, WINDOW, FACTS, SUMMARY = "full", "window", "facts", "summary"
 STRATEGIES = (FULL, WINDOW, FACTS, SUMMARY)
 DEFAULT_CONTEXT_N = 10
 
+# Новые диалоги начинают с фактов: карточка ключ-значение переживает обрезку
+# хвоста и, если диалог в проекте, перетекает в рабочую память проекта.
+DEFAULT_STRATEGY = FACTS
+
 
 def create_conversation(
     user_id: int, *, title: str = NEW_TITLE, model: str | None = None,
     thinking: bool = False, max_tokens: int | None = None,
-    strategy: str = FULL, context_n: int = DEFAULT_CONTEXT_N,
+    strategy: str = DEFAULT_STRATEGY, context_n: int = DEFAULT_CONTEXT_N,
+    project_id: int | None = None,
 ) -> dict:
     """Заводит пустой диалог и возвращает его."""
     if strategy not in STRATEGIES:
@@ -295,10 +445,10 @@ def create_conversation(
     with connect() as conn:
         cur = conn.execute(
             "INSERT INTO conversations (user_id, title, model, thinking, max_tokens,"
-            " strategy, context_n, created_at, updated_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " strategy, context_n, project_id, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (user_id, title.strip()[:TITLE_LIMIT] or NEW_TITLE, model, int(thinking),
-             max_tokens, strategy, max(1, min(context_n, 200)), _now(), _now()),
+             max_tokens, strategy, max(1, min(context_n, 200)), project_id, _now(), _now()),
         )
         row = conn.execute("SELECT * FROM conversations WHERE id = ?", (cur.lastrowid,)).fetchone()
     return dict(row)
@@ -331,6 +481,7 @@ def update_conversation(
     max_tokens: int | None = None, clear_max_tokens: bool = False,
     compress: bool | None = None, strategy: str | None = None,
     context_n: int | None = None,
+    use_profile: bool | None = None, use_project: bool | None = None,
 ) -> dict | None:
     """Меняет название или настройки. Возвращает None, если диалог чужой или его нет."""
     sets, values = [], []
@@ -356,6 +507,12 @@ def update_conversation(
     if context_n is not None:
         sets.append("context_n = ?")
         values.append(max(1, min(context_n, 200)))
+    if use_profile is not None:
+        sets.append("use_profile = ?")
+        values.append(int(use_profile))
+    if use_project is not None:
+        sets.append("use_project = ?")
+        values.append(int(use_project))
     if clear_max_tokens:
         sets.append("max_tokens = NULL")
     elif max_tokens is not None:
@@ -445,12 +602,14 @@ def create_branch(conversation_id: int, user_id: int, from_message_id: int) -> d
         cur = conn.execute(
             "INSERT INTO conversations (user_id, title, model, thinking, max_tokens,"
             " strategy, context_n, facts, summary, summary_upto, parent_id, branched_from,"
-            " created_at, updated_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " project_id, use_profile, use_project, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (user_id, f"↳ {base}"[:TITLE_LIMIT], source["model"], source["thinking"],
              source["max_tokens"], source["strategy"], source["context_n"],
              source["facts"], source["summary"], source["summary_upto"],
-             conversation_id, from_message_id, _now(), _now()),
+             conversation_id, from_message_id,
+             source["project_id"], source["use_profile"], source["use_project"],
+             _now(), _now()),
         )
         branch_id = cur.lastrowid
         for r in rows:

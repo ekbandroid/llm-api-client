@@ -291,6 +291,47 @@ td.actions button { margin-left: 6px; }
 .conv:hover .kill, .conv.active .kill { opacity: 1; }
 .conv .kill:hover { color: var(--danger); }
 .convempty { color: var(--muted); font-size: 13px; padding: 10px; }
+
+/* Диалоги сгруппированы по проектам: заголовок группы раскрывает список. */
+.group { margin-bottom: 6px; }
+.grouphead {
+  display: flex; align-items: center; gap: 10px; padding: 7px 10px; border-radius: 6px;
+  cursor: pointer; font-size: 13px; color: var(--text);
+}
+.grouphead:hover { background: var(--bg); }
+.grouphead .caret { flex: 0 0 auto; width: 9px; font-size: 10px; color: var(--muted); }
+.grouphead .name {
+  flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; font-weight: 600;
+}
+.grouphead .count { flex: 0 0 auto; font-family: var(--mono); font-size: 11px; color: var(--muted); }
+.grouphead .kill {
+  flex: 0 0 auto; border: 0; background: transparent; color: var(--muted);
+  font-size: 15px; line-height: 1; padding: 2px 4px; opacity: 0; font-weight: 400;
+}
+.grouphead:hover .kill { opacity: 1; }
+.grouphead .kill:hover { color: var(--danger); }
+.group .conv { margin-left: 18px; }
+.grouphead .projname { flex: 1 1 0; min-width: 0; padding: 3px 6px; font-size: 13px; }
+.addconv {
+  margin: 2px 0 0 28px; padding: 2px 6px; border: 0; background: transparent;
+  color: var(--muted); font-size: 12px; font-weight: 400; cursor: pointer;
+}
+.addconv:hover { color: var(--text); background: transparent; }
+
+/* Накопленные факты проекта: каждый можно убрать по отдельности. */
+.facts { margin-top: 8px; }
+.fact {
+  display: flex; align-items: baseline; gap: 8px; font-size: 12px;
+  padding: 3px 0; border-top: 1px solid var(--border);
+}
+.fact .key { flex: 0 0 auto; font-family: var(--mono); color: var(--text); }
+.fact .val { flex: 1 1 0; min-width: 0; color: var(--muted); overflow-wrap: anywhere; }
+.fact .kill {
+  flex: 0 0 auto; border: 0; background: transparent; color: var(--muted);
+  font-size: 14px; line-height: 1; padding: 0 2px; font-weight: 400;
+}
+.fact .kill:hover { color: var(--danger); }
 .convtitle { display: flex; align-items: center; gap: 10px; padding: 10px 24px; border-bottom: 1px solid var(--border); background: var(--panel); }
 .convtitle b { font-size: 14px; }
 .convtitle input { flex: 1; max-width: 420px; }

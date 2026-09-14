@@ -124,15 +124,18 @@ def dialog_growth(conversation_id: int, model: str) -> list[Turn]:
     return turns
 
 
-def next_request_estimate(conversation_id: int, draft: str = "") -> dict:
-    """Во что обойдётся следующий запрос: история плюс черновик реплики."""
+def next_request_estimate(
+    conversation_id: int, draft: str = "", *, memory_tokens: int = 0
+) -> dict:
+    """Во что обойдётся следующий запрос: история, черновик и слои памяти."""
     history = db.history_for_api(conversation_id)
     history_tokens = estimate_messages(history)
     draft_tokens = estimate_tokens(draft) + (MESSAGE_OVERHEAD if draft else 0)
-    total = history_tokens + draft_tokens
+    total = history_tokens + draft_tokens + memory_tokens
     return {
         "history_tokens": history_tokens,
         "draft_tokens": draft_tokens,
+        "memory_tokens": memory_tokens,
         "request_tokens": total,
         "context_limit": CONTEXT_LIMIT,
         "context_used": round(total / CONTEXT_LIMIT * 100, 3),

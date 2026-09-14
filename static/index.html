@@ -30,6 +30,9 @@
   <button class="railbtn" data-tab="model" title="Настройки модели и контекста" aria-label="Настройки">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>
   </button>
+  <button class="railbtn" data-tab="memory" title="Память агента" aria-label="Память">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>
+  </button>
   <button class="railbtn" data-tab="tokens" title="Расход токенов" aria-label="Токены">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>
   </button>
@@ -39,7 +42,7 @@
   <section class="tab" data-tab="dialogs">
     <div class="tabhead"><span>Диалоги</span><span class="grow"></span><button class="hide" title="Свернуть панель">‹</button></div>
     <div class="tabbody">
-      <button class="newconv" id="newConv">+ Новый диалог</button>
+      <button class="newconv" id="newProject">+ Новый проект</button>
       <div class="convlist" id="convList"></div>
     </div>
   </section>
@@ -62,13 +65,43 @@
         <label><span>Стратегия</span><select id="strategy">
           <option value="full">Вся история</option>
           <option value="window">Последние N сообщений</option>
-          <option value="facts">Факты + последние N</option>
+          <option value="facts" selected>Факты + последние N</option>
           <option value="summary">Конспект + хвост</option>
         </select></label>
         <label><span>N — сколько сообщений дословно</span><input type="number" id="contextN" min="1" max="200" value="10"></label>
         <div class="hint" id="strategyState"></div>
         <details id="factsBox" hidden><summary>Карточка фактов</summary><pre id="factsBody"></pre></details>
         <div class="hint">Настройки принадлежат диалогу и сохраняются вместе с ним. При включённом thinking рассуждение расходует этот же бюджет.</div>
+      </fieldset>
+    </div>
+  </section>
+
+  <section class="tab" data-tab="memory">
+    <div class="tabhead"><span>Память</span><span class="grow"></span><button class="hide" title="Свернуть панель">‹</button></div>
+    <div class="tabbody">
+      <fieldset>
+        <legend>Долговременная — профиль</legend>
+        <textarea id="profileMemory" placeholder="Что модель должна знать о вас в любом диалоге: кто вы, чем занимаетесь, как отвечать."></textarea>
+        <div class="hint" id="profileState"></div>
+        <div class="check" style="margin-top:8px"><input type="checkbox" id="useProfile"><label for="useProfile" style="margin:0">Подключать к этому диалогу</label></div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Рабочая — проект</legend>
+        <div class="hint" id="projectNone">Диалог не принадлежит проекту. Заведите проект во вкладке «Диалоги» и создайте диалог внутри него.</div>
+        <div id="projectBox" hidden>
+          <b id="projectName"></b>
+          <textarea id="projectBrief" style="margin-top:8px" placeholder="Цель задачи, ограничения, договорённости — общее для всех диалогов проекта."></textarea>
+          <div class="hint" id="projectState"></div>
+          <div class="check" style="margin-top:8px"><input type="checkbox" id="collectFacts"><label for="collectFacts" style="margin:0">Собирать факты диалогов</label></div>
+          <div class="check" style="margin-top:6px"><input type="checkbox" id="useProject"><label for="useProject" style="margin:0">Подключать к этому диалогу</label></div>
+          <div class="facts" id="projectFacts"></div>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Краткосрочная — диалог</legend>
+        <div class="hint" id="shortState"></div>
       </fieldset>
     </div>
   </section>
@@ -99,11 +132,17 @@
 <script>
 const $ = id => document.getElementById(id);
 const log = $("log");
-let conversations = [], current = null, busy = false;
+let conversations = [], projects = [], current = null, currentProject = null, busy = false;
+// Название проекта вводится прямо в списке: модальное окно ради одной строки —
+// лишний шаг, а на узкой панели ещё и теряет из виду сам список.
+let creatingProject = false, renamingProject = null;
 let loadedTotals = 0;   // сумма tokens_total по сообщениям открытого диалога
 // Исходные тексты сообщений: в DOM markdown уже отрисован, и оценка по нему
 // занижала бы размер запроса — символы разметки там потеряны.
 let loadedTexts = [];
+// Оценка слоёв памяти: они уходят в тот же запрос, что и переписка, но в ней
+// не видны — без них счётчик занижал бы размер на всю память.
+let profileTokens = 0, projectTokens = 0;
 
 const el = (tag, cls, text) => {
   const n = document.createElement(tag);
@@ -201,40 +240,206 @@ $("reloadModels").addEventListener("click", reloadModels);
 // ---------- список диалогов ----------
 
 async function loadConversations(openId) {
-  conversations = (await (await fetch("/api/conversations")).json()).conversations;
+  // Проекты и диалоги приходят порознь: список строится из обоих, поэтому
+  // ждём оба ответа, иначе дерево успеет отрисоваться без групп.
+  const [convRes, projRes] = await Promise.all([
+    fetch("/api/conversations"), fetch("/api/projects"),
+  ]);
+  conversations = (await convRes.json()).conversations;
+  projects = (await projRes.json()).projects;
   renderList();
   if (openId) return openConversation(openId);
   if (conversations.length && !current) return openConversation(conversations[0].id);
 }
 
+// Раскрытые группы — удобство конкретного браузера, как и состояние панели.
+const GROUP_KEY = "llmchat.groups";
+
+function groupState() {
+  try { return JSON.parse(localStorage.getItem(GROUP_KEY)) || {}; } catch { return {}; }
+}
+// По умолчанию группа раскрыта: пустой список выглядел бы поломкой.
+const groupOpen = key => groupState()[key] !== false;
+function setGroupOpen(key, open) {
+  const state = groupState();
+  state[key] = open;
+  try { localStorage.setItem(GROUP_KEY, JSON.stringify(state)); } catch {}
+}
+
+/** Поле ввода названия: Enter — сохранить, Esc — отменить, уход — тоже отмена. */
+function nameInput(value, onCommit) {
+  const input = el("input", "projname");
+  input.type = "text";
+  input.maxLength = 60;
+  input.value = value;
+  input.placeholder = "Название проекта";
+  let done = false;
+  const finish = commit => {
+    if (done) return;
+    done = true;
+    const text = input.value.trim();
+    if (commit && text) onCommit(text);
+    else { creatingProject = false; renamingProject = null; renderList(); }
+  };
+  input.onkeydown = e => {
+    if (e.key === "Enter") { e.preventDefault(); finish(true); }
+    if (e.key === "Escape") { e.preventDefault(); finish(false); }
+  };
+  input.onblur = () => finish(false);
+  input.onclick = e => e.stopPropagation();
+  setTimeout(() => { input.focus(); input.select(); }, 0);
+  return input;
+}
+
+/** Строка одного диалога. */
+function convRow(c) {
+  const row = el("div", "conv" + (current && c.id === current.id ? " active" : ""));
+  // Имена режем до одной длины: иначе список выглядит рваным, когда рядом
+  // стоят однословный заголовок и первая фраза на две строки.
+  const name = el("span", "name", shortTitle(c.title));
+  name.title = c.parent_id ? `${c.title}\n(ветка диалога №${c.parent_id})` : c.title;
+  row.appendChild(name);
+  row.appendChild(el("span", "count", String(c.message_count ?? 0)));
+  const kill = el("button", "kill", "×");
+  kill.title = "Удалить диалог";
+  kill.onclick = async e => {
+    e.stopPropagation();
+    if (!confirm(`Удалить диалог «${c.title}» вместе с сообщениями?`)) return;
+    await fetch(`/api/conversations/${c.id}`, { method: "DELETE" });
+    if (current && current.id === c.id) { current = null; showEmpty(); }
+    loadConversations();
+  };
+  row.appendChild(kill);
+  row.onclick = () => openConversation(c.id);
+  return row;
+}
+
+/** Список диалогов, сгруппированный по проектам. */
 function renderList() {
   const box = $("convList");
   box.innerHTML = "";
-  if (!conversations.length) {
-    box.appendChild(el("div", "convempty", "Диалогов пока нет."));
-    return;
-  }
-  for (const c of conversations) {
-    const row = el("div", "conv" + (current && c.id === current.id ? " active" : ""));
-    // Имена режем до одной длины: иначе список выглядит рваным, когда рядом
-    // стоят однословный заголовок и первая фраза на две строки.
-    const name = el("span", "name", shortTitle(c.title));
-    name.title = c.parent_id ? `${c.title}\n(ветка диалога №${c.parent_id})` : c.title;
-    row.appendChild(name);
-    row.appendChild(el("span", "count", String(c.message_count ?? 0)));
-    const kill = el("button", "kill", "×");
-    kill.title = "Удалить диалог";
-    kill.onclick = async e => {
-      e.stopPropagation();
-      if (!confirm(`Удалить диалог «${c.title}» вместе с сообщениями?`)) return;
-      await fetch(`/api/conversations/${c.id}`, { method: "DELETE" });
-      if (current && current.id === c.id) { current = null; showEmpty(); }
-      loadConversations();
-    };
-    row.appendChild(kill);
-    row.onclick = () => openConversation(c.id);
+
+  if (creatingProject) {
+    const row = el("div", "grouphead");
+    row.appendChild(el("span", "caret", "▾"));
+    row.appendChild(nameInput("", createProject));
     box.appendChild(row);
   }
+
+  const groups = projects.map(p => ({
+    key: "p" + p.id, project: p,
+    items: conversations.filter(c => c.project_id === p.id),
+  }));
+  // «Без проекта» есть всегда: сюда попадают старые диалоги, и отсюда же
+  // заводятся новые, когда проект не нужен.
+  groups.push({ key: "none", project: null, items: conversations.filter(c => !c.project_id) });
+
+  for (const g of groups) {
+    const wrap = el("div", "group");
+    const head = el("div", "grouphead");
+    const open = groupOpen(g.key);
+    head.appendChild(el("span", "caret", open ? "▾" : "▸"));
+
+    const renaming = g.project && renamingProject === g.project.id;
+    const name = renaming
+      ? nameInput(g.project.title, title => saveProjectTitle(g.project, title))
+      : el("span", "name", g.project ? g.project.title : "Без проекта");
+    if (!renaming) {
+      name.title = g.project
+        ? `${g.project.title}\nДвойной щелчок — переименовать`
+        : "Диалоги вне проектов";
+    }
+    head.appendChild(name);
+    head.appendChild(el("span", "count", String(g.items.length)));
+
+    if (g.project) {
+      if (!renaming) {
+        name.ondblclick = e => { e.stopPropagation(); renamingProject = g.project.id; renderList(); };
+      }
+      const kill = el("button", "kill", "×");
+      kill.title = "Удалить проект вместе с диалогами";
+      kill.onclick = e => { e.stopPropagation(); deleteProject(g.project, g.items.length); };
+      head.appendChild(kill);
+    }
+    head.onclick = () => {
+      if (renaming) return;
+      setGroupOpen(g.key, !open);
+      renderList();
+    };
+    wrap.appendChild(head);
+
+    if (open) {
+      for (const c of g.items) wrap.appendChild(convRow(c));
+      const add = el("button", "addconv", "+ диалог");
+      add.title = g.project ? `Новый диалог в проекте «${g.project.title}»` : "Новый диалог вне проектов";
+      add.onclick = () => newConversation(g.project ? g.project.id : null);
+      wrap.appendChild(add);
+    }
+    box.appendChild(wrap);
+  }
+}
+
+// ---------- проекты ----------
+
+function newProject() {
+  creatingProject = true;
+  renderList();
+}
+
+async function createProject(title) {
+  creatingProject = false;
+  const res = await fetch("/api/projects", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title }),
+  });
+  if (!res.ok) { alert("Не удалось создать проект"); return renderList(); }
+  const created = await res.json();
+  setGroupOpen("p" + created.id, true);
+  await loadConversations();
+}
+
+async function saveProjectTitle(project, title) {
+  renamingProject = null;
+  if (title !== project.title) {
+    await fetch(`/api/projects/${project.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title }),
+    });
+  }
+  await loadConversations();
+  if (current && current.project_id === project.id) showMemory(current);
+}
+
+async function deleteProject(project, count) {
+  // Диалоги проекта удаляются вместе с ним — предупреждаем прямо.
+  const tail = count
+    ? ` Вместе с ним будут удалены диалоги (${count}) и вся их переписка.`
+    : "";
+  if (!confirm(`Удалить проект «${project.title}»?${tail} Отменить будет нельзя.`)) return;
+  await fetch(`/api/projects/${project.id}`, { method: "DELETE" });
+  if (current && current.project_id === project.id) { current = null; showEmpty(); }
+  await loadConversations();
+}
+
+/** Создаёт диалог — сразу внутри проекта, если он указан. */
+async function newConversation(projectId) {
+  await modelsReady;
+  const res = await fetch("/api/conversations", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: $("model").value || null,
+      thinking: $("thinking").checked,
+      max_tokens: Number($("maxTokens").value) || null,
+      project_id: projectId,
+    }),
+  });
+  const created = await res.json();
+  current = null;
+  await loadConversations(created.id);
+  $("prompt").focus();
 }
 
 function showEmpty() {
@@ -243,6 +448,7 @@ function showEmpty() {
   log.innerHTML = "";
   log.appendChild(el("div", "empty", "Создайте диалог или напишите сообщение — диалог заведётся сам."));
   $("convTitle").hidden = true;
+  showMemory(null);
 }
 
 async function openConversation(id) {
@@ -258,7 +464,6 @@ async function openConversation(id) {
   $("maxTokens").value = current.max_tokens || "";
   $("strategy").value = current.strategy || "full";
   $("contextN").value = current.context_n || 10;
-  showStrategy(current);
 
   log.innerHTML = "";
   if (!data.messages.length) {
@@ -268,6 +473,10 @@ async function openConversation(id) {
   }
   loadedTotals = data.messages.reduce((s, m) => s + (m.tokens_total || 0), 0);
   loadedTexts = data.messages.map(m => m.content);
+  // Слои показываем после загрузки сообщений: краткосрочный слой — это они
+  // и есть, и до присваивания их счётчик показывал бы ноль.
+  showStrategy(current);
+  showMemory(current);
   updateTokenStats();
   log.scrollTop = log.scrollHeight;
   renderList();
@@ -301,6 +510,8 @@ function showStrategy(conv) {
   };
   box.textContent = texts[conv.strategy] || texts.full;
 
+  showShortState(conv);
+
   if (conv.strategy === "facts") {
     const facts = parseFacts(conv.facts);
     const count = Object.keys(facts).length;
@@ -318,18 +529,177 @@ function parseFacts(raw) {
   catch { return {}; }
 }
 
+// ---------- вкладка «Память» ----------
+//
+// Три слоя показываются раздельно и подключаются раздельно: профиль принадлежит
+// пользователю, рабочая память — проекту, краткосрочная — самому диалогу.
+
+async function loadProfile() {
+  const res = await fetch("/api/me/memory");
+  if (!res.ok) return;
+  const data = await res.json();
+  $("profileMemory").value = data.text;
+  showProfileState(data);
+  profileTokens = data.tokens;
+  updateTokenStats();
+}
+
+function showProfileState(data) {
+  $("profileState").textContent = data.text
+    ? `${data.text.length} из ${data.limit} символов, ~${data.tokens} токенов в каждом запросе.`
+    : "Пусто — слой ничего не добавляет к запросам.";
+}
+
+/** Обновляет вкладку под выбранный диалог. */
+async function showMemory(conv) {
+  for (const id of ["useProfile", "useProject"]) $(id).disabled = !conv;
+  $("useProfile").checked = conv ? !!conv.use_profile : true;
+  $("useProject").checked = conv ? !!conv.use_project : true;
+
+  const empty = $("projectNone"), box = $("projectBox");
+  currentProject = null;
+  projectTokens = 0;
+  if (!conv || !conv.project_id) {
+    empty.hidden = false;
+    box.hidden = true;
+  } else {
+    const res = await fetch(`/api/projects/${conv.project_id}`);
+    if (res.ok) {
+      const data = await res.json();
+      currentProject = data.project;
+      projectTokens = data.tokens;
+      empty.hidden = true;
+      box.hidden = false;
+      $("projectName").textContent = data.project.title;
+      $("projectBrief").value = data.project.brief || "";
+      $("collectFacts").checked = !!data.project.collect_facts;
+      $("projectState").textContent =
+        `В каждый запрос диалогов проекта: ~${data.tokens} токенов; ` +
+        `фактов ${Object.keys(data.facts).length} из ${data.facts_limit}.`;
+      renderProjectFacts(data.facts);
+    } else {
+      empty.hidden = false;
+      box.hidden = true;
+    }
+  }
+  showShortState(conv);
+  updateTokenStats();
+}
+
+function renderProjectFacts(facts) {
+  const box = $("projectFacts");
+  box.innerHTML = "";
+  const keys = Object.keys(facts);
+  if (!keys.length) {
+    box.appendChild(el("div", "hint", "Фактов пока нет — они накопятся из диалогов проекта."));
+    return;
+  }
+  for (const key of keys) {
+    const row = el("div", "fact");
+    row.appendChild(el("span", "key", key));
+    row.appendChild(el("span", "val", String(facts[key])));
+    const kill = el("button", "kill", "×");
+    kill.title = "Забыть этот факт";
+    kill.onclick = async () => {
+      if (!currentProject) return;
+      const res = await fetch(
+        `/api/projects/${currentProject.id}/facts/${encodeURIComponent(key)}`,
+        { method: "DELETE" });
+      if (res.ok) showMemory(current);
+    };
+    row.appendChild(kill);
+    box.appendChild(row);
+  }
+}
+
+/** Что сейчас в краткосрочном слое — том, что живёт только внутри диалога. */
+function showShortState(conv) {
+  const box = $("shortState");
+  if (!conv) { box.textContent = "Диалог не выбран."; return; }
+  const names = {
+    full: "вся переписка целиком",
+    window: `последние ${conv.context_n || 10} сообщений`,
+    facts: `карточка фактов и последние ${conv.context_n || 10} сообщений`,
+    summary: "конспект свёрнутой части и хвост",
+  };
+  const facts = Object.keys(parseFacts(conv.facts)).length;
+  box.textContent =
+    `Сообщений в диалоге: ${loadedTexts.length}. В запрос идёт ${names[conv.strategy] || names.full}.` +
+    (conv.strategy === "facts" ? ` Фактов диалога: ${facts}.` : "") +
+    " Всё это исчезнет вместе с диалогом.";
+}
+
+$("profileMemory").addEventListener("change", async () => {
+  const res = await fetch("/api/me/memory", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text: $("profileMemory").value }),
+  });
+  if (res.ok) {
+    const data = await res.json();
+    $("profileMemory").value = data.text;
+    showProfileState(data);
+    profileTokens = data.tokens;
+    updateTokenStats();
+  }
+});
+
+$("projectBrief").addEventListener("change", async () => {
+  if (!currentProject) return;
+  await fetch(`/api/projects/${currentProject.id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ brief: $("projectBrief").value }),
+  });
+  showMemory(current);
+});
+
+$("collectFacts").addEventListener("change", async () => {
+  if (!currentProject) return;
+  await fetch(`/api/projects/${currentProject.id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ collect_facts: $("collectFacts").checked }),
+  });
+});
+
+$("useProfile").addEventListener("change", async () => {
+  await patchCurrent({ use_profile: $("useProfile").checked });
+  updateTokenStats();
+});
+$("useProject").addEventListener("change", async () => {
+  await patchCurrent({ use_project: $("useProject").checked });
+  updateTokenStats();
+});
+
+/** Строка о том, сколько памяти ушло в этот запрос. */
+function memoryLine(mem) {
+  if (!mem || (!mem.profile && !mem.project)) return null;
+  const parts = [];
+  if (mem.profile) parts.push(`профиль ~${mem.profile.tokens} токенов`);
+  if (mem.project) {
+    parts.push(`проект «${mem.project.title}» ~${mem.project.tokens} токенов` +
+               (mem.project.facts ? `, фактов ${mem.project.facts}` : ""));
+  }
+  const line = el("div", "hint", "Память в запросе: " + parts.join("; ") + ".");
+  line.style.marginTop = "8px";
+  return line;
+}
+
 /** Показывает расход диалога и оценку следующего запроса. */
 function updateTokenStats() {
   const box = $("tokenStats");
   if (!current) { box.innerHTML = '<span>диалог не выбран</span>'; return; }
 
   const draft = $("prompt").value;
-  const next = estimateMessages(loadedTexts) + (draft ? estimateTokens(draft) + 4 : 0);
+  const memory = (current.use_profile ? profileTokens : 0) + (current.use_project ? projectTokens : 0);
+  const next = estimateMessages(loadedTexts) + (draft ? estimateTokens(draft) + 4 : 0) + memory;
   const spent = loadedTotals;
 
   box.innerHTML =
     `<span>потрачено <b>${spent.toLocaleString("ru-RU")}</b></span>` +
-    `<span>следующий запрос ~<b>${next.toLocaleString("ru-RU")}</b></span>`;
+    `<span>следующий запрос ~<b>${next.toLocaleString("ru-RU")}</b></span>` +
+    (memory ? `<span>из них память <b>${memory.toLocaleString("ru-RU")}</b></span>` : "");
 }
 
 /** Кнопка «Ветка отсюда» под ответом модели. */
@@ -395,6 +765,8 @@ function renderStored(m) {
     if (d) box.appendChild(d);
   }
   box.appendChild(statsLine(m));
+  const mem = memoryLine(meta.memory);
+  if (mem) box.appendChild(mem);
   addBranchButton(box, m.id);
   if (meta.finish_reason === "length") {
     box.appendChild(el("div", "truncated", "Генерация оборвана лимитом max_tokens — ответ не дописан."));
@@ -413,8 +785,6 @@ async function ensureConversation() {
       model: $("model").value || null,
       thinking: $("thinking").checked,
       max_tokens: Number($("maxTokens").value) || null,
-      strategy: $("strategy").value,
-      context_n: Number($("contextN").value) || 10,
     }),
   });
   current = await res.json();
@@ -535,6 +905,15 @@ async function send(text) {
             : `Карточку фактов обновить не удалось: ${ev.reason}. Прежняя сохранена.`;
           box.appendChild(note);
           if (current && ev.ok) { current.facts = JSON.stringify(ev.facts); showStrategy(current); }
+        } else if (ev.type === "project_facts") {
+          const note = el("div", "hint");
+          note.style.marginTop = "8px";
+          const keys = [...ev.added, ...ev.changed];
+          note.textContent =
+            `В память проекта «${ev.title}» перенесено: ${keys.join(", ")}. ` +
+            `Всего фактов у проекта: ${ev.count}.`;
+          box.appendChild(note);
+          if (current) showMemory(current);
         } else if (ev.type === "context_error") {
           const note = el("div", "truncated");
           note.textContent = "Обслуживание контекста не удалось: " + ev.message;
@@ -599,24 +978,7 @@ $("maxTokens").addEventListener("change", () => {
 });
 $("titleInput").addEventListener("change", () => patchCurrent({ title: $("titleInput").value }));
 
-$("newConv").addEventListener("click", async () => {
-  await modelsReady;
-  const res = await fetch("/api/conversations", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: $("model").value || null,
-      thinking: $("thinking").checked,
-      max_tokens: Number($("maxTokens").value) || null,
-      strategy: $("strategy").value,
-      context_n: Number($("contextN").value) || 10,
-    }),
-  });
-  const created = await res.json();
-  current = null;
-  await loadConversations(created.id);
-  $("prompt").focus();
-});
+$("newProject").addEventListener("click", newProject);
 
 // ---------- события ----------
 
@@ -675,6 +1037,7 @@ $("prompt").addEventListener("keydown", e => {
 });
 
 loadConversations();
+loadProfile();
 updateTokenStats();
 </script>
 </body>

@@ -20,6 +20,7 @@ import db
 import benchmark
 import history
 import llm
+import memory
 import reasoning
 import temperature as temperature_mod
 import tokens as tokens_mod
@@ -406,6 +407,117 @@ def api_login(request: Request, creds: Credentials) -> dict:
     return _finish_login(request, user)
 
 
+# ---------- память: профиль и проекты ----------
+#
+# Три слоя памяти лежат порознь: профиль — у пользователя, бриф и накопленные
+# факты — у проекта, переписка — у диалога. Здесь только первые два: диалоговым
+# слоем занимаются маршруты диалогов ниже.
+
+class ProfileMemory(BaseModel):
+    text: str = ""
+
+
+class ProjectCreate(BaseModel):
+    title: str = ""
+    brief: str = ""
+
+
+class ProjectPatch(BaseModel):
+    title: str | None = None
+    brief: str | None = None
+    collect_facts: bool | None = None
+
+
+def _owned_project(project_id: int, user: dict) -> dict:
+    """Проект пользователя или 404 — как и у диалогов, чужой неотличим от несуществующего."""
+    project = db.get_project(project_id, user["id"])
+    if project is None:
+        raise HTTPException(404, "Проект не найден")
+    return project
+
+
+@app.get("/api/me/memory")
+async def profile_memory_get(user: dict = Depends(require_approved)) -> dict:
+    """Долговременная память — то, что уходит во все диалоги с включённым слоем."""
+    text = user["profile_memory"] or ""
+    return {"text": text, "limit": db.PROFILE_LIMIT, "tokens": tokens_mod.estimate_tokens(text)}
+
+
+@app.put("/api/me/memory")
+async def profile_memory_put(
+    payload: ProfileMemory, user: dict = Depends(require_approved)
+) -> dict:
+    db.set_profile_memory(user["id"], payload.text)
+    return await profile_memory_get(db.get(user["id"]))
+
+
+@app.get("/api/projects")
+async def projects_list(user: dict = Depends(require_approved)) -> dict:
+    return {"projects": db.list_projects(user["id"])}
+
+
+@app.post("/api/projects")
+async def project_create(
+    payload: ProjectCreate, user: dict = Depends(require_approved)
+) -> dict:
+    return db.create_project(user["id"], title=payload.title, brief=payload.brief)
+
+
+@app.get("/api/projects/{project_id}")
+async def project_get(project_id: int, user: dict = Depends(require_approved)) -> dict:
+    project = _owned_project(project_id, user)
+    facts = memory.load_facts(project["facts"])
+    return {
+        "project": project,
+        "facts": facts,
+        "brief_limit": db.BRIEF_LIMIT,
+        "facts_limit": memory.PROJECT_FACTS_LIMIT,
+        "tokens": tokens_mod.estimate_tokens(
+            memory.project_text(memory.Layers(
+                project_title=project["title"], project_brief=project["brief"] or "",
+                project_facts=facts,
+            ))
+        ) if (project["brief"] or facts) else 0,
+    }
+
+
+@app.patch("/api/projects/{project_id}")
+async def project_patch(
+    project_id: int, payload: ProjectPatch, user: dict = Depends(require_approved)
+) -> dict:
+    _owned_project(project_id, user)
+    updated = db.update_project(
+        project_id, user["id"], title=payload.title, brief=payload.brief,
+        collect_facts=payload.collect_facts,
+    )
+    if updated is None:
+        raise HTTPException(404, "Проект не найден")
+    return updated
+
+
+@app.delete("/api/projects/{project_id}")
+async def project_delete(project_id: int, user: dict = Depends(require_approved)) -> dict:
+    """Удаляет проект вместе с диалогами. Предупреждение показывает интерфейс."""
+    _owned_project(project_id, user)
+    killed = db.delete_project(project_id, user["id"])
+    if killed is None:
+        raise HTTPException(404, "Проект не найден")
+    return {"ok": True, "conversations_deleted": killed}
+
+
+@app.delete("/api/projects/{project_id}/facts/{key}")
+async def project_fact_delete(
+    project_id: int, key: str, user: dict = Depends(require_approved)
+) -> dict:
+    """Убирает один накопленный факт: память проекта должна быть управляемой."""
+    project = _owned_project(project_id, user)
+    facts = memory.load_facts(project["facts"])
+    if facts.pop(key, None) is None:
+        raise HTTPException(404, "Такого факта нет")
+    db.set_project_facts(project_id, json.dumps(facts, ensure_ascii=False))
+    return {"ok": True, "facts": facts}
+
+
 # ---------- диалоги ----------
 
 class ConversationCreate(BaseModel):
@@ -413,8 +525,10 @@ class ConversationCreate(BaseModel):
     model: str | None = None
     thinking: bool = False
     max_tokens: int | None = Field(default=None, ge=1, le=384_000)
-    strategy: str = db.FULL
+    strategy: str = db.DEFAULT_STRATEGY
     context_n: int = Field(default=db.DEFAULT_CONTEXT_N, ge=1, le=200)
+    # Диалог заводится сразу внутри проекта; переносить его потом нельзя.
+    project_id: int | None = None
 
 
 class ConversationPatch(BaseModel):
@@ -426,6 +540,9 @@ class ConversationPatch(BaseModel):
     max_tokens: int | None = Field(default=None, ge=0, le=384_000)
     strategy: str | None = None
     context_n: int | None = Field(default=None, ge=1, le=200)
+    # Какие слои памяти подключать к запросам этого диалога.
+    use_profile: bool | None = None
+    use_project: bool | None = None
 
 
 class NewMessage(BaseModel):
@@ -473,6 +590,7 @@ async def conversation_create(
         max_tokens=payload.max_tokens,
         strategy=payload.strategy,
         context_n=payload.context_n,
+        project_id=_owned_project(payload.project_id, user)["id"] if payload.project_id else None,
     )
 
 
@@ -499,6 +617,8 @@ async def conversation_patch(
         clear_max_tokens=payload.max_tokens == 0,
         strategy=payload.strategy,
         context_n=payload.context_n,
+        use_profile=payload.use_profile,
+        use_project=payload.use_project,
     )
     if updated is None:
         raise HTTPException(404, "Диалог не найден")
@@ -555,7 +675,11 @@ async def conversation_send(
         db.update_conversation(conversation_id, user["id"], title=content)
 
     # Заново читаем диалог: только что добавленный вопрос должен войти в план.
-    plan = history.plan_request(_owned(conversation_id, user), system_prompt)
+    layers = memory.collect(conversation, user)
+    plan = history.plan_request(
+        _owned(conversation_id, user), system_prompt,
+        memory_blocks=memory.blocks(layers), memory_info=memory.describe(layers),
+    )
     messages = plan.messages
 
     async def events() -> AsyncIterator[str]:
@@ -594,6 +718,7 @@ async def conversation_send(
 
         meta.update(
             finish_reason=finish_reason, elapsed=elapsed,
+            memory=plan.memory,
             context={
                 "strategy": plan.strategy, "verbatim": plan.verbatim,
                 "folded": plan.folded, "dropped": plan.dropped,
@@ -626,6 +751,14 @@ async def conversation_send(
                 )
                 if info:
                     yield sse({"type": "facts", **info})
+                    # Факты диалога — то же знание, что нужно проекту. Переливаем
+                    # без обращения к модели: они уже извлечены строкой выше.
+                    if info.get("ok") and fresh["project_id"]:
+                        moved = memory.absorb_facts(
+                            db.get_project(fresh["project_id"], user["id"]), info["facts"]
+                        )
+                        if moved:
+                            yield sse({"type": "project_facts", **moved})
         except llm.LLMError as err:
             yield sse({"type": "context_error", "message": str(err)})
 
@@ -730,6 +863,11 @@ async def conversation_tokens(
     conversation = _owned(conversation_id, user)
     model = conversation["model"] or llm.MODEL
     turns = tokens_mod.dialog_growth(conversation_id, model)
+    # Слои памяти уходят в тот же запрос, значит и в оценку: без них она
+    # занижала бы размер ровно на ту часть, которую пользователь не видит
+    # в переписке.
+    described = memory.describe(memory.collect(conversation, user))
+    memory_tokens = sum(layer["tokens"] for layer in described.values())
 
     return {
         "model": model,
@@ -747,7 +885,10 @@ async def conversation_tokens(
             }
             for t in turns
         ],
-        "next_request": tokens_mod.next_request_estimate(conversation_id, draft),
+        "next_request": tokens_mod.next_request_estimate(
+            conversation_id, draft, memory_tokens=memory_tokens
+        ),
+        "memory": described,
         "ratios": tokens_mod.RATIOS,
     }
 

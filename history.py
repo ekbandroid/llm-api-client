@@ -50,7 +50,9 @@ FACTS_SYSTEM = (
     "Храни то, без чего нельзя продолжить работу: цель, ограничения, "
     "предпочтения, принятые решения, договорённости, открытые вопросы. "
     "Ключи — короткие существительные на русском. Старые факты сохраняй, если "
-    "они не отменены; отменённые заменяй новыми. Не выдумывай того, чего не было."
+    "они не отменены; отменённые заменяй новыми. Не выдумывай того, чего не было. "
+    "Карточка описывает задачу и собеседника, а не состояние ассистента: никогда "
+    "не записывай, чего ассистент не знает или не смог ответить."
 )
 
 # Сколько фактов держим: больше — и блок сам становится длинной историей.
@@ -69,6 +71,7 @@ class Plan:
     strategy: str = db.FULL
     dropped: int = 0            # сколько сообщений просто отброшено
     facts: dict = field(default_factory=dict)
+    memory: dict = field(default_factory=dict)   # что дали слои памяти поверх диалога
 
 
 def split(rows: list[dict], summary_upto: int | None) -> tuple[list[dict], list[dict], list[dict]]:
@@ -104,12 +107,21 @@ def facts_block(facts: dict) -> str:
     return FACTS_PREFIX + "\n".join(lines)
 
 
-def plan_request(conversation: dict, system_prompt: str) -> Plan:
-    """Собирает запрос к API по выбранной стратегии."""
+def plan_request(
+    conversation: dict, system_prompt: str, *,
+    memory_blocks: list[dict] | None = None, memory_info: dict | None = None,
+) -> Plan:
+    """Собирает запрос к API по выбранной стратегии.
+
+    Слои памяти, если они подключены, идут сразу за системным промптом —
+    до всего, что относится к самому диалогу. Собирает их memory.py: этому
+    модулю принадлежит только краткосрочный слой.
+    """
     rows = db.list_messages(conversation["id"])
     strategy = conversation.get("strategy") or db.FULL
     keep = conversation.get("context_n") or db.DEFAULT_CONTEXT_N
-    head = [{"role": "system", "content": system_prompt}]
+    head = [{"role": "system", "content": system_prompt}] + list(memory_blocks or [])
+    remembered = dict(memory_info or {})
 
     if strategy == db.WINDOW:
         # Всё, что не попало в окно, просто отбрасывается — это и есть
@@ -118,6 +130,7 @@ def plan_request(conversation: dict, system_prompt: str) -> Plan:
         return Plan(
             messages=head + as_api(tail), summary="", verbatim=len(tail),
             folded=0, stale=0, strategy=strategy, dropped=len(rows) - len(tail),
+            memory=remembered,
         )
 
     if strategy == db.FACTS:
@@ -127,7 +140,7 @@ def plan_request(conversation: dict, system_prompt: str) -> Plan:
         return Plan(
             messages=messages + as_api(tail), summary="", verbatim=len(tail),
             folded=0, stale=0, strategy=strategy,
-            dropped=len(rows) - len(tail), facts=facts,
+            dropped=len(rows) - len(tail), facts=facts, memory=remembered,
         )
 
     if strategy == db.SUMMARY:
@@ -137,12 +150,12 @@ def plan_request(conversation: dict, system_prompt: str) -> Plan:
         return Plan(
             messages=messages + as_api(stale) + as_api(tail), summary=summary,
             verbatim=len(stale) + len(tail), folded=len(folded), stale=len(stale),
-            strategy=strategy,
+            strategy=strategy, memory=remembered,
         )
 
     return Plan(
         messages=head + as_api(rows), summary="", verbatim=len(rows),
-        folded=0, stale=0, strategy=db.FULL,
+        folded=0, stale=0, strategy=db.FULL, memory=remembered,
     )
 
 
