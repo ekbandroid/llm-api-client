@@ -81,7 +81,21 @@
     <div class="tabbody">
       <fieldset>
         <legend>Долговременная — профиль</legend>
-        <textarea id="profileMemory" placeholder="Что модель должна знать о вас в любом диалоге: кто вы, чем занимаетесь, как отвечать."></textarea>
+        <label><span>Профиль диалога</span>
+          <span class="withbtn">
+            <select id="profileSelect"></select>
+            <button id="newProfile" class="ghost" title="Создать профиль">+</button>
+            <button id="killProfile" class="ghost" title="Удалить профиль">×</button>
+          </span>
+        </label>
+        <div id="profileBox" hidden>
+          <label style="margin-top:10px"><span>Название</span><input type="text" id="profileTitle" maxlength="60"></label>
+          <label><span>О собеседнике — роль, проект, команда</span><textarea id="profileAbout" placeholder="роль: Senior Android Developer&#10;проект: мобильный банк, команда 4 человека"></textarea></label>
+          <label><span>Стиль — как отвечать</span><textarea id="profileStyle" placeholder="краткие ответы&#10;формальный тон&#10;с примерами"></textarea></label>
+          <label><span>Ограничения — чего держаться</span><textarea id="profileConstraints" placeholder="стек: Kotlin, Ktor&#10;архитектура: MVVM&#10;только бесплатные API"></textarea></label>
+          <label><span>Формат ответа</span><select id="profileFormat"></select></label>
+          <div class="hint" id="profileFormatHint"></div>
+        </div>
         <div class="hint" id="profileState"></div>
         <div class="check" style="margin-top:8px"><input type="checkbox" id="useProfile"><label for="useProfile" style="margin:0">Подключать к этому диалогу</label></div>
       </fieldset>
@@ -132,7 +146,8 @@
 <script>
 const $ = id => document.getElementById(id);
 const log = $("log");
-let conversations = [], projects = [], current = null, currentProject = null, busy = false;
+let conversations = [], projects = [], current = null, busy = false;
+let currentProject = null, currentProfile = null;
 // Название проекта вводится прямо в списке: модальное окно ради одной строки —
 // лишний шаг, а на узкой панели ещё и теряет из виду сам список.
 let creatingProject = false, renamingProject = null;
@@ -534,20 +549,76 @@ function parseFacts(raw) {
 // Три слоя показываются раздельно и подключаются раздельно: профиль принадлежит
 // пользователю, рабочая память — проекту, краткосрочная — самому диалогу.
 
-async function loadProfile() {
-  const res = await fetch("/api/me/memory");
+let profilesList = [], profileFormats = [], profileLimit = 4000;
+
+/** Перечитывает профили пользователя. */
+async function loadProfiles() {
+  const res = await fetch("/api/profiles");
   if (!res.ok) return;
   const data = await res.json();
-  $("profileMemory").value = data.text;
-  showProfileState(data);
-  profileTokens = data.tokens;
-  updateTokenStats();
+  profilesList = data.profiles;
+  profileFormats = data.formats;
+  profileLimit = data.limit;
+
+  const sel = $("profileFormat");
+  if (!sel.options.length) profileFormats.forEach(f => sel.add(new Option(f.label, f.id)));
+  renderProfileSelect();
 }
 
-function showProfileState(data) {
-  $("profileState").textContent = data.text
-    ? `${data.text.length} из ${data.limit} символов, ~${data.tokens} токенов в каждом запросе.`
-    : "Пусто — слой ничего не добавляет к запросам.";
+function renderProfileSelect() {
+  const sel = $("profileSelect");
+  const keep = current && current.profile_id ? String(current.profile_id) : "";
+  sel.innerHTML = "";
+  sel.add(new Option("— без профиля —", ""));
+  profilesList.forEach(p => sel.add(new Option(p.title, String(p.id))));
+  sel.value = [...sel.options].some(o => o.value === keep) ? keep : "";
+}
+
+/** Показывает поля выбранного профиля и его цену. */
+function showProfile(profile) {
+  currentProfile = profile || null;
+  profileTokens = profile ? profile.tokens : 0;
+  $("profileBox").hidden = !profile;
+  $("killProfile").disabled = !profile;
+
+  if (profile) {
+    $("profileTitle").value = profile.title;
+    $("profileAbout").value = profile.about || "";
+    $("profileStyle").value = profile.style || "";
+    $("profileConstraints").value = profile.constraints || "";
+    $("profileFormat").value = profile.response_format;
+    $("profileFormatHint").textContent = profile.response_format === "json_object"
+      ? "Ответы будут приходить одним JSON-объектом. Слово «json» дописывается " +
+        "в промпт автоматически — без него API отклоняет запрос целиком."
+      : "Обычный текст с разметкой markdown.";
+    const filled = (profile.about || "").length + (profile.style || "").length +
+                   (profile.constraints || "").length;
+    $("profileState").textContent =
+      `~${profile.tokens} токенов в каждом запросе, ${filled} символов ` +
+      `(предел ${profileLimit} на поле). Всего профилей: ${profilesList.length}.`;
+  } else {
+    $("profileState").textContent = profilesList.length
+      ? `Диалог без профиля — долговременная память не подключена. Профилей: ${profilesList.length}.`
+      : "Профилей пока нет.";
+  }
+}
+
+/** Сохраняет поле профиля и обновляет цену слоя. */
+async function patchProfile(payload) {
+  if (!currentProfile) return;
+  const res = await fetch(`/api/profiles/${currentProfile.id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) { alert("Не удалось сохранить профиль"); return; }
+  const updated = await res.json();
+  // conversation_count приходит только со списком: сохраняем его при слиянии,
+  // иначе предупреждение при удалении показало бы ноль диалогов.
+  profilesList = profilesList.map(p => (p.id === updated.id ? { ...p, ...updated } : p));
+  renderProfileSelect();
+  showProfile(updated);
+  updateTokenStats();
 }
 
 /** Обновляет вкладку под выбранный диалог. */
@@ -555,6 +626,12 @@ async function showMemory(conv) {
   for (const id of ["useProfile", "useProject"]) $(id).disabled = !conv;
   $("useProfile").checked = conv ? !!conv.use_profile : true;
   $("useProject").checked = conv ? !!conv.use_project : true;
+
+  $("profileSelect").disabled = !conv;
+  renderProfileSelect();
+  showProfile(conv && conv.profile_id
+    ? profilesList.find(p => p.id === conv.profile_id)
+    : null);
 
   const empty = $("projectNone"), box = $("projectBox");
   currentProject = null;
@@ -632,19 +709,51 @@ function showShortState(conv) {
     " Всё это исчезнет вместе с диалогом.";
 }
 
-$("profileMemory").addEventListener("change", async () => {
-  const res = await fetch("/api/me/memory", {
-    method: "PUT",
+$("profileSelect").addEventListener("change", async () => {
+  // Ноль на сервере означает «снять профиль»; пустое значение — это он и есть.
+  const id = Number($("profileSelect").value) || 0;
+  await patchCurrent({ profile_id: id });
+  showProfile(id ? profilesList.find(p => p.id === id) : null);
+  updateTokenStats();
+});
+
+$("profileTitle").addEventListener("change", () => patchProfile({ title: $("profileTitle").value }));
+$("profileAbout").addEventListener("change", () => patchProfile({ about: $("profileAbout").value }));
+$("profileStyle").addEventListener("change", () => patchProfile({ style: $("profileStyle").value }));
+$("profileConstraints").addEventListener("change", () => patchProfile({ constraints: $("profileConstraints").value }));
+$("profileFormat").addEventListener("change", () => patchProfile({ response_format: $("profileFormat").value }));
+
+$("newProfile").addEventListener("click", async () => {
+  const res = await fetch("/api/profiles", {
+    method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text: $("profileMemory").value }),
+    body: JSON.stringify({ title: "Новый профиль" }),
   });
-  if (res.ok) {
-    const data = await res.json();
-    $("profileMemory").value = data.text;
-    showProfileState(data);
-    profileTokens = data.tokens;
-    updateTokenStats();
-  }
+  if (!res.ok) { alert("Не удалось создать профиль"); return; }
+  const created = await res.json();
+  await loadProfiles();
+  // Новый профиль сразу подключаем к диалогу — иначе его пришлось бы искать
+  // в списке, а он заводится ровно для того, чтобы им пользоваться.
+  if (current) await patchCurrent({ profile_id: created.id });
+  renderProfileSelect();
+  showProfile(created);
+  updateTokenStats();
+  $("profileTitle").focus();
+  $("profileTitle").select();
+});
+
+$("killProfile").addEventListener("click", async () => {
+  if (!currentProfile) return;
+  const listed = profilesList.find(p => p.id === currentProfile.id) || currentProfile;
+  const used = listed.conversation_count || 0;
+  const tail = used ? ` Диалоги (${used}) останутся, но потеряют долговременный слой.` : "";
+  if (!confirm(`Удалить профиль «${currentProfile.title}»?${tail}`)) return;
+  await fetch(`/api/profiles/${currentProfile.id}`, { method: "DELETE" });
+  await loadProfiles();
+  if (current) { current.profile_id = null; }
+  showProfile(null);
+  renderProfileSelect();
+  updateTokenStats();
 });
 
 $("projectBrief").addEventListener("change", async () => {
@@ -679,7 +788,10 @@ $("useProject").addEventListener("change", async () => {
 function memoryLine(mem) {
   if (!mem || (!mem.profile && !mem.project)) return null;
   const parts = [];
-  if (mem.profile) parts.push(`профиль ~${mem.profile.tokens} токенов`);
+  if (mem.profile) {
+    parts.push(`профиль «${mem.profile.title}» ~${mem.profile.tokens} токенов` +
+               (mem.profile.format === "json_object" ? ", ответ JSON-объектом" : ""));
+  }
   if (mem.project) {
     parts.push(`проект «${mem.project.title}» ~${mem.project.tokens} токенов` +
                (mem.project.facts ? `, фактов ${mem.project.facts}` : ""));
@@ -727,6 +839,21 @@ function addBranchButton(box, messageId) {
   box.appendChild(b);
 }
 
+/** Показывает ответ: markdown или, если профиль требует JSON, — разбором.
+ *
+ *  JSON-ответ в виде абзаца markdown нечитаем: кавычки и скобки склеиваются
+ *  в сплошную строку. Пока поток не дописан, разбор не удаётся — показываем
+ *  как есть, а по завершении форматируем с отступами.
+ */
+function renderAnswer(body, text, format) {
+  if (format !== "json_object") { setMarkdown(body, text); return; }
+  body.innerHTML = "";
+  const pre = el("pre", "jsonanswer");
+  try { pre.textContent = JSON.stringify(JSON.parse(text), null, 2); }
+  catch { pre.textContent = text; }
+  body.appendChild(pre);
+}
+
 function statsLine(m) {
   const meta = m.meta || {};
   const line = el("div", "stats");
@@ -746,13 +873,14 @@ function renderStored(m) {
   if (m.role === "user") { body.textContent = m.content; return; }
 
   const meta = m.meta || {};
+  const format = ((meta.memory || {}).profile || {}).format || "text";
   if (m.reasoning) {
     const d = document.createElement("details");
     d.appendChild(el("summary", null, "Рассуждение"));
     d.appendChild(el("pre", null, m.reasoning));
     box.insertBefore(d, body);
   }
-  setMarkdown(body, m.content);
+  renderAnswer(body, m.content, format);
   if (meta.system) {
     const d = document.createElement("details");
     d.appendChild(el("summary", null, `Системный промпт (${meta.model || ""})`));
@@ -810,6 +938,8 @@ async function send(text) {
   const body = box.querySelector(".body");
   body.classList.add("cursor");
   let answer = "", reasoning = "", reasoningBox = null;
+  // Формат приходит вместе с составом слоёв, до первого куска текста.
+  let answerFormat = "text";
 
   try {
     const res = await fetch(`/api/conversations/${current.id}/messages`, {
@@ -877,7 +1007,7 @@ async function send(text) {
           const wait = box.querySelector(".waitnote");
           if (wait) wait.remove();
           answer += ev.text;
-          setMarkdown(body, answer);
+          renderAnswer(body, answer, answerFormat);
           log.scrollTop = log.scrollHeight;
         } else if (ev.type === "error") {
           body.classList.add("error");
@@ -909,6 +1039,7 @@ async function send(text) {
           box.appendChild(note);
           if (current && ev.ok) { current.facts = JSON.stringify(ev.facts); showStrategy(current); }
         } else if (ev.type === "memory") {
+          answerFormat = ((ev.memory || {}).profile || {}).format || "text";
           const line = memoryLine(ev.memory);
           if (line) box.appendChild(line);
         } else if (ev.type === "project_facts") {
@@ -1042,8 +1173,9 @@ $("prompt").addEventListener("keydown", e => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("form").requestSubmit(); }
 });
 
-loadConversations();
-loadProfile();
+loadProfiles()
+  .then(loadConversations)
+  .then(() => { if (!current) showMemory(null); });
 updateTokenStats();
 </script>
 </body>

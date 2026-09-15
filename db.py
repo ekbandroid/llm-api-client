@@ -30,6 +30,23 @@ CREATE TABLE IF NOT EXISTS users (
     last_login_at TEXT
 );
 
+-- Профили — долговременная память. Их несколько: у одного человека бывает
+-- несколько ролей, и диалог ссылается на ту, в которой сейчас работают.
+CREATE TABLE IF NOT EXISTS profiles (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    title           TEXT    NOT NULL,
+    -- about — кто и над чем работает, style — как отвечать,
+    -- constraints — чего держаться и чего избегать.
+    about           TEXT,
+    style           TEXT,
+    constraints     TEXT,
+    response_format TEXT    NOT NULL DEFAULT 'text',
+    created_at      TEXT    NOT NULL,
+    updated_at      TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_profiles_user ON profiles(user_id, id);
+
 -- Проекты — рабочая память: несколько диалогов об одной задаче делят бриф
 -- и накопленные факты. Диалог заводится внутри проекта и остаётся в нём.
 CREATE TABLE IF NOT EXISTS projects (
@@ -102,8 +119,12 @@ def connect() -> sqlite3.Connection:
 # их не создаст в уже существующей таблице, поэтому добавляем отдельно.
 MIGRATIONS = {
     "users": {
-        # Долговременная память: что помнить о пользователе во всех диалогах.
+        # Историческая колонка: одна долговременная память на пользователя.
+        # Содержимое перенесено в profiles, отсюда больше не читается.
         "profile_memory": "TEXT",
+        # Готовые профили заводятся один раз; флаг не даёт завести их снова
+        # после того, как пользователь их поправил или удалил.
+        "profiles_seeded": "INTEGER NOT NULL DEFAULT 0",
     },
     "conversations": {
         "max_tokens": "INTEGER",
@@ -121,6 +142,8 @@ MIGRATIONS = {
         "project_id": "INTEGER",
         "use_profile": "INTEGER NOT NULL DEFAULT 1",
         "use_project": "INTEGER NOT NULL DEFAULT 1",
+        # Какой профиль долговременной памяти подключён к диалогу.
+        "profile_id": "INTEGER",
     },
 }
 
@@ -150,6 +173,11 @@ def init() -> None:
         conn.executescript(SCHEMA)
         _apply_migrations(conn)
         columns = {r[1] for r in conn.execute("PRAGMA table_info(users)")}
+        pending = [r[0] for r in conn.execute(
+            "SELECT id FROM users WHERE COALESCE(profiles_seeded, 0) = 0")]
+    # Готовые профили заводим и тем, кто зарегистрировался до их появления.
+    for user_id in pending:
+        seed_profiles(user_id)
     missing = {"login", "password_hash", "status", "is_admin"} - columns
     if missing:
         raise SchemaError(
@@ -190,7 +218,13 @@ def create_user(
                 _now(),
             ),
         )
-        return _fetch(conn, "login = ?", login)
+        user = _fetch(conn, "login = ?", login)
+    # Заводим профили отдельным подключением: внутри открытой транзакции
+    # второй писатель в WAL упёрся бы в блокировку.
+    if user:
+        seed_profiles(user["id"])
+        user = get(user["id"])
+    return user
 
 
 def get_by_login(login: str) -> dict | None:
@@ -258,7 +292,11 @@ def upsert_from_yandex(profile: dict, *, admin_logins: set[str]) -> dict:
                 (email, name, is_admin, status, _now(), yandex_id),
             )
 
-        return _fetch(conn, "yandex_id = ?", yandex_id)
+        user = _fetch(conn, "yandex_id = ?", yandex_id)
+    if user:
+        seed_profiles(user["id"])
+        user = get(user["id"])
+    return user
 
 
 # ---------- общее ----------
@@ -308,6 +346,215 @@ def count_admins() -> int:
     """Число админов — чтобы не остаться без единого администратора."""
     with connect() as conn:
         return conn.execute("SELECT COUNT(*) FROM users WHERE is_admin = 1").fetchone()[0]
+
+
+# ---------- профили ----------
+#
+# Долговременная память. У человека несколько ролей — по профилю на каждую:
+# в одном он пишет банковское приложение на Kotlin, в другом разбирает выгрузки
+# на Python, и ответы должны отличаться не только содержанием, но и стилем.
+
+TEXT_FORMAT, JSON_FORMAT = "text", "json_object"
+# Проверено на живом API: json_schema и regex провайдер пока отклоняет
+# («This response_format type is unavailable now»), поэтому их здесь нет.
+RESPONSE_FORMATS = (TEXT_FORMAT, JSON_FORMAT)
+
+NEW_PROFILE_TITLE = "Новый профиль"
+PROFILE_TITLE_LIMIT = 60
+LEGACY_PROFILE_TITLE = "Мой профиль"
+
+# Готовые профили: две роли на Android и две на Python. Это обычные строки —
+# их правят и удаляют, как любые другие.
+PROFILE_PRESETS = (
+    {
+        "title": "Android: мобильный банк",
+        "about": "Роль: Senior Android Developer.\n"
+                 "Проект: мобильный банк, команда 4 человека.",
+        "style": "Краткие ответы.\nФормальный тон.\nС примерами кода на Kotlin.",
+        "constraints": "Стек: Kotlin, Ktor client, Coroutines.\n"
+                       "Архитектура: MVVM.\n"
+                       "Минимум зависимостей, только бесплатные API.\n"
+                       "minSdk 26.",
+        "response_format": TEXT_FORMAT,
+    },
+    {
+        "title": "Android: инди-приложение",
+        "about": "Роль: Android-разработчик-одиночка.\n"
+                 "Проект: трекер привычек в Google Play, всё делаю сам.",
+        "style": "Подробные ответы с пошаговыми объяснениями.\n"
+                 "Разговорный тон.\nВсегда с примерами.",
+        "constraints": "Стек: Kotlin, Jetpack Compose, Room, Hilt.\n"
+                       "Без платных SDK и подписок.\n"
+                       "Нужны готовые сниппеты, а не общие советы.",
+        "response_format": TEXT_FORMAT,
+    },
+    {
+        "title": "Python: бэкенд на FastAPI",
+        "about": "Роль: Python backend developer.\n"
+                 "Проект: API сервиса на FastAPI и PostgreSQL, в команде двое.",
+        "style": "Кратко, формально, без вводных фраз.\n"
+                 "С примерами кода и аннотациями типов.",
+        "constraints": "Python 3.13, FastAPI, Pydantic v2, SQLAlchemy 2.x, pytest.\n"
+                       "Где хватает стандартной библиотеки — обходимся ею.\n"
+                       "Синхронный и асинхронный код не смешивать.",
+        "response_format": TEXT_FORMAT,
+    },
+    {
+        "title": "Python: данные и отчёты",
+        "about": "Роль: Python-разработчик по данным.\n"
+                 "Задачи: разбор выгрузок, отчёты, автоматизация рутины.",
+        "style": "Предельно сжато, без вводных фраз и извинений.\n"
+                 "Ответ — машиночитаемый json.",
+        "constraints": "pandas, polars, matplotlib.\n"
+                       "Код запускается как обычный скрипт, без Jupyter-магии.\n"
+                       "Большие выгрузки читать по частям.",
+        "response_format": JSON_FORMAT,
+    },
+)
+
+
+def _profile_fields(title, about, style, constraints, response_format):
+    """Приводит поля профиля к допустимым значениям."""
+    if response_format not in RESPONSE_FORMATS:
+        raise ValueError(f"Неизвестный формат ответа: {response_format}")
+    return (
+        title.strip()[:PROFILE_TITLE_LIMIT] or NEW_PROFILE_TITLE,
+        (about or "").strip()[:PROFILE_LIMIT],
+        (style or "").strip()[:PROFILE_LIMIT],
+        (constraints or "").strip()[:PROFILE_LIMIT],
+        response_format,
+    )
+
+
+def create_profile(
+    user_id: int, *, title: str = "", about: str = "", style: str = "",
+    constraints: str = "", response_format: str = TEXT_FORMAT,
+) -> dict:
+    """Заводит профиль и возвращает его."""
+    values = _profile_fields(title, about, style, constraints, response_format)
+    with connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO profiles (user_id, title, about, style, constraints,"
+            " response_format, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (user_id, *values, _now(), _now()),
+        )
+        row = conn.execute("SELECT * FROM profiles WHERE id = ?", (cur.lastrowid,)).fetchone()
+    return dict(row)
+
+
+def get_profile(profile_id: int, user_id: int) -> dict | None:
+    """Профиль по id, только если он принадлежит этому пользователю."""
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM profiles WHERE id = ? AND user_id = ?", (profile_id, user_id)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def list_profiles(user_id: int) -> list[dict]:
+    """Профили пользователя в порядке создания, с числом диалогов у каждого."""
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT p.*, (SELECT COUNT(*) FROM conversations c WHERE c.profile_id = p.id)"
+            " AS conversation_count FROM profiles p WHERE p.user_id = ? ORDER BY p.id",
+            (user_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def update_profile(
+    profile_id: int, user_id: int, *, title: str | None = None, about: str | None = None,
+    style: str | None = None, constraints: str | None = None,
+    response_format: str | None = None,
+) -> dict | None:
+    """Меняет поля профиля. None — профиль чужой или его нет."""
+    sets, values = [], []
+    if title is not None:
+        sets.append("title = ?")
+        values.append(title.strip()[:PROFILE_TITLE_LIMIT] or NEW_PROFILE_TITLE)
+    for name, value in (("about", about), ("style", style), ("constraints", constraints)):
+        if value is not None:
+            sets.append(f"{name} = ?")
+            values.append(value.strip()[:PROFILE_LIMIT])
+    if response_format is not None:
+        if response_format not in RESPONSE_FORMATS:
+            raise ValueError(f"Неизвестный формат ответа: {response_format}")
+        sets.append("response_format = ?")
+        values.append(response_format)
+    if not sets:
+        return get_profile(profile_id, user_id)
+
+    sets.append("updated_at = ?")
+    values.extend([_now(), profile_id, user_id])
+    with connect() as conn:
+        cur = conn.execute(
+            f"UPDATE profiles SET {', '.join(sets)} WHERE id = ? AND user_id = ?", values
+        )
+    return get_profile(profile_id, user_id) if cur.rowcount else None
+
+
+def delete_profile(profile_id: int, user_id: int) -> int | None:
+    """Удаляет профиль. Диалоги остаются — просто теряют долговременный слой.
+
+    Возвращает число осиротевших диалогов или None, если профиля нет.
+    """
+    with connect() as conn:
+        if conn.execute(
+            "SELECT 1 FROM profiles WHERE id = ? AND user_id = ?", (profile_id, user_id)
+        ).fetchone() is None:
+            return None
+        orphaned = conn.execute(
+            "UPDATE conversations SET profile_id = NULL WHERE profile_id = ? AND user_id = ?",
+            (profile_id, user_id),
+        ).rowcount
+        conn.execute("DELETE FROM profiles WHERE id = ? AND user_id = ?", (profile_id, user_id))
+    return orphaned
+
+
+def seed_profiles(user_id: int) -> int:
+    """Заводит готовые профили и переносит прежнюю долговременную память.
+
+    Вызывается один раз на пользователя: и при регистрации, и при старте для
+    тех, кто завёлся раньше. Флаг `profiles_seeded` важнее, чем «профилей нет»:
+    иначе удалённые заготовки возвращались бы после каждого перезапуска.
+    """
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT profile_memory, COALESCE(profiles_seeded, 0) AS seeded"
+            " FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+        if row is None or row["seeded"]:
+            return 0
+
+        created = 0
+        for preset in PROFILE_PRESETS:
+            conn.execute(
+                "INSERT INTO profiles (user_id, title, about, style, constraints,"
+                " response_format, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (user_id, preset["title"], preset["about"], preset["style"],
+                 preset["constraints"], preset["response_format"], _now(), _now()),
+            )
+            created += 1
+
+        legacy = (row["profile_memory"] or "").strip()
+        if legacy:
+            # Прежний единственный профиль не теряем и оставляем подключённым:
+            # иначе старые диалоги молча лишились бы долговременного слоя.
+            cur = conn.execute(
+                "INSERT INTO profiles (user_id, title, about, style, constraints,"
+                " response_format, created_at, updated_at) VALUES (?, ?, ?, '', '', ?, ?, ?)",
+                (user_id, LEGACY_PROFILE_TITLE, legacy[:PROFILE_LIMIT],
+                 TEXT_FORMAT, _now(), _now()),
+            )
+            conn.execute(
+                "UPDATE conversations SET profile_id = ?"
+                " WHERE user_id = ? AND profile_id IS NULL",
+                (cur.lastrowid, user_id),
+            )
+            created += 1
+
+        conn.execute("UPDATE users SET profiles_seeded = 1 WHERE id = ?", (user_id,))
+    return created
 
 
 # ---------- проекты ----------
@@ -437,7 +684,7 @@ def create_conversation(
     user_id: int, *, title: str = NEW_TITLE, model: str | None = None,
     thinking: bool = False, max_tokens: int | None = None,
     strategy: str = DEFAULT_STRATEGY, context_n: int = DEFAULT_CONTEXT_N,
-    project_id: int | None = None,
+    project_id: int | None = None, profile_id: int | None = None,
 ) -> dict:
     """Заводит пустой диалог и возвращает его."""
     if strategy not in STRATEGIES:
@@ -445,10 +692,11 @@ def create_conversation(
     with connect() as conn:
         cur = conn.execute(
             "INSERT INTO conversations (user_id, title, model, thinking, max_tokens,"
-            " strategy, context_n, project_id, created_at, updated_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " strategy, context_n, project_id, profile_id, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (user_id, title.strip()[:TITLE_LIMIT] or NEW_TITLE, model, int(thinking),
-             max_tokens, strategy, max(1, min(context_n, 200)), project_id, _now(), _now()),
+             max_tokens, strategy, max(1, min(context_n, 200)), project_id, profile_id,
+             _now(), _now()),
         )
         row = conn.execute("SELECT * FROM conversations WHERE id = ?", (cur.lastrowid,)).fetchone()
     return dict(row)
@@ -482,6 +730,7 @@ def update_conversation(
     compress: bool | None = None, strategy: str | None = None,
     context_n: int | None = None,
     use_profile: bool | None = None, use_project: bool | None = None,
+    profile_id: int | None = None, clear_profile: bool = False,
 ) -> dict | None:
     """Меняет название или настройки. Возвращает None, если диалог чужой или его нет."""
     sets, values = [], []
@@ -513,6 +762,13 @@ def update_conversation(
     if use_project is not None:
         sets.append("use_project = ?")
         values.append(int(use_project))
+    # «Снять профиль» и «не трогать профиль» — разные намерения, по одному
+    # profile_id=None их не различить, отсюда отдельный флаг.
+    if clear_profile:
+        sets.append("profile_id = NULL")
+    elif profile_id is not None:
+        sets.append("profile_id = ?")
+        values.append(profile_id)
     if clear_max_tokens:
         sets.append("max_tokens = NULL")
     elif max_tokens is not None:
@@ -602,14 +858,14 @@ def create_branch(conversation_id: int, user_id: int, from_message_id: int) -> d
         cur = conn.execute(
             "INSERT INTO conversations (user_id, title, model, thinking, max_tokens,"
             " strategy, context_n, facts, summary, summary_upto, parent_id, branched_from,"
-            " project_id, use_profile, use_project, created_at, updated_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " project_id, use_profile, use_project, profile_id, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (user_id, f"↳ {base}"[:TITLE_LIMIT], source["model"], source["thinking"],
              source["max_tokens"], source["strategy"], source["context_n"],
              source["facts"], source["summary"], source["summary_upto"],
              conversation_id, from_message_id,
              source["project_id"], source["use_profile"], source["use_project"],
-             _now(), _now()),
+             source["profile_id"], _now(), _now()),
         )
         branch_id = cur.lastrowid
         for r in rows:

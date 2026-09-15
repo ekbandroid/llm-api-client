@@ -320,6 +320,13 @@ td.actions button { margin-left: 6px; }
 .addconv:hover { color: var(--text); background: transparent; }
 
 /* Накопленные факты проекта: каждый можно убрать по отдельности. */
+/* Ответ в формате json_object: показываем разбором, а не абзацем. */
+.jsonanswer {
+  margin: 0; padding: 10px 12px; border-radius: 8px; background: var(--bg);
+  border: 1px solid var(--border); font-family: var(--mono); font-size: 12.5px;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
+
 .facts { margin-top: 8px; }
 .fact {
   display: flex; align-items: baseline; gap: 8px; font-size: 12px;

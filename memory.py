@@ -2,7 +2,8 @@
 
 Слои различаются не форматом, а сроком жизни и владельцем:
 
-    долговременная — профиль пользователя, `users.profile_memory`;
+    долговременная — выбранный профиль пользователя: кто он, как ему отвечать
+                     и чего держаться (таблица `profiles`);
     рабочая        — проект: бриф, написанный руками, и факты, накопленные
                      из диалогов проекта;
     краткосрочная  — сам диалог: сообщения, конспект, карточка фактов.
@@ -22,7 +23,20 @@ from dataclasses import dataclass, field
 import db
 import tokens as tokens_mod
 
-PROFILE_PREFIX = "Долговременная память — что известно о собеседнике:\n"
+PROFILE_PREFIX = "Долговременная память. Профиль «{title}».\n"
+PROFILE_ABOUT_PREFIX = "О собеседнике:\n"
+PROFILE_STYLE_PREFIX = "Стиль ответов:\n"
+PROFILE_CONSTRAINTS_PREFIX = "Ограничения, которых держаться:\n"
+PROFILE_EMPTY = "Профиль пока не заполнен — не домысливай за него."
+
+# Формат ответа задаётся полем response_format в запросе, но одной этой
+# настройки мало: API отклоняет запрос целиком, если слова «json» нет ни в
+# одном сообщении. Строка ниже и объясняет модели задачу, и закрывает
+# требование провайдера.
+PROFILE_JSON_NOTE = (
+    "Отвечай строго одним JSON-объектом: без пояснений до и после, "
+    "без markdown-ограды."
+)
 
 PROJECT_PREFIX = "Рабочая память. Проект «{title}».\n"
 PROJECT_BRIEF_PREFIX = "Описание задачи:\n"
@@ -39,11 +53,25 @@ PROJECT_FACTS_LIMIT = 40
 class Layers:
     """Содержимое слоёв, подключённых к конкретному диалогу."""
 
-    profile: str = ""
+    profile_id: int | None = None
+    profile_title: str = ""
+    profile_about: str = ""
+    profile_style: str = ""
+    profile_constraints: str = ""
+    profile_format: str = db.TEXT_FORMAT
     project_id: int | None = None
     project_title: str = ""
     project_brief: str = ""
     project_facts: dict = field(default_factory=dict)
+
+    @property
+    def has_profile(self) -> bool:
+        """Профиль подключён — блок уходит, даже если поля пустые.
+
+        По той же причине, что и у проекта: иначе включённая галочка при пустом
+        профиле не давала бы в запрос ничего и выглядела бы несработавшей.
+        """
+        return self.profile_id is not None
 
     @property
     def has_project(self) -> bool:
@@ -78,8 +106,16 @@ def collect(conversation: dict, user: dict) -> Layers:
     """
     layers = Layers()
 
-    if conversation.get("use_profile", 1):
-        layers.profile = (user.get("profile_memory") or "").strip()
+    profile_id = conversation.get("profile_id")
+    if profile_id and conversation.get("use_profile", 1):
+        profile = db.get_profile(profile_id, user["id"])
+        if profile:
+            layers.profile_id = profile["id"]
+            layers.profile_title = profile["title"]
+            layers.profile_about = (profile["about"] or "").strip()
+            layers.profile_style = (profile["style"] or "").strip()
+            layers.profile_constraints = (profile["constraints"] or "").strip()
+            layers.profile_format = profile["response_format"] or db.TEXT_FORMAT
 
     project_id = conversation.get("project_id")
     if project_id and conversation.get("use_project", 1):
@@ -91,6 +127,34 @@ def collect(conversation: dict, user: dict) -> Layers:
             layers.project_facts = load_facts(project["facts"])
 
     return layers
+
+
+def profile_text(layers: Layers) -> str:
+    """Текст блока долговременной памяти.
+
+    Разделы подписаны: стиль и ограничения — такие же указания модели, как и
+    рассказ о собеседнике, но смешивать их в один абзац значит получать ответы,
+    где ограничения теряются среди биографии.
+    """
+    parts = [PROFILE_PREFIX.format(title=layers.profile_title)]
+    if layers.profile_about:
+        parts.append(PROFILE_ABOUT_PREFIX + layers.profile_about)
+    if layers.profile_style:
+        parts.append(PROFILE_STYLE_PREFIX + layers.profile_style)
+    if layers.profile_constraints:
+        parts.append(PROFILE_CONSTRAINTS_PREFIX + layers.profile_constraints)
+    if not (layers.profile_about or layers.profile_style or layers.profile_constraints):
+        parts.append(PROFILE_EMPTY)
+    if layers.profile_format == db.JSON_FORMAT:
+        parts.append(PROFILE_JSON_NOTE)
+    return "\n".join(parts)
+
+
+def response_format(layers: Layers) -> dict | None:
+    """Значение response_format для запроса или None, если формат обычный."""
+    if layers.has_profile and layers.profile_format == db.JSON_FORMAT:
+        return {"type": db.JSON_FORMAT}
+    return None
 
 
 def project_text(layers: Layers) -> str:
@@ -109,8 +173,8 @@ def project_text(layers: Layers) -> str:
 def blocks(layers: Layers) -> list[dict]:
     """Готовые system-сообщения для запроса — в порядке убывания срока жизни."""
     out = []
-    if layers.profile:
-        out.append({"role": "system", "content": PROFILE_PREFIX + layers.profile})
+    if layers.has_profile:
+        out.append({"role": "system", "content": profile_text(layers)})
     if layers.has_project:
         out.append({"role": "system", "content": project_text(layers)})
     return out
@@ -123,10 +187,13 @@ def describe(layers: Layers) -> dict:
     meta повторялся бы при каждом сообщении и раздувал базу.
     """
     info: dict = {}
-    if layers.profile:
+    if layers.has_profile:
+        text = profile_text(layers)
         info["profile"] = {
-            "chars": len(layers.profile),
-            "tokens": tokens_mod.estimate_tokens(PROFILE_PREFIX + layers.profile),
+            "title": layers.profile_title,
+            "chars": len(text),
+            "tokens": tokens_mod.estimate_tokens(text),
+            "format": layers.profile_format,
         }
     if layers.has_project:
         text = project_text(layers)

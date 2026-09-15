@@ -38,6 +38,17 @@ STALL_TIMEOUT = 60
 FIRST_TOKEN_TIMEOUT = 60
 
 
+# API отклоняет запрос целиком, если выбран формат json_object, а слова «json»
+# нет ни в одном сообщении: «Prompt must contain the word 'json' in some form».
+# Регистр не важен. Строку дописываем сами, чтобы настройка формата не могла
+# уронить запрос.
+JSON_REQUIRED_NOTE = "Ответ верни одним JSON-объектом."
+
+
+def _mentions_json(messages: list[dict]) -> bool:
+    return any("json" in (m.get("content") or "").lower() for m in messages)
+
+
 class LLMError(RuntimeError):
     """Ошибка вызова API — сеть или ненулевой HTTP-статус.
 
@@ -127,6 +138,7 @@ def build_payload(
     stop: list[str] | None = None,
     thinking: bool | None = None,
     temperature: float | None = None,
+    response_format: dict | None = None,
 ) -> dict:
     """Собирает тело запроса к /chat/completions."""
     use_thinking = THINKING if thinking is None else thinking
@@ -144,6 +156,12 @@ def build_payload(
         payload["stop"] = stop
     if temperature is not None:
         payload["temperature"] = temperature
+    if response_format:
+        payload["response_format"] = response_format
+        if response_format.get("type") == "json_object" and not _mentions_json(messages):
+            payload["messages"] = messages + [
+                {"role": "system", "content": JSON_REQUIRED_NOTE}
+            ]
     return payload
 
 

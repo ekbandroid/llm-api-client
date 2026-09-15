@@ -413,8 +413,20 @@ def api_login(request: Request, creds: Credentials) -> dict:
 # факты — у проекта, переписка — у диалога. Здесь только первые два: диалоговым
 # слоем занимаются маршруты диалогов ниже.
 
-class ProfileMemory(BaseModel):
-    text: str = ""
+class ProfileCreate(BaseModel):
+    title: str = ""
+    about: str = ""
+    style: str = ""
+    constraints: str = ""
+    response_format: str = db.TEXT_FORMAT
+
+
+class ProfilePatch(BaseModel):
+    title: str | None = None
+    about: str | None = None
+    style: str | None = None
+    constraints: str | None = None
+    response_format: str | None = None
 
 
 class ProjectCreate(BaseModel):
@@ -436,19 +448,83 @@ def _owned_project(project_id: int, user: dict) -> dict:
     return project
 
 
-@app.get("/api/me/memory")
-async def profile_memory_get(user: dict = Depends(require_approved)) -> dict:
-    """Долговременная память — то, что уходит во все диалоги с включённым слоем."""
-    text = user["profile_memory"] or ""
-    return {"text": text, "limit": db.PROFILE_LIMIT, "tokens": tokens_mod.estimate_tokens(text)}
+def _owned_profile(profile_id: int, user: dict) -> dict:
+    """Профиль пользователя или 404."""
+    profile = db.get_profile(profile_id, user["id"])
+    if profile is None:
+        raise HTTPException(404, "Профиль не найден")
+    return profile
 
 
-@app.put("/api/me/memory")
-async def profile_memory_put(
-    payload: ProfileMemory, user: dict = Depends(require_approved)
+def _profile_view(profile: dict) -> dict:
+    """Профиль плюс его цена: блок уходит в каждый запрос диалога."""
+    layers = memory.Layers(
+        profile_id=profile["id"], profile_title=profile["title"],
+        profile_about=profile["about"] or "", profile_style=profile["style"] or "",
+        profile_constraints=profile["constraints"] or "",
+        profile_format=profile["response_format"] or db.TEXT_FORMAT,
+    )
+    return dict(profile, tokens=tokens_mod.estimate_tokens(memory.profile_text(layers)))
+
+
+@app.get("/api/profiles")
+async def profiles_list(user: dict = Depends(require_approved)) -> dict:
+    """Профили пользователя — долговременная память во множественном числе."""
+    return {
+        "profiles": [_profile_view(p) for p in db.list_profiles(user["id"])],
+        "formats": [
+            {"id": db.TEXT_FORMAT, "label": "Обычный текст"},
+            {"id": db.JSON_FORMAT, "label": "JSON-объект"},
+        ],
+        "limit": db.PROFILE_LIMIT,
+    }
+
+
+@app.post("/api/profiles")
+async def profile_create(
+    payload: ProfileCreate, user: dict = Depends(require_approved)
 ) -> dict:
-    db.set_profile_memory(user["id"], payload.text)
-    return await profile_memory_get(db.get(user["id"]))
+    try:
+        profile = db.create_profile(
+            user["id"], title=payload.title, about=payload.about, style=payload.style,
+            constraints=payload.constraints, response_format=payload.response_format,
+        )
+    except ValueError as err:
+        raise HTTPException(400, str(err)) from err
+    return _profile_view(profile)
+
+
+@app.get("/api/profiles/{profile_id}")
+async def profile_get(profile_id: int, user: dict = Depends(require_approved)) -> dict:
+    return _profile_view(_owned_profile(profile_id, user))
+
+
+@app.patch("/api/profiles/{profile_id}")
+async def profile_patch(
+    profile_id: int, payload: ProfilePatch, user: dict = Depends(require_approved)
+) -> dict:
+    _owned_profile(profile_id, user)
+    try:
+        updated = db.update_profile(
+            profile_id, user["id"], title=payload.title, about=payload.about,
+            style=payload.style, constraints=payload.constraints,
+            response_format=payload.response_format,
+        )
+    except ValueError as err:
+        raise HTTPException(400, str(err)) from err
+    if updated is None:
+        raise HTTPException(404, "Профиль не найден")
+    return _profile_view(updated)
+
+
+@app.delete("/api/profiles/{profile_id}")
+async def profile_delete(profile_id: int, user: dict = Depends(require_approved)) -> dict:
+    """Удаляет профиль. Диалоги остаются, просто теряют долговременный слой."""
+    _owned_profile(profile_id, user)
+    orphaned = db.delete_profile(profile_id, user["id"])
+    if orphaned is None:
+        raise HTTPException(404, "Профиль не найден")
+    return {"ok": True, "conversations_without_profile": orphaned}
 
 
 @app.get("/api/projects")
@@ -530,6 +606,8 @@ class ConversationCreate(BaseModel):
     context_n: int = Field(default=db.DEFAULT_CONTEXT_N, ge=1, le=200)
     # Диалог заводится сразу внутри проекта; переносить его потом нельзя.
     project_id: int | None = None
+    # Профиль, наоборот, переключается когда угодно.
+    profile_id: int | None = None
 
 
 class ConversationPatch(BaseModel):
@@ -544,6 +622,8 @@ class ConversationPatch(BaseModel):
     # Какие слои памяти подключать к запросам этого диалога.
     use_profile: bool | None = None
     use_project: bool | None = None
+    # Ноль означает «снять профиль», пропущенное поле — «не трогать».
+    profile_id: int | None = Field(default=None, ge=0)
 
 
 class NewMessage(BaseModel):
@@ -592,6 +672,7 @@ async def conversation_create(
         strategy=payload.strategy,
         context_n=payload.context_n,
         project_id=_owned_project(payload.project_id, user)["id"] if payload.project_id else None,
+        profile_id=_owned_profile(payload.profile_id, user)["id"] if payload.profile_id else None,
     )
 
 
@@ -620,6 +701,8 @@ async def conversation_patch(
         context_n=payload.context_n,
         use_profile=payload.use_profile,
         use_project=payload.use_project,
+        profile_id=(_owned_profile(payload.profile_id, user)["id"] if payload.profile_id else None),
+        clear_profile=payload.profile_id == 0,
     )
     if updated is None:
         raise HTTPException(404, "Диалог не найден")
@@ -697,7 +780,10 @@ async def conversation_send(
 
         try:
             async for event in llm.stream(
-                messages, model=model, thinking=thinking, max_tokens=max_tokens
+                messages, model=model, thinking=thinking, max_tokens=max_tokens,
+                # Формат ответа — настройка профиля: служебные вызовы
+                # (карточка фактов, конспект) его не наследуют.
+                response_format=memory.response_format(layers),
             ):
                 if event["type"] == "content":
                     answer += event["text"]
