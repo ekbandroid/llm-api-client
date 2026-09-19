@@ -62,6 +62,31 @@ CREATE TABLE IF NOT EXISTS projects (
 );
 CREATE INDEX IF NOT EXISTS idx_projects_user ON projects(user_id, created_at);
 
+-- Инварианты проекта: правила, которые ассистент не имеет права нарушать.
+-- Лежат отдельно от переписки намеренно: стратегии контекста режут историю,
+-- и правило, сказанное в начале длинного диалога, рано или поздно выпало бы
+-- из запроса. Отсюда оно уходит в каждый запрос целиком.
+CREATE TABLE IF NOT EXISTS invariants (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id  INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    -- Номер INV-<number> не переиспользуется после удаления: в истории
+    -- остаются ответы со ссылкой «нарушает INV-2», и они не должны начать
+    -- указывать на другое правило.
+    number      INTEGER NOT NULL,
+    category    TEXT    NOT NULL,
+    rule        TEXT    NOT NULL,
+    -- Причина: ею ассистент объясняет отказ, и по замерам именно она
+    -- удерживает модель под давлением «я разрешаю нарушить».
+    rationale   TEXT,
+    active      INTEGER NOT NULL DEFAULT 1,
+    -- Удаление мягкое: строка остаётся и держит свой номер занятым.
+    deleted     INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT    NOT NULL,
+    updated_at  TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_invariants_project ON invariants(project_id, number);
+
 -- Диалоги и их сообщения. Настройки (модель, thinking) живут на диалоге:
 -- вернувшись к старой переписке, возвращаемся и к условиям, при которых она шла.
 CREATE TABLE IF NOT EXISTS conversations (
@@ -135,6 +160,9 @@ def connect() -> sqlite3.Connection:
 # Колонки, добавленные после первого выпуска. CREATE TABLE IF NOT EXISTS
 # их не создаст в уже существующей таблице, поэтому добавляем отдельно.
 MIGRATIONS = {
+    "invariants": {
+        "deleted": "INTEGER NOT NULL DEFAULT 0",
+    },
     "users": {
         # Историческая колонка: одна долговременная память на пользователя.
         # Содержимое перенесено в profiles, отсюда больше не читается.
@@ -691,6 +719,105 @@ def delete_project(project_id: int, user_id: int) -> int | None:
         ).rowcount
         conn.execute("DELETE FROM projects WHERE id = ? AND user_id = ?", (project_id, user_id))
     return killed
+
+
+# ---------- инварианты ----------
+
+ARCHITECTURE, DECISION, STACK, BUSINESS = "architecture", "decision", "stack", "business"
+INVARIANT_CATEGORIES = (ARCHITECTURE, DECISION, STACK, BUSINESS)
+INVARIANT_LIMIT = 1000
+
+
+def _check_category(category: str) -> str:
+    if category not in INVARIANT_CATEGORIES:
+        raise ValueError(f"Неизвестная категория инварианта: {category}")
+    return category
+
+
+def list_invariants(project_id: int, user_id: int, *, only_active: bool = False) -> list[dict]:
+    """Инварианты проекта по порядку номеров."""
+    sql = "SELECT * FROM invariants WHERE project_id = ? AND user_id = ? AND deleted = 0"
+    if only_active:
+        sql += " AND active = 1"
+    with connect() as conn:
+        rows = conn.execute(sql + " ORDER BY number", (project_id, user_id)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_invariant(invariant_id: int, user_id: int) -> dict | None:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM invariants WHERE id = ? AND user_id = ? AND deleted = 0",
+            (invariant_id, user_id),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def create_invariant(
+    project_id: int, user_id: int, *, category: str, rule: str, rationale: str = "",
+) -> dict:
+    """Заводит инвариант со следующим свободным номером проекта."""
+    rule = rule.strip()[:INVARIANT_LIMIT]
+    if not rule:
+        raise ValueError("Пустое правило")
+    with connect() as conn:
+        # Считаем и удалённые: удаление мягкое, поэтому номер удалённого
+        # правила остаётся занятым и ссылки в истории не начнут указывать
+        # на новое правило.
+        number = conn.execute(
+            "SELECT COALESCE(MAX(number), 0) + 1 FROM invariants WHERE project_id = ?",
+            (project_id,),
+        ).fetchone()[0]
+        cur = conn.execute(
+            "INSERT INTO invariants (project_id, user_id, number, category, rule, rationale,"
+            " active, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)",
+            (project_id, user_id, number, _check_category(category), rule,
+             rationale.strip()[:INVARIANT_LIMIT] or None, _now(), _now()),
+        )
+        row = conn.execute("SELECT * FROM invariants WHERE id = ?", (cur.lastrowid,)).fetchone()
+    return dict(row)
+
+
+def update_invariant(
+    invariant_id: int, user_id: int, *, category: str | None = None, rule: str | None = None,
+    rationale: str | None = None, active: bool | None = None,
+) -> dict | None:
+    sets, values = [], []
+    if category is not None:
+        sets.append("category = ?")
+        values.append(_check_category(category))
+    if rule is not None:
+        if not rule.strip():
+            raise ValueError("Пустое правило")
+        sets.append("rule = ?")
+        values.append(rule.strip()[:INVARIANT_LIMIT])
+    if rationale is not None:
+        sets.append("rationale = ?")
+        values.append(rationale.strip()[:INVARIANT_LIMIT] or None)
+    if active is not None:
+        sets.append("active = ?")
+        values.append(int(active))
+    if not sets:
+        return get_invariant(invariant_id, user_id)
+    sets.append("updated_at = ?")
+    values.extend([_now(), invariant_id, user_id])
+    with connect() as conn:
+        cur = conn.execute(
+            f"UPDATE invariants SET {', '.join(sets)} WHERE id = ? AND user_id = ? AND deleted = 0",
+            values,
+        )
+    return get_invariant(invariant_id, user_id) if cur.rowcount else None
+
+
+def delete_invariant(invariant_id: int, user_id: int) -> bool:
+    """Убирает инвариант из проекта, не освобождая его номер."""
+    with connect() as conn:
+        cur = conn.execute(
+            "UPDATE invariants SET deleted = 1, active = 0, updated_at = ?"
+            " WHERE id = ? AND user_id = ? AND deleted = 0",
+            (_now(), invariant_id, user_id),
+        )
+    return cur.rowcount > 0
 
 
 # ---------- диалоги ----------

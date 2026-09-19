@@ -33,6 +33,9 @@
   <button class="railbtn" data-tab="memory" title="Память агента" aria-label="Память">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>
   </button>
+  <button class="railbtn" data-tab="invariants" title="Инварианты проекта" aria-label="Инварианты">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+  </button>
   <button class="railbtn" data-tab="task" title="Состояние задачи" aria-label="Задача">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
   </button>
@@ -123,6 +126,24 @@
     </div>
   </section>
 
+  <section class="tab" data-tab="invariants">
+    <div class="tabhead"><span>Инварианты</span><span class="grow"></span><button class="hide" title="Свернуть панель">‹</button></div>
+    <div class="tabbody">
+      <div class="hint" id="invNone">Инварианты задаются на проекте и действуют во всех его диалогах. Откройте диалог внутри проекта.</div>
+      <div id="invBox" hidden>
+        <div class="hint" id="invState" style="margin:0 0 12px"></div>
+        <div id="invList"></div>
+        <fieldset style="margin-top:14px">
+          <legend>Новый инвариант</legend>
+          <label><span>Категория</span><select id="invCategory"></select></label>
+          <label><span>Правило — что нельзя нарушать</span><textarea id="invRule"></textarea></label>
+          <label><span>Почему — этим ассистент объяснит отказ</span><textarea id="invRationale" style="min-height:60px"></textarea></label>
+          <button id="invAdd">Добавить</button>
+        </fieldset>
+      </div>
+    </div>
+  </section>
+
   <section class="tab" data-tab="task">
     <div class="tabhead"><span>Задача</span><span class="grow"></span><button class="hide" title="Свернуть панель">‹</button></div>
     <div class="tabbody">
@@ -201,6 +222,7 @@ const log = $("log");
 let conversations = [], projects = [], current = null, busy = false;
 let currentProject = null, currentProfile = null;
 let taskState = null, taskTokens = 0;
+let invState = null, invariantTokens = 0;
 // Название проекта вводится прямо в списке: модальное окно ради одной строки —
 // лишний шаг, а на узкой панели ещё и теряет из виду сам список.
 let creatingProject = false, renamingProject = null;
@@ -518,6 +540,7 @@ function showEmpty() {
   $("convTitle").hidden = true;
   showMemory(null);
   loadTask(null);
+  loadInvariants(null);
 }
 
 async function openConversation(id) {
@@ -547,6 +570,7 @@ async function openConversation(id) {
   showStrategy(current);
   showMemory(current);
   loadTask(current);
+  loadInvariants(current);
   updateTokenStats();
   log.scrollTop = log.scrollHeight;
   renderList();
@@ -597,6 +621,150 @@ function parseFacts(raw) {
   if (!raw) return {};
   try { const v = JSON.parse(raw); return v && typeof v === "object" ? v : {}; }
   catch { return {}; }
+}
+
+// ---------- вкладка «Инварианты» ----------
+//
+// Правила проекта, которые ассистент не имеет права нарушать. Лежат на
+// проекте, а не в диалоге: стратегии контекста режут переписку, и правило,
+// сказанное в начале длинного разговора, рано или поздно выпало бы из запроса.
+
+// Заготовки полей — по одной на каждую категорию из задания дня.
+const INV_EXAMPLES = {
+  architecture: ["Единственное хранилище данных — PostgreSQL; других хранилищ, кэшей и брокеров нет.",
+                 "одна точка бэкапа и восстановления"],
+  decision: ["Все даты хранятся в UTC; в часовой пояс переводит только интерфейс.",
+             "отчёты не должны зависеть от того, где стоит сервер"],
+  stack: ["Бэкенд — только Python 3.13 и FastAPI.",
+          "команда из двух человек, второй язык не поддержим"],
+  business: ["Пароли не хранятся и не логируются в открытом виде.",
+             "закон о персональных данных и безопасность"],
+};
+
+async function loadInvariants(conv) {
+  invState = null;
+  invariantTokens = 0;
+  if (!conv || !conv.project_id) { renderInvariants(); return; }
+  const res = await fetch(`/api/projects/${conv.project_id}/invariants`);
+  if (res.ok) invState = await res.json();
+  renderInvariants();
+}
+
+function renderInvariants() {
+  const box = $("invBox");
+  $("invNone").hidden = !!invState;
+  box.hidden = !invState;
+  if (!invState) { updateTokenStats(); return; }
+
+  const sel = $("invCategory");
+  if (!sel.options.length) {
+    invState.categories.forEach(c => sel.add(new Option(c.label, c.id)));
+    showInvExample();
+  }
+
+  const active = invState.invariants.filter(i => i.active).length;
+  invariantTokens = invState.tokens;
+  $("invState").textContent = invState.invariants.length
+    ? `Проект «${invState.project.title}»: действует ${active} из ${invState.invariants.length}, ` +
+      `~${invState.tokens} токенов в каждом запросе. После каждого ответа судья сверяет его с правилами.`
+    : `У проекта «${invState.project.title}» инвариантов пока нет.`;
+
+  const list = $("invList");
+  list.innerHTML = "";
+  for (const inv of invState.invariants) list.appendChild(invariantRow(inv));
+  updateTokenStats();
+}
+
+function invariantRow(inv) {
+  const row = el("div", "inv" + (inv.active ? "" : " off"));
+  const head = el("div", "invhead");
+  head.appendChild(el("b", "invcode", inv.code));
+
+  const cat = el("select");
+  invState.categories.forEach(c => cat.add(new Option(c.label, c.id)));
+  cat.value = inv.category;
+  cat.onchange = () => patchInvariant(inv.id, { category: cat.value });
+  head.appendChild(cat);
+
+  const on = el("label", "check");
+  const box = el("input");
+  box.type = "checkbox";
+  box.checked = !!inv.active;
+  box.onchange = () => patchInvariant(inv.id, { active: box.checked });
+  on.appendChild(box);
+  on.appendChild(document.createTextNode("действует"));
+  head.appendChild(on);
+
+  const kill = el("button", "kill", "×");
+  kill.title = "Удалить инвариант";
+  kill.onclick = async () => {
+    if (!confirm(`Удалить ${inv.code}? Номер не освободится: ссылки на него в истории останутся верными.`)) return;
+    const res = await fetch(`/api/invariants/${inv.id}`, { method: "DELETE" });
+    if (res.ok) { invState = await res.json(); renderInvariants(); }
+  };
+  head.appendChild(kill);
+  row.appendChild(head);
+
+  const rule = el("textarea", "invrule");
+  rule.value = inv.rule;
+  rule.onchange = () => patchInvariant(inv.id, { rule: rule.value });
+  row.appendChild(rule);
+
+  const why = el("input", "invwhy");
+  why.type = "text";
+  why.placeholder = "Почему — без причины модель держит правило слабее";
+  why.value = inv.rationale || "";
+  why.onchange = () => patchInvariant(inv.id, { rationale: why.value });
+  row.appendChild(why);
+  return row;
+}
+
+async function patchInvariant(id, payload) {
+  const res = await fetch(`/api/invariants/${id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const info = await httpErrorResponse(res);
+    alert((info && info.detail) || "Не удалось сохранить инвариант");
+  } else {
+    invState = await res.json();
+  }
+  renderInvariants();
+}
+
+function showInvExample() {
+  const [rule, why] = INV_EXAMPLES[$("invCategory").value] || ["", ""];
+  $("invRule").placeholder = "Например: " + rule;
+  $("invRationale").placeholder = "Например: " + why;
+}
+$("invCategory").addEventListener("change", showInvExample);
+
+$("invAdd").addEventListener("click", async () => {
+  if (!current || !current.project_id) return;
+  const rule = $("invRule").value.trim();
+  if (!rule) { $("invRule").focus(); return; }
+  const res = await fetch(`/api/projects/${current.project_id}/invariants`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ category: $("invCategory").value, rule, rationale: $("invRationale").value }),
+  });
+  if (!res.ok) {
+    const info = await httpErrorResponse(res);
+    alert((info && info.detail) || "Не удалось добавить инвариант");
+    return;
+  }
+  invState = await res.json();
+  $("invRule").value = "";
+  $("invRationale").value = "";
+  renderInvariants();
+});
+
+/** Пометка «отклонено: INV-1» на реплике пользователя. */
+function markRejected(userBox, codes) {
+  if (!userBox || !codes || !codes.length || userBox.querySelector(".rejected")) return;
+  userBox.querySelector(".who").appendChild(el("span", "rejected", `отклонено: ${codes.join(", ")}`));
 }
 
 // ---------- вкладка «Задача» ----------
@@ -1020,10 +1188,22 @@ const SERVICE_LABELS = {
   summary: "конспект",
   task: "переключение этапа",
   simulated_user: "реплика за пользователя",
+  invariants: "проверка инвариантов",
 };
 
 /** Текст заметки: что именно сделал служебный вызов. */
 function serviceText(info) {
+  if (info.kind === "invariants") {
+    if (info.ok === false) return `Проверка инвариантов не удалась: ${info.reason}.`;
+    if (info.violations && info.violations.length) {
+      return info.violations.map(v =>
+        `Нарушен ${v.id} [${v.category}]: «${v.quote}» — ${v.why}`).join(" ") +
+        ` (проверка стоила ${info.cost_tokens} токенов).`;
+    }
+    return "Проверка инвариантов: нарушений нет" +
+      (info.defended && info.defended.length ? `; ответ отказал по ${info.defended.join(", ")}` : ` (правил — ${info.count})`) +
+      ` (проверка стоила ${info.cost_tokens} токенов).`;
+  }
   if (info.kind === "simulated_user") {
     return `Реплику написала модель вместо пользователя (стоила ${info.cost_tokens} токенов).`;
   }
@@ -1054,7 +1234,8 @@ function serviceNote(info, { undo = false } = {}) {
   const wrap = el("div");
   wrap.style.marginTop = "8px";
 
-  const note = el("div", "hint", serviceText(info));
+  const violated = info.kind === "invariants" && info.violations && info.violations.length;
+  const note = el("div", violated ? "hint violation" : "hint", serviceText(info));
   wrap.appendChild(note);
 
   // Кнопка отмены только в живом виде: у сохранённого сообщения она отменила
@@ -1081,8 +1262,11 @@ function serviceNote(info, { undo = false } = {}) {
 
 /** Строка о том, сколько памяти ушло в этот запрос. */
 function memoryLine(mem) {
-  if (!mem || (!mem.profile && !mem.project && !mem.task)) return null;
+  if (!mem || (!mem.profile && !mem.project && !mem.task && !mem.invariants)) return null;
   const parts = [];
+  if (mem.invariants) {
+    parts.push(`инварианты: ${mem.invariants.codes.join(", ")} ~${mem.invariants.tokens} токенов`);
+  }
   if (mem.task) {
     parts.push(`задача: ${STAGE_LABELS[mem.task.stage] || mem.task.stage}` +
                (mem.task.paused ? " (на паузе)" : "") + ` ~${mem.task.tokens} токенов`);
@@ -1107,7 +1291,7 @@ function updateTokenStats() {
 
   const draft = $("prompt").value;
   const memory = (current.use_profile ? profileTokens : 0) +
-                 (current.use_project ? projectTokens : 0) + taskTokens;
+                 (current.use_project ? projectTokens : 0) + taskTokens + invariantTokens;
   const next = estimateMessages(loadedTexts) + (draft ? estimateTokens(draft) + 4 : 0) + memory;
   const spent = loadedTotals;
 
@@ -1174,7 +1358,11 @@ function renderStored(m) {
   }
   const box = addMessage(m.role === "user" ? "user" : "assistant", m.role === "user" ? "Вы" : "Модель");
   const body = box.querySelector(".body");
-  if (m.role === "user") { body.textContent = m.content; return; }
+  if (m.role === "user") {
+    body.textContent = m.content;
+    markRejected(box, (m.meta || {}).rejected_by);
+    return;
+  }
 
   const meta = m.meta || {};
   const format = ((meta.memory || {}).profile || {}).format || "text";
@@ -1246,6 +1434,7 @@ function simulatedMessage(info) {
   const box = addMessage("user simulated", "Вы · автопилот");
   box.querySelector(".body").textContent = info.text;
   box.appendChild(serviceNote(info));
+  markRejected(box, info.rejected_by);
   return box;
 }
 
@@ -1430,6 +1619,11 @@ async function streamInto(url, payload, turn) {
           loadedTotals += u.total_tokens || 0;
           loadedTexts.push(turn.answer);
           updateTokenStats();
+        } else if (ev.type === "invariants") {
+          box.appendChild(serviceNote(ev));
+          // Реплика пользователя этого хода — последняя в ленте перед ответом.
+          const users = [...log.querySelectorAll(".msg.user")];
+          markRejected(users[users.length - 1], ev.defended);
         } else if (ev.type === "facts") {
           box.appendChild(serviceNote(ev));
           if (current && ev.ok) { current.facts = JSON.stringify(ev.facts); showStrategy(current); }

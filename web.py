@@ -19,6 +19,7 @@ import auth
 import db
 import benchmark
 import history
+import invariants as invariants_mod
 import llm
 import memory
 import reasoning
@@ -583,6 +584,75 @@ async def project_delete(project_id: int, user: dict = Depends(require_approved)
     return {"ok": True, "conversations_deleted": killed}
 
 
+class InvariantCreate(BaseModel):
+    category: str = db.ARCHITECTURE
+    rule: str
+    rationale: str = ""
+
+
+class InvariantPatch(BaseModel):
+    category: str | None = None
+    rule: str | None = None
+    rationale: str | None = None
+    active: bool | None = None
+
+
+def _invariants_view(project: dict, user: dict) -> dict:
+    """Инварианты проекта и цена их блока в каждом запросе."""
+    items = db.list_invariants(project["id"], user["id"])
+    active = [i for i in items if i["active"]]
+    return {
+        "project": {"id": project["id"], "title": project["title"]},
+        "invariants": [dict(i, code=invariants_mod.code(i)) for i in items],
+        "categories": [{"id": c, "label": invariants_mod.LABELS[c]} for c in db.INVARIANT_CATEGORIES],
+        "tokens": (invariants_mod.describe(project, active) or {}).get("tokens", 0),
+        "limit": db.INVARIANT_LIMIT,
+    }
+
+
+@app.get("/api/projects/{project_id}/invariants")
+async def invariants_list(project_id: int, user: dict = Depends(require_approved)) -> dict:
+    return _invariants_view(_owned_project(project_id, user), user)
+
+
+@app.post("/api/projects/{project_id}/invariants")
+async def invariant_create(
+    project_id: int, payload: InvariantCreate, user: dict = Depends(require_approved)
+) -> dict:
+    project = _owned_project(project_id, user)
+    try:
+        db.create_invariant(project_id, user["id"], category=payload.category,
+                            rule=payload.rule, rationale=payload.rationale)
+    except ValueError as err:
+        raise HTTPException(400, str(err)) from err
+    return _invariants_view(project, user)
+
+
+@app.patch("/api/invariants/{invariant_id}")
+async def invariant_patch(
+    invariant_id: int, payload: InvariantPatch, user: dict = Depends(require_approved)
+) -> dict:
+    current = db.get_invariant(invariant_id, user["id"])
+    if current is None:
+        raise HTTPException(404, "Инвариант не найден")
+    try:
+        db.update_invariant(invariant_id, user["id"], category=payload.category,
+                            rule=payload.rule, rationale=payload.rationale, active=payload.active)
+    except ValueError as err:
+        raise HTTPException(400, str(err)) from err
+    return _invariants_view(_owned_project(current["project_id"], user), user)
+
+
+@app.delete("/api/invariants/{invariant_id}")
+async def invariant_delete(invariant_id: int, user: dict = Depends(require_approved)) -> dict:
+    """Убирает правило. Номер остаётся занятым: ссылки в истории не поплывут."""
+    current = db.get_invariant(invariant_id, user["id"])
+    if current is None:
+        raise HTTPException(404, "Инвариант не найден")
+    db.delete_invariant(invariant_id, user["id"])
+    return _invariants_view(_owned_project(current["project_id"], user), user)
+
+
 @app.delete("/api/projects/{project_id}/facts/{key}")
 async def project_fact_delete(
     project_id: int, key: str, user: dict = Depends(require_approved)
@@ -766,13 +836,18 @@ async def _exchange(
     # Заново читаем диалог: только что добавленный вопрос должен войти в план.
     layers = memory.collect(conversation, user)
     described = memory.describe(layers)
+    # Инварианты — правила проекта, отдельный блок сразу за рабочей памятью.
+    project, rules = invariants_mod.load(conversation, user)
+    if ruled := invariants_mod.describe(project, rules):
+        described["invariants"] = ruled
     # Состояние задачи — отдельный блок и отдельный ключ телеметрии: это не
     # память, а то, где мы сейчас в работе.
     if state := task.describe(conversation):
         described["task"] = state
     plan = history.plan_request(
         _owned(conversation_id, user), system_prompt,
-        memory_blocks=memory.blocks(layers) + task.blocks(conversation),
+        memory_blocks=(memory.blocks(layers) + invariants_mod.blocks(project, rules)
+                       + task.blocks(conversation)),
         memory_info=described,
     )
     messages = plan.messages
@@ -862,14 +937,31 @@ async def _exchange(
         # телеметрию дописываем в meta отдельной правкой — иначе после
         # перезагрузки страницы от них не осталось бы и следа.
         service: list[dict] = []
+        # Отказ по инварианту помечает реплику пользователя: иначе карточка
+        # фактов и конспект принимают отклонённую просьбу за решение.
+        rejected_by: list[str] = []
         try:
+            # Судья идёт первым: вердикт должен стоять сразу под ответом, и
+            # пометка об отказе нужна карточке фактов до её обновления.
+            if rules:
+                verdict = await asyncio.to_thread(
+                    invariants_mod.check, rules, content, answer, model=model
+                )
+                service.append(verdict)
+                rejected_by = verdict.get("defended") or []
+                if rejected_by:
+                    marked = json.loads(asked["meta"]) if asked["meta"] else {}
+                    marked["rejected_by"] = rejected_by
+                    db.update_message_meta(asked["id"], json.dumps(marked, ensure_ascii=False))
+                yield sse({"type": "invariants", **verdict, "message_id": asked["id"]})
+
             if history.needs_refresh(fresh):
                 info = await asyncio.to_thread(history.refresh, fresh, model=model)
                 if info:
                     service.append(info)
                     yield sse({"type": "compressed", **info})
             elif (fresh["strategy"] or db.FULL) == db.FACTS:
-                exchange = [{"role": "user", "content": content},
+                exchange = [{"role": "user", "content": content, "rejected_by": rejected_by},
                             {"role": "assistant", "content": answer}]
                 info = await asyncio.to_thread(
                     history.refresh_facts, fresh, exchange, model=model
@@ -890,7 +982,7 @@ async def _exchange(
             after = _owned(conversation_id, user)
             moved = await asyncio.to_thread(
                 task.refresh, after,
-                [{"role": "user", "content": content},
+                [{"role": "user", "content": content, "rejected_by": rejected_by},
                  {"role": "assistant", "content": answer}],
                 model=model,
             )
@@ -1266,6 +1358,8 @@ async def conversation_tokens(
     # занижала бы размер ровно на ту часть, которую пользователь не видит
     # в переписке.
     described = memory.describe(memory.collect(conversation, user))
+    if ruled := invariants_mod.describe(*invariants_mod.load(conversation, user)):
+        described["invariants"] = ruled
     if state := task.describe(conversation):
         described["task"] = state
     memory_tokens = sum(layer["tokens"] for layer in described.values())

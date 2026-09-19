@@ -36,7 +36,11 @@ SUMMARY_SYSTEM = (
     "Верни обновлённый конспект, в котором сохранено всё, что понадобится для "
     "продолжения разговора: факты о собеседнике, имена, числа, принятые решения, "
     "договорённости и нерешённые вопросы. Пиши сжато, по пунктам, без вводных "
-    "фраз и без пересказа вежливых оборотов. Не выдумывай того, чего не было."
+    "фраз и без пересказа вежливых оборотов. Не выдумывай того, чего не было. "
+    "Реплика «[просьба отклонена по INV-…]» — просьба, которую ассистент "
+    "отклонил по правилам проекта. То, что отклонено, — не цель, не решение, "
+    "не предпочтение и не договорённость; можно лишь отметить, что такая "
+    "просьба была отклонена."
 )
 
 SUMMARY_PREFIX = "Конспект предыдущей части разговора:\n"
@@ -52,7 +56,11 @@ FACTS_SYSTEM = (
     "Ключи — короткие существительные на русском. Старые факты сохраняй, если "
     "они не отменены; отменённые заменяй новыми. Не выдумывай того, чего не было. "
     "Карточка описывает задачу и собеседника, а не состояние ассистента: никогда "
-    "не записывай, чего ассистент не знает или не смог ответить."
+    "не записывай, чего ассистент не знает или не смог ответить. "
+    "Реплика «[просьба отклонена по INV-…]» — просьба, которую ассистент "
+    "отклонил по правилам проекта. То, что отклонено, — не цель, не решение, "
+    "не предпочтение и не договорённость; можно лишь отметить, что такая "
+    "просьба была отклонена."
 )
 
 # Сколько фактов держим: больше — и блок сам становится длинной историей.
@@ -72,6 +80,41 @@ class Plan:
     dropped: int = 0            # сколько сообщений просто отброшено
     facts: dict = field(default_factory=dict)
     memory: dict = field(default_factory=dict)   # что дали слои памяти поверх диалога
+
+
+def rejected_codes(message: dict) -> list[str]:
+    """По каким инвариантам отклонена просьба. Пусто — не отклонена."""
+    if message["role"] != "user":
+        return []
+    rejected = message.get("rejected_by")
+    if rejected is None and message.get("meta"):
+        meta = message["meta"]
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except json.JSONDecodeError:
+                meta = {}
+        rejected = (meta or {}).get("rejected_by")
+    return list(rejected or [])
+
+
+def transcript_line(message: dict) -> str:
+    """Строка реплики для служебных вызовов: карточки, конспекта, переключателя.
+
+    Текст отклонённой по инварианту просьбы сюда не попадает — только
+    пометка. Одной пометки с правилом «не записывай как решение» не хватило:
+    на первой же реплике диалога, пока карточка пуста, служебный вызов
+    записал «цель: переписать хранение заказов на MongoDB», хотя ассистент
+    отказал, а дальше это перелилось в память проекта — рядом с инвариантом,
+    противореча ему. Что именно просили, остаётся понятным из ответа
+    ассистента: отказ называет и просьбу, и альтернативу, и он идёт целиком.
+    """
+    if message["role"] != "user":
+        return f"Ассистент: {message['content']}"
+    if codes := rejected_codes(message):
+        return (f"Пользователь: [просьба отклонена по {', '.join(codes)}; "
+                "её текст в память не переносится]")
+    return f"Пользователь: {message['content']}"
 
 
 def split(rows: list[dict], summary_upto: int | None) -> tuple[list[dict], list[dict], list[dict]]:
@@ -170,10 +213,7 @@ def refresh_facts(conversation: dict, exchange: list[dict], *, model: str | None
         return None
 
     current = load_facts(conversation)
-    transcript = "\n".join(
-        f"{'Пользователь' if m['role'] == 'user' else 'Ассистент'}: {m['content']}"
-        for m in exchange
-    )
+    transcript = "\n".join(transcript_line(m) for m in exchange)
     user_part = (
         (f"Текущая карточка:\n{json.dumps(current, ensure_ascii=False, indent=2)}\n\n"
          if current else "")
@@ -234,10 +274,7 @@ def refresh(conversation: dict, *, model: str | None = None) -> dict | None:
         return None
 
     previous = conversation.get("summary") or ""
-    transcript = "\n".join(
-        f"{'Пользователь' if m['role'] == 'user' else 'Ассистент'}: {m['content']}"
-        for m in stale
-    )
+    transcript = "\n".join(transcript_line(m) for m in stale)
     user_part = (
         (f"Прежний конспект:\n{previous}\n\n" if previous else "")
         + f"Новые реплики:\n{transcript}"

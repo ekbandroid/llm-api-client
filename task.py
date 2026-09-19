@@ -16,6 +16,7 @@
 import json
 
 import db
+import history
 import llm
 import tokens as tokens_mod
 
@@ -220,10 +221,9 @@ def refresh(conversation: dict, exchange: list[dict], *, model: str | None = Non
         return None
 
     stage = stage_of(conversation)
-    transcript = "\n".join(
-        f"{'Пользователь' if m['role'] == 'user' else 'Ассистент'}: {m['content']}"
-        for m in exchange
-    )
+    # Отклонённая по инварианту просьба идёт без текста: иначе «переводим
+    # на MongoDB, решение принято» выглядело бы как сигнал к переходу.
+    transcript = "\n".join(history.transcript_line(m) for m in exchange)
     facts = conversation.get("facts") or ""
     user_part = (
         f"Этап: {stage}\n"

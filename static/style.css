@@ -349,6 +349,27 @@ td.actions button { margin-left: 6px; }
 .event .what { flex: 1 1 0; min-width: 0; overflow-wrap: anywhere; }
 .event.model .what { color: var(--text); }
 
+/* ---------- инварианты ---------- */
+.inv { border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; margin-bottom: 8px; }
+.inv.off { opacity: .55; }
+.invhead { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.invhead select { flex: 1 1 auto; min-width: 0; padding: 3px 6px; font-size: 12px; }
+.invhead .check { margin: 0; font-size: 12px; gap: 4px; }
+.invhead .kill {
+  flex: 0 0 auto; border: 0; background: transparent; color: var(--muted);
+  font-size: 15px; line-height: 1; padding: 0 2px; font-weight: 400;
+}
+.invhead .kill:hover { color: var(--danger); }
+.invcode { flex: 0 0 auto; font-family: var(--mono); font-size: 12px; white-space: nowrap; }
+.inv .invrule { min-height: 52px; font-family: inherit; font-size: 13px; }
+.inv .invwhy { margin-top: 6px; font-size: 12px; }
+/* Нарушение инварианта — единственная красная заметка под ответом. */
+.hint.violation { color: var(--danger); font-weight: 600; }
+.msg .who .rejected {
+  margin-left: 8px; font-size: 11px; font-weight: 400; color: var(--danger);
+  border: 1px solid var(--danger); border-radius: 5px; padding: 1px 6px;
+}
+
 /* ---------- автопилот ---------- */
 /* Реплики, написанные моделью за пользователя, не должны выглядеть как
    настоящие: решения в них придуманы. */
