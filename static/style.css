@@ -349,6 +349,17 @@ td.actions button { margin-left: 6px; }
 .event .what { flex: 1 1 0; min-width: 0; overflow-wrap: anywhere; }
 .event.model .what { color: var(--text); }
 
+/* ---------- автопилот ---------- */
+/* Реплики, написанные моделью за пользователя, не должны выглядеть как
+   настоящие: решения в них придуманы. */
+.msg.simulated .who { color: var(--accent); }
+.msg.simulated .body { border-style: dashed; opacity: .92; }
+.autopilotnote {
+  margin: 10px 0 4px; padding: 8px 12px; border-radius: 8px; font-size: 13px;
+  border: 1px solid var(--border); background: var(--panel); color: var(--text);
+}
+#send.stop { background: var(--danger); border-color: var(--danger); }
+
 /* Ответ в формате json_object: показываем разбором, а не абзацем. */
 .jsonanswer {
   margin: 0; padding: 10px 12px; border-radius: 8px; background: var(--bg);

@@ -133,9 +133,11 @@
           <option value="task">Задача</option>
         </select></label>
         <label><span>Переключение этапов</span><select id="taskAuto">
-          <option value="0">Вручную</option>
-          <option value="1">Автоматически</option>
+          <option value="manual">Вручную</option>
+          <option value="auto">Автоматически</option>
+          <option value="autopilot">Автопилот — модель отвечает за пользователя</option>
         </select></label>
+        <label id="taskTurnsRow" hidden><span>Не больше ходов за прогон</span><input type="number" id="taskMaxTurns" min="1" max="20"></label>
         <div class="hint" id="taskModeHint"></div>
       </fieldset>
 
@@ -638,8 +640,8 @@ async function patchTask(payload) {
 function renderTask() {
   const box = $("taskBox");
   const badge = $("taskBadge");
-  const controls = ["taskMode", "taskAuto", "taskStep", "taskExpected", "taskActor",
-                    "taskBack", "taskNext", "taskPause"];
+  const controls = ["taskMode", "taskAuto", "taskMaxTurns", "taskStep", "taskExpected",
+                    "taskActor", "taskBack", "taskNext", "taskPause"];
   for (const id of controls) $(id).disabled = !taskState;
 
   if (!taskState) {
@@ -651,12 +653,19 @@ function renderTask() {
   }
 
   $("taskMode").value = taskState.mode;
-  $("taskAuto").value = taskState.auto ? "1" : "0";
+  $("taskAuto").value = taskState.autopilot ? "autopilot" : taskState.auto ? "auto" : "manual";
+  $("taskTurnsRow").hidden = !taskState.autopilot;
+  $("taskMaxTurns").value = taskState.max_turns;
+  $("taskMaxTurns").max = taskState.max_turns_limit;
   box.hidden = taskState.mode !== "task";
   taskTokens = taskState.mode === "task" ? taskState.tokens : 0;
 
   $("taskModeHint").textContent = taskState.mode !== "task"
     ? "Обычный чат: состояние в запрос не уходит и служебных запросов нет."
+    : taskState.autopilot
+    ? `Модель отвечает и за пользователя — задача проходит этапы сама, до «готово» ` +
+      `или ${taskState.max_turns} ходов. Ход — четыре вызова к модели, 4–6 тыс. токенов. ` +
+      `Решения в репликах автопилота придуманы моделью, такие реплики помечены.`
     : (taskState.auto
         ? `Этап двигает модель после каждого обмена (примерно 300 токенов на обмен). Блок состояния — ~${taskState.tokens} токенов в каждом запросе.`
         : `Этап переключается кнопками. Блок состояния — ~${taskState.tokens} токенов в каждом запросе.`);
@@ -731,14 +740,29 @@ function renderTaskEvents(events) {
 }
 
 $("taskMode").addEventListener("change", () => patchTask({ mode: $("taskMode").value }));
-$("taskAuto").addEventListener("change", () => patchTask({ auto: $("taskAuto").value === "1" }));
+$("taskAuto").addEventListener("change", () => {
+  const v = $("taskAuto").value;
+  patchTask({ auto: v !== "manual", autopilot: v === "autopilot" });
+});
+$("taskMaxTurns").addEventListener("change", () => {
+  const n = Number($("taskMaxTurns").value) || 8;
+  patchTask({ max_turns: Math.max(1, Math.min(n, taskState.max_turns_limit)) });
+});
 $("taskNext").addEventListener("click", () => {
   if ($("taskNext").dataset.stage) patchTask({ stage: $("taskNext").dataset.stage });
 });
 $("taskBack").addEventListener("click", () => {
   if ($("taskBack").dataset.stage) patchTask({ stage: $("taskBack").dataset.stage });
 });
-$("taskPause").addEventListener("click", () => patchTask({ paused: !taskState.paused }));
+$("taskPause").addEventListener("click", async () => {
+  const resuming = taskState.paused;
+  await patchTask({ paused: !taskState.paused });
+  // Возобновление — это не только снятие паузы: автопилот продолжает работу
+  // с того же места, без новой реплики.
+  if (resuming && !taskState.paused && taskState.mode === "task" && taskState.autopilot) {
+    runAutopilot();
+  }
+});
 $("taskStep").addEventListener("change", () => patchTask({ step: $("taskStep").value }));
 $("taskExpected").addEventListener("change", () => patchTask({ expected: $("taskExpected").value }));
 $("taskActor").addEventListener("change", () => patchTask({ actor: $("taskActor").value }));
@@ -995,10 +1019,14 @@ const SERVICE_LABELS = {
   facts: "карточка фактов",
   summary: "конспект",
   task: "переключение этапа",
+  simulated_user: "реплика за пользователя",
 };
 
 /** Текст заметки: что именно сделал служебный вызов. */
 function serviceText(info) {
+  if (info.kind === "simulated_user") {
+    return `Реплику написала модель вместо пользователя (стоила ${info.cost_tokens} токенов).`;
+  }
   if (info.kind === "summary") {
     return `История свёрнута: ${info.folded_messages} сообщений заменены конспектом ` +
            `на ${info.summary_chars} символов, сборка стоила ${info.cost_tokens} токенов.`;
@@ -1140,6 +1168,10 @@ function statsLine(m) {
 
 /** Сообщение, поднятое из базы, — со всей сохранённой телеметрией. */
 function renderStored(m) {
+  if (m.role === "user" && m.meta && m.meta.simulated) {
+    simulatedMessage({ ...m.meta, text: m.content });
+    return;
+  }
   const box = addMessage(m.role === "user" ? "user" : "assistant", m.role === "user" ? "Вы" : "Модель");
   const body = box.querySelector(".body");
   if (m.role === "user") { body.textContent = m.content; return; }
@@ -1197,41 +1229,114 @@ async function ensureConversation() {
   return current;
 }
 
-async function send(text) {
-  if (busy) return;
-  busy = true;
-  $("send").disabled = true;
+// Идёт ли сейчас автопилот: кнопка «Отправить» тогда становится «Стоп».
+let autopilotRunning = false;
 
-  await ensureConversation();
-  addMessage("user", "Вы").querySelector(".body").textContent = text;
-  loadedTexts.push(text);
-  updateTokenStats();
-
+/** Новый блок ответа модели — сюда рисуются куски потока одного обмена. */
+function newTurn() {
   const box = addMessage("assistant", "Модель");
   const body = box.querySelector(".body");
   body.classList.add("cursor");
-  let answer = "", reasoning = "", reasoningBox = null;
   // Формат приходит вместе с составом слоёв, до первого куска текста.
-  let answerFormat = "text";
+  return { box, body, answer: "", reasoning: "", reasoningBox: null, answerFormat: "text" };
+}
+
+/** Реплика, которую за пользователя написала модель. */
+function simulatedMessage(info) {
+  const box = addMessage("user simulated", "Вы · автопилот");
+  box.querySelector(".body").textContent = info.text;
+  box.appendChild(serviceNote(info));
+  return box;
+}
+
+/** Русское множественное число: 1 ход, 2 хода, 5 ходов, 21 ход. */
+function plural(n, one, few, many) {
+  const tens = n % 100, units = n % 10;
+  if (tens >= 11 && tens <= 14) return many;
+  if (units === 1) return one;
+  if (units >= 2 && units <= 4) return few;
+  return many;
+}
+
+/** Итог прогона автопилота. */
+function autopilotSummary(ev) {
+  const route = ev.from_stage === ev.stage
+    ? `этап «${STAGE_LABELS[ev.stage]}»`
+    : `${STAGE_LABELS[ev.from_stage]} → ${STAGE_LABELS[ev.stage]}`;
+  const spent = `${ev.turns} ${plural(ev.turns, "ход", "хода", "ходов")}, ${route}, ` +
+                `${ev.tokens.toLocaleString("ru-RU")} токенов`;
+  const texts = {
+    done: `Автопилот довёл задачу до конца: ${spent}.`,
+    limit: `Автопилот остановлен по лимиту: ${spent}.`,
+    paused: `Автопилот остановлен паузой: ${spent}. «▶ Продолжить» во вкладке «Задача» запустит его дальше.`,
+    off: `Автопилот выключен посреди прогона: ${spent}.`,
+    error: `Автопилот остановлен из-за ошибки: ${spent}.`,
+    stopped: `Автопилот остановлен: ${spent}.`,
+    nothing: "Автопилоту не на что отвечать: в диалоге ещё нет ответа ассистента.",
+  };
+  const note = el("div", "autopilotnote", texts[ev.reason] || `Автопилот остановлен: ${spent}.`);
+  // По лимиту задача не на паузе — продолжить можно сразу, с новым лимитом.
+  if (ev.reason === "limit") {
+    const more = el("button", "ghost small", "▶ Ещё ходы");
+    more.style.marginLeft = "8px";
+    more.onclick = () => { more.remove(); runAutopilot(); };
+    note.appendChild(more);
+  }
+  return note;
+}
+
+function setSendMode(mode) {
+  const btn = $("send");
+  if (mode === "stop") { btn.textContent = "■ Стоп"; btn.disabled = false; btn.classList.add("stop"); }
+  else if (mode === "stopping") { btn.textContent = "Останавливаю…"; btn.disabled = true; }
+  else if (mode === "busy") { btn.textContent = "Отправить"; btn.disabled = true; btn.classList.remove("stop"); }
+  else { btn.textContent = "Отправить"; btn.disabled = false; btn.classList.remove("stop"); }
+}
+
+/** «Стоп» — это пауза, а не обрыв: текущий ход доходит до конца и сохраняется. */
+async function stopAutopilot() {
+  setSendMode("stopping");
+  await patchTask({ paused: true });
+}
+
+/** Читает поток: один обмен или много ходов автопилота подряд.
+ *  turn — блок, куда рисовать; null, если поток начнётся с хода автопилота. */
+async function streamInto(url, payload, turn) {
+  busy = true;
+  autopilotRunning = !!(taskState && taskState.mode === "task" && taskState.autopilot);
+  setSendMode(autopilotRunning ? "stop" : "busy");
+
+  // Сообщение, которому не нашлось блока ответа (ошибка до первого хода).
+  const standalone = (cls, text) => {
+    const n = el("div", cls, text);
+    n.style.margin = "8px 0";
+    if (log.querySelector(".empty")) log.innerHTML = "";
+    log.appendChild(n);
+    return n;
+  };
 
   try {
-    const res = await fetch(`/api/conversations/${current.id}/messages`, {
+    const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content: text }),
+      body: payload ? JSON.stringify(payload) : undefined,
     });
     if (res.status === 401) { location.href = "/login"; return; }
     if (!res.ok) {
       const info = await httpErrorResponse(res);
       const hint = httpErrorHint(res.status);
-      body.classList.add("error");
-      body.textContent = `Сбой запроса: HTTP ${res.status}` + (hint ? ` — ${hint}` : "");
-      const d = responseDetails(info, "Ответ сервера (ошибка)");
-      if (d) box.appendChild(d);
-      // Запрос до приложения не дошёл, в историю ничего не записано —
-      // убираем вопрос из подсчёта, иначе оценка следующего запроса завысится.
-      loadedTexts.pop();
-      updateTokenStats();
+      const text = (info && info.detail) || `Сбой запроса: HTTP ${res.status}` + (hint ? ` — ${hint}` : "");
+      if (turn) {
+        turn.body.classList.add("error");
+        turn.body.textContent = text;
+        const d = responseDetails(info, "Ответ сервера (ошибка)");
+        if (d) turn.box.appendChild(d);
+        // Запрос до приложения не дошёл, в историю ничего не записано —
+        // убираем вопрос из подсчёта, иначе оценка следующего запроса завысится.
+        if (payload) { loadedTexts.pop(); updateTokenStats(); }
+      } else {
+        standalone("truncated", text);
+      }
       return;
     }
 
@@ -1250,6 +1355,30 @@ async function send(text) {
         if (!part.startsWith("data: ")) continue;
         const ev = JSON.parse(part.slice(6));
 
+        // Новый ход автопилота: закрываем прежний блок, рисуем реплику
+        // «за пользователя» и заводим новый блок ответа.
+        if (ev.type === "autopilot_turn") {
+          if (turn) turn.body.classList.remove("cursor");
+          simulatedMessage(ev);
+          loadedTexts.push(ev.text);
+          turn = newTurn();
+          log.scrollTop = log.scrollHeight;
+          continue;
+        }
+        if (ev.type === "autopilot_done") {
+          if (turn) turn.body.classList.remove("cursor");
+          const note = autopilotSummary(ev);
+          if (log.querySelector(".empty")) log.innerHTML = "";
+          log.appendChild(note);
+          loadTask(current);
+          continue;
+        }
+        if (!turn) {
+          if (ev.type === "error") standalone("truncated", ev.message);
+          continue;
+        }
+
+        const { box, body } = turn;
         if (ev.type === "request") {
           const d = requestDetails(ev.request);
           if (d) box.appendChild(d);
@@ -1257,16 +1386,16 @@ async function send(text) {
           const d = responseDetails(ev.response);
           if (d) box.appendChild(d);
         } else if (ev.type === "reasoning") {
-          if (!reasoningBox) {
+          if (!turn.reasoningBox) {
             const d = document.createElement("details");
             d.appendChild(el("summary", null, "Рассуждение"));
             const pre = el("pre");
             d.appendChild(pre);
             box.insertBefore(d, body);
-            reasoningBox = pre;
+            turn.reasoningBox = pre;
           }
-          reasoning += ev.text;
-          reasoningBox.textContent = reasoning;
+          turn.reasoning += ev.text;
+          turn.reasoningBox.textContent = turn.reasoning;
         } else if (ev.type === "waiting") {
           // Соединение живо, но текста ещё нет — показываем, что запрос в работе.
           let wait = box.querySelector(".waitnote");
@@ -1279,8 +1408,8 @@ async function send(text) {
         } else if (ev.type === "content") {
           const wait = box.querySelector(".waitnote");
           if (wait) wait.remove();
-          answer += ev.text;
-          renderAnswer(body, answer, answerFormat);
+          turn.answer += ev.text;
+          renderAnswer(body, turn.answer, turn.answerFormat);
           log.scrollTop = log.scrollHeight;
         } else if (ev.type === "error") {
           body.classList.add("error");
@@ -1290,7 +1419,7 @@ async function send(text) {
         } else if (ev.type === "done") {
           const u = ev.usage || {};
           box.appendChild(statsLine({
-            content: answer,
+            content: turn.answer,
             tokens_completion: u.completion_tokens,
             tokens_total: u.total_tokens,
             meta: { finish_reason: ev.finish_reason, elapsed: ev.elapsed },
@@ -1299,13 +1428,13 @@ async function send(text) {
             box.appendChild(el("div", "truncated", "Генерация оборвана лимитом max_tokens — ответ не дописан."));
           }
           loadedTotals += u.total_tokens || 0;
-          loadedTexts.push(answer);
+          loadedTexts.push(turn.answer);
           updateTokenStats();
         } else if (ev.type === "facts") {
           box.appendChild(serviceNote(ev));
           if (current && ev.ok) { current.facts = JSON.stringify(ev.facts); showStrategy(current); }
         } else if (ev.type === "memory") {
-          answerFormat = ((ev.memory || {}).profile || {}).format || "text";
+          turn.answerFormat = ((ev.memory || {}).profile || {}).format || "text";
           const line = memoryLine(ev.memory);
           if (line) box.appendChild(line);
         } else if (ev.type === "task_state") {
@@ -1337,14 +1466,38 @@ async function send(text) {
       }
     }
   } catch (err) {
-    body.classList.add("error");
-    body.textContent = "Сбой запроса: " + err.message;
+    if (turn) {
+      turn.body.classList.add("error");
+      turn.body.textContent = "Сбой запроса: " + err.message;
+    } else {
+      standalone("truncated", "Сбой запроса: " + err.message);
+    }
   } finally {
-    body.classList.remove("cursor");
+    if (turn) turn.body.classList.remove("cursor");
     busy = false;
-    $("send").disabled = false;
+    autopilotRunning = false;
+    setSendMode("idle");
     log.scrollTop = log.scrollHeight;
   }
+}
+
+async function send(text) {
+  if (busy) return;
+  busy = true;
+  setSendMode("busy");
+
+  await ensureConversation();
+  addMessage("user", "Вы").querySelector(".body").textContent = text;
+  loadedTexts.push(text);
+  updateTokenStats();
+
+  await streamInto(`/api/conversations/${current.id}/messages`, { content: text }, newTurn());
+}
+
+/** Запускает автопилот без новой реплики: после паузы или сверх лимита. */
+async function runAutopilot() {
+  if (busy || !current) return;
+  await streamInto(`/api/conversations/${current.id}/autopilot`, null, null);
 }
 
 // ---------- настройки диалога ----------
@@ -1426,6 +1579,10 @@ for (const b of document.querySelectorAll(".tabhead .hide")) {
 
 $("form").addEventListener("submit", e => {
   e.preventDefault();
+  if (busy) {
+    if (autopilotRunning) stopAutopilot();
+    return;
+  }
   const text = $("prompt").value.trim();
   if (!text) return;
   $("prompt").value = "";

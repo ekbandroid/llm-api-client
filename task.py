@@ -149,8 +149,14 @@ def describe(conversation: dict) -> dict:
         "label": LABELS[stage_of(conversation)],
         "paused": bool(conversation.get("task_paused")),
         "auto": bool(conversation.get("task_auto")),
+        "autopilot": is_autopilot(conversation),
         "tokens": tokens_mod.estimate_tokens(text),
     }
+
+
+def is_autopilot(conversation: dict) -> bool:
+    """Включён ли автопилот: модель отвечает и за пользователя."""
+    return is_task(conversation) and bool(conversation.get("task_autopilot"))
 
 
 # ---------- автоматическое переключение ----------
@@ -281,3 +287,70 @@ def refresh(conversation: dict, exchange: list[dict], *, model: str | None = Non
                       note=info["reason"], author="model")
     info.update(stage=proposed, moved=True)
     return info
+
+
+# ---------- автопилот: модель за пользователя ----------
+#
+# Отдельный служебный вызов пишет следующую реплику пользователя. Реплика потом
+# идёт через тот же конвейер, что и настоящая: слои памяти, блок состояния,
+# карточка фактов, переключатель. Иначе автопилот проверял бы не то приложение,
+# которое видит человек.
+#
+# Модель-«пользователь» неизбежно принимает решения, которых человек не
+# принимал: ОС, пути, названия. Иначе ей нечем отвечать на уточняющие вопросы.
+# Поэтому её реплики помечаются в базе и в интерфейсе.
+
+SIMULATED_USER_SYSTEM = (
+    "Ты играешь пользователя, который поставил задачу ассистенту и хочет "
+    "довести её до конца. Пиши от первого лица, коротко, как человек в чате, "
+    "без приветствий и подписей.\n"
+    "Спрашивают — отвечай на вопросы, принимая разумные решения сам.\n"
+    "Предлагают план — прими его или попроси одну конкретную правку.\n"
+    "Показывают результат — проверь по существу: подтверди, что всё сходится, "
+    "или назови конкретное расхождение.\n"
+    "Задача сделана и проверена — так и скажи, коротко.\n"
+    "Не пиши код и не делай работу за ассистента. Не благодари без дела. "
+    "Верни только текст реплики."
+)
+
+STAGE_HINTS = {
+    db.PLANNING: "ассистент уточняет задачу и предлагает план",
+    db.EXECUTION: "ассистент выполняет утверждённый план",
+    db.VALIDATION: "ассистент проверяет результат",
+    db.DONE: "задача завершена",
+}
+
+
+def simulate_user(
+    conversation: dict, task_text: str, last_answer: str, *, model: str | None = None,
+) -> dict:
+    """Пишет следующую реплику за пользователя.
+
+    На вход — не вся переписка, а то, без чего нельзя ответить: исходная
+    задача, карточка фактов, этап и последний ответ ассистента. Так вызов
+    стоит одинаково на любой длине диалога.
+    """
+    stage = stage_of(conversation)
+    facts = conversation.get("facts") or ""
+    user_part = (
+        f"Исходная задача:\n{task_text}\n\n"
+        + (f"Что уже решено: {facts}\n\n" if facts else "")
+        + f"Этап: {LABELS[stage]} — {STAGE_HINTS[stage]}.\n\n"
+        f"Последний ответ ассистента:\n{last_answer}\n\n"
+        "Напиши свою следующую реплику."
+    )
+    result = llm.complete(
+        [{"role": "system", "content": SIMULATED_USER_SYSTEM},
+         {"role": "user", "content": user_part}],
+        model=model, thinking=False, max_tokens=300,
+        # Реплика больше нигде не видна целиком вместе с её запросом.
+        keep_text=True,
+    )
+    return {
+        "kind": "simulated_user",
+        "text": result.content.strip(),
+        "cost_tokens": result.total_tokens,
+        "request": result.request,
+        "response": result.response,
+    }
+

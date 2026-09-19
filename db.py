@@ -171,6 +171,10 @@ MIGRATIONS = {
         "task_paused": "INTEGER NOT NULL DEFAULT 0",
         "task_auto": "INTEGER NOT NULL DEFAULT 0",
         "task_updated_at": "TEXT",
+        # Автопилот: модель отвечает и за пользователя, задача проходит
+        # этапы сама. Лимит ходов — предохранитель от бесконечного цикла.
+        "task_autopilot": "INTEGER NOT NULL DEFAULT 0",
+        "task_max_turns": "INTEGER NOT NULL DEFAULT 8",
     },
 }
 
@@ -846,6 +850,9 @@ ACTORS = (USER_ACTOR, ASSISTANT_ACTOR)
 
 STEP_LIMIT = 500
 
+# Потолок лимита ходов автопилота: каждый ход — четыре вызова к модели.
+MAX_TURNS_LIMIT = 20
+
 
 def _add_task_event(conn, conversation_id: int, kind: str, stage: str, *,
                     from_stage: str | None = None, note: str | None = None,
@@ -861,7 +868,7 @@ def _add_task_event(conn, conversation_id: int, kind: str, stage: str, *,
 def update_task(
     conversation_id: int, user_id: int, *, mode: str | None = None,
     step: str | None = None, expected: str | None = None, actor: str | None = None,
-    auto: bool | None = None,
+    auto: bool | None = None, autopilot: bool | None = None, max_turns: int | None = None,
 ) -> dict | None:
     """Меняет настройки задачи. Этап и пауза идут отдельными функциями —
     у них есть правила и журнал."""
@@ -883,6 +890,16 @@ def update_task(
     if auto is not None:
         sets.append("task_auto = ?")
         values.append(int(auto))
+    if autopilot is not None:
+        sets.append("task_autopilot = ?")
+        values.append(int(autopilot))
+        # Автопилот без автоматического переключения крутился бы на месте:
+        # модель отвечает за пользователя, а этап не двигается никогда.
+        if autopilot:
+            sets.append("task_auto = 1")
+    if max_turns is not None:
+        sets.append("task_max_turns = ?")
+        values.append(max(1, min(int(max_turns), MAX_TURNS_LIMIT)))
     if not sets:
         return get_conversation(conversation_id, user_id)
 

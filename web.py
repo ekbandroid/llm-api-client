@@ -734,27 +734,31 @@ async def conversation_delete(
     return {"ok": db.delete_conversation(conversation_id, user["id"])}
 
 
-@app.post("/api/conversations/{conversation_id}/messages")
-async def conversation_send(
-    conversation_id: int, payload: NewMessage, user: dict = Depends(require_approved)
-) -> StreamingResponse:
-    """Принимает новое сообщение, историю поднимает сам и стримит ответ.
+async def _exchange(
+    conversation_id: int, user: dict, content: str, *,
+    outcome: dict, simulated: dict | None = None,
+) -> AsyncIterator[str]:
+    """Один обмен: сохранить реплику, собрать запрос, стримить ответ, обслужить.
 
-    Клиент присылает только текст: историю он не передаёт и подменить её
-    не может. Оба сообщения сохраняются, поэтому после перезапуска диалог
-    продолжается с того же места.
+    Через него идут и настоящие реплики, и реплики автопилота — одинаково:
+    иначе автопилот проверял бы не то приложение, которое видит человек.
+    simulated — телеметрия вызова, написавшего реплику за пользователя; она
+    сохраняется в meta этой реплики.
+
+    Итог пишется в outcome: ok, answer, tokens (основной ответ плюс служебные
+    вызовы), paused. Вернуть значение из асинхронного генератора нельзя.
     """
+    outcome["ok"] = False
     conversation = _owned(conversation_id, user)
-    content = payload.content.strip()
-    if not content:
-        raise HTTPException(400, "Пустое сообщение")
-
     system_prompt = llm.SYSTEM_PROMPT
     model = conversation["model"] or llm.MODEL
     thinking = bool(conversation["thinking"])
     max_tokens = conversation["max_tokens"] or None
 
-    asked = db.add_message(conversation_id, "user", content)
+    asked = db.add_message(
+        conversation_id, "user", content,
+        meta=json.dumps({"simulated": True, **simulated}, ensure_ascii=False) if simulated else None,
+    )
     # Первое сообщение даёт диалогу имя — иначе список будет из «Новых диалогов».
     if conversation["title"] == db.NEW_TITLE:
         db.update_conversation(conversation_id, user["id"], title=content)
@@ -773,13 +777,14 @@ async def conversation_send(
     )
     messages = plan.messages
 
-    async def events() -> AsyncIterator[str]:
-        answer, reasoning = "", ""
-        meta: dict = {"system": system_prompt, "model": model}
-        completion_tokens = total_tokens = 0
-        finish_reason = "unknown"
-        elapsed = 0.0
+    answer, reasoning = "", ""
+    meta: dict = {"system": system_prompt, "model": model}
+    completion_tokens = total_tokens = 0
+    finish_reason = "unknown"
+    elapsed = 0.0
+    answered = False
 
+    try:
         # Состав слоёв показываем до ответа: иначе понять, ушла ли память
         # в запрос, можно было бы только перезагрузив страницу.
         if plan.memory:
@@ -799,6 +804,8 @@ async def conversation_send(
                                  "finish_reason": "paused", "elapsed": 0},
                                 ensure_ascii=False),
             )
+            answered = True
+            outcome.update(ok=True, answer=reply, tokens=0, paused=True)
             yield sse({"type": "saved", "message_id": saved["id"],
                        "title": _owned(conversation_id, user)["title"]})
             return
@@ -826,10 +833,7 @@ async def conversation_send(
                     elapsed = event["elapsed"]
                 yield sse(event)
         except llm.LLMError as err:
-            # Обмен не состоялся — убираем вопрос из истории. Иначе каждая
-            # неудачная попытка оставалась бы в диалоге навсегда и оплачивалась
-            # заново в каждом следующем запросе.
-            db.delete_message(asked["id"])
+            # Вопрос без ответа удалит finally ниже — так же, как при обрыве.
             yield sse({"type": "error", "message": str(err), "response": err.response, "diagnostics": err.diagnostics})
             return
 
@@ -848,10 +852,9 @@ async def conversation_send(
             tokens_completion=completion_tokens, tokens_total=total_tokens,
             meta=json.dumps(meta, ensure_ascii=False),
         )
+        answered = True
         yield sse({"type": "saved", "message_id": saved["id"], "title": _owned(conversation_id, user)["title"]})
 
-        # Пересборку делаем после ответа: пользователь его уже видит, лишняя
-        # задержка на сворачивание истории до него не доходит.
         # Обслуживание контекста идёт после ответа: пользователь его уже видит,
         # и задержка на конспект или карточку фактов до него не доходит.
         fresh = _owned(conversation_id, user)
@@ -903,11 +906,160 @@ async def conversation_send(
             meta["service"] = service
             db.update_message_meta(saved["id"], json.dumps(meta, ensure_ascii=False))
 
+        outcome.update(
+            ok=True, answer=answer, paused=False,
+            tokens=total_tokens + sum(x.get("cost_tokens", 0) for x in service),
+        )
+    finally:
+        # Ответ сохраняется только в самом конце. Если обмен сорвался — ошибка
+        # API или закрытая вкладка, когда Starlette снимает поток на ближайшем
+        # await, — в истории остался бы вопрос без ответа, который потом
+        # оплачивался бы в каждом следующем запросе. Убираем его.
+        if not answered:
+            db.delete_message(asked["id"])
+
+
+def _autopilot_context(conversation_id: int) -> tuple[str, str]:
+    """Исходная задача и последний настоящий ответ ассистента.
+
+    Заготовленный ответ «задача на паузе» пропускаем: реагировать на него
+    модели-«пользователю» не на что, работа по задаче была до него.
+    """
+    rows = db.list_messages(conversation_id)
+    first = next((m["content"] for m in rows if m["role"] == "user"), "")
+    last = ""
+    for m in reversed(rows):
+        if m["role"] != "assistant":
+            continue
+        meta = json.loads(m["meta"]) if m["meta"] else {}
+        if not meta.get("paused"):
+            last = m["content"]
+            break
+    return first, last
+
+
+async def _autopilot(conversation_id: int, user: dict, request: Request) -> AsyncIterator[str]:
+    """Цикл ходов: модель пишет реплику за пользователя, дальше обычный обмен.
+
+    Останавливается на этапе «готово», по лимиту ходов, на паузе (это и есть
+    кнопка «Стоп»), если автопилот выключили посреди прогона, на ошибке и
+    когда вкладку закрыли. Каждое условие проверяется перед ходом, поэтому
+    начатый ход всегда доходит до конца.
+    """
+    conversation = _owned(conversation_id, user)
+    if not task.is_autopilot(conversation):
+        return
+
+    start_stage = task.stage_of(conversation)
+    limit = conversation["task_max_turns"] or 8
+    model = conversation["model"] or llm.MODEL
+    turns = spent = 0
+    reason = "limit"
+
+    while True:
+        conversation = _owned(conversation_id, user)
+        if task.stage_of(conversation) == db.DONE:
+            reason = "done"
+            break
+        if conversation["task_paused"]:
+            reason = "paused"
+            break
+        if not task.is_autopilot(conversation):
+            reason = "off"
+            break
+        if turns >= limit:
+            reason = "limit"
+            break
+        if await request.is_disconnected():
+            reason = "stopped"
+            break
+
+        task_text, last_answer = _autopilot_context(conversation_id)
+        if not last_answer:
+            reason = "nothing"
+            break
+        try:
+            reply = await asyncio.to_thread(
+                task.simulate_user, conversation, task_text, last_answer, model=model
+            )
+        except llm.LLMError as err:
+            yield sse({"type": "error", "message": str(err), "response": err.response,
+                       "diagnostics": err.diagnostics})
+            reason = "error"
+            break
+        if not reply["text"]:
+            reason = "error"
+            break
+
+        turns += 1
+        spent += reply["cost_tokens"]
+        yield sse({"type": "autopilot_turn", "turn": turns, "max": limit, **reply})
+
+        outcome: dict = {}
+        async for chunk in _exchange(
+            conversation_id, user, reply["text"], outcome=outcome, simulated=reply
+        ):
+            yield chunk
+        spent += outcome.get("tokens", 0)
+        if not outcome.get("ok"):
+            reason = "error"
+            break
+
+    final = _owned(conversation_id, user)
+    yield sse({
+        "type": "autopilot_done", "reason": reason, "turns": turns, "max": limit,
+        "from_stage": start_stage, "stage": task.stage_of(final), "tokens": spent,
+    })
+
+
+def _sse_response(events: AsyncIterator[str]) -> StreamingResponse:
     return StreamingResponse(
-        events(),
+        events,
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@app.post("/api/conversations/{conversation_id}/messages")
+async def conversation_send(
+    conversation_id: int, payload: NewMessage, request: Request,
+    user: dict = Depends(require_approved),
+) -> StreamingResponse:
+    """Принимает новое сообщение, историю поднимает сам и стримит ответ.
+
+    Клиент присылает только текст: историю он не передаёт и подменить её
+    не может. Оба сообщения сохраняются, поэтому после перезапуска диалог
+    продолжается с того же места. Если включён автопилот, после ответа в том
+    же потоке идут ходы за пользователя.
+    """
+    _owned(conversation_id, user)
+    content = payload.content.strip()
+    if not content:
+        raise HTTPException(400, "Пустое сообщение")
+
+    async def events() -> AsyncIterator[str]:
+        outcome: dict = {}
+        async for chunk in _exchange(conversation_id, user, content, outcome=outcome):
+            yield chunk
+        # На паузе автопилот не стартует: пауза — тормоз человека над автоматом.
+        if outcome.get("ok") and not outcome.get("paused"):
+            async for chunk in _autopilot(conversation_id, user, request):
+                yield chunk
+
+    return _sse_response(events())
+
+
+@app.post("/api/conversations/{conversation_id}/autopilot")
+async def autopilot_run(
+    conversation_id: int, request: Request, user: dict = Depends(require_approved)
+) -> StreamingResponse:
+    """Запускает автопилот без новой реплики — так возобновляется работа после паузы."""
+    conversation = _owned(conversation_id, user)
+    if not task.is_autopilot(conversation):
+        raise HTTPException(400, "Автопилот на этом диалоге не включён")
+    if conversation["task_paused"]:
+        raise HTTPException(400, "Задача на паузе — сначала снимите паузу")
+    return _sse_response(_autopilot(conversation_id, user, request))
 
 
 # ---------- состояние задачи ----------
@@ -917,6 +1069,8 @@ class TaskPatch(BaseModel):
     stage: str | None = None
     paused: bool | None = None
     auto: bool | None = None
+    autopilot: bool | None = None
+    max_turns: int | None = Field(default=None, ge=1, le=db.MAX_TURNS_LIMIT)
     step: str | None = None
     expected: str | None = None
     actor: str | None = None
@@ -935,6 +1089,9 @@ def _task_view(conversation: dict) -> dict:
         "actor": conversation["task_actor"] or db.USER_ACTOR,
         "paused": bool(conversation["task_paused"]),
         "auto": bool(conversation["task_auto"]),
+        "autopilot": bool(conversation["task_autopilot"]),
+        "max_turns": conversation["task_max_turns"] or 8,
+        "max_turns_limit": db.MAX_TURNS_LIMIT,
         "updated_at": conversation["task_updated_at"],
         "stages": [{"id": st, "label": task.LABELS[st]} for st in db.STAGES],
         "allowed": list(task.allowed(stage)),
@@ -965,10 +1122,12 @@ async def task_set(
                     conversation_id, user["id"], task.stage_of(conversation),
                     note="задача заведена",
                 )
-        if any(v is not None for v in (payload.step, payload.expected, payload.actor, payload.auto)):
+        if any(v is not None for v in (payload.step, payload.expected, payload.actor,
+                                       payload.auto, payload.autopilot, payload.max_turns)):
             conversation = db.update_task(
                 conversation_id, user["id"], step=payload.step, expected=payload.expected,
-                actor=payload.actor, auto=payload.auto,
+                actor=payload.actor, auto=payload.auto, autopilot=payload.autopilot,
+                max_turns=payload.max_turns,
             )
     except ValueError as err:
         raise HTTPException(400, str(err)) from err
