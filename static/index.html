@@ -983,6 +983,74 @@ $("useProject").addEventListener("change", async () => {
   updateTokenStats();
 });
 
+// ---------- служебные вызовы к модели ----------
+//
+// После ответа приложение обращается к модели ещё раз: обновить карточку
+// фактов, собрать конспект, решить, не пора ли менять этап задачи. Это самые
+// дорогие невидимые расходы в проекте, поэтому у каждого такого вызова те же
+// два аккордеона, что и у основного ответа. Один построитель на живой поток и
+// на сохранённое сообщение — иначе они разойдутся.
+
+const SERVICE_LABELS = {
+  facts: "карточка фактов",
+  summary: "конспект",
+  task: "переключение этапа",
+};
+
+/** Текст заметки: что именно сделал служебный вызов. */
+function serviceText(info) {
+  if (info.kind === "summary") {
+    return `История свёрнута: ${info.folded_messages} сообщений заменены конспектом ` +
+           `на ${info.summary_chars} символов, сборка стоила ${info.cost_tokens} токенов.`;
+  }
+  if (info.kind === "task") {
+    if (info.moved) {
+      return `Этап: ${STAGE_LABELS[info.from_stage]} → ${STAGE_LABELS[info.stage]} — ` +
+             `${info.reason} (переключение стоило ${info.cost_tokens} токенов).`;
+    }
+    if (info.rejected) return `Переход отклонён: ${info.rejected}. Этап остался прежним.`;
+    if (info.ok === false) return `Состояние задачи не обновлено: ${info.reason}.`;
+    return `Этап прежний (${STAGE_LABELS[info.stage]})` +
+           (info.step ? `, шаг: ${info.step}` : "") +
+           ` (проверка стоила ${info.cost_tokens} токенов).`;
+  }
+  return info.ok
+    ? `Карточка фактов обновлена: ${info.count} записей` +
+      (info.added && info.added.length ? `, добавлено — ${info.added.join(", ")}` : "") +
+      `. Обновление стоило ${info.cost_tokens} токенов.`
+    : `Карточку фактов обновить не удалось: ${info.reason}. Прежняя сохранена.`;
+}
+
+/** Заметка служебного вызова вместе с запросом и ответом. */
+function serviceNote(info, { undo = false } = {}) {
+  const wrap = el("div");
+  wrap.style.marginTop = "8px";
+
+  const note = el("div", "hint", serviceText(info));
+  wrap.appendChild(note);
+
+  // Кнопка отмены только в живом виде: у сохранённого сообщения она отменила
+  // бы последний переход диалога, а не тот, что описан здесь.
+  if (undo && info.kind === "task" && info.moved) {
+    const button = el("button", "ghost small", "Отменить");
+    button.style.marginLeft = "8px";
+    button.onclick = async () => {
+      button.disabled = true;
+      const res = await fetch(`/api/conversations/${current.id}/task/undo`, { method: "POST" });
+      if (res.ok) { taskState = await res.json(); renderTask(); note.textContent = "Переход отменён."; button.remove(); }
+      else button.disabled = false;
+    };
+    note.appendChild(button);
+  }
+
+  const label = SERVICE_LABELS[info.kind] || "служебный вызов";
+  const request = requestDetails(info.request, `Запрос к API (${label})`);
+  if (request) wrap.appendChild(request);
+  const response = responseDetails(info.response, `Ответ API (${label})`);
+  if (response) wrap.appendChild(response);
+  return wrap;
+}
+
 /** Строка о том, сколько памяти ушло в этот запрос. */
 function memoryLine(mem) {
   if (!mem || (!mem.profile && !mem.project && !mem.task)) return null;
@@ -1102,6 +1170,7 @@ function renderStored(m) {
   box.appendChild(statsLine(m));
   const mem = memoryLine(meta.memory);
   if (mem) box.appendChild(mem);
+  for (const info of meta.service || []) box.appendChild(serviceNote(info));
   addBranchButton(box, m.id);
   if (meta.finish_reason === "length") {
     box.appendChild(el("div", "truncated", "Генерация оборвана лимитом max_tokens — ответ не дописан."));
@@ -1233,44 +1302,14 @@ async function send(text) {
           loadedTexts.push(answer);
           updateTokenStats();
         } else if (ev.type === "facts") {
-          const note = el("div", "hint");
-          note.style.marginTop = "8px";
-          note.textContent = ev.ok
-            ? `Карточка фактов обновлена: ${ev.count} записей` +
-              (ev.added.length ? `, добавлено — ${ev.added.join(", ")}` : "") +
-              `. Обновление стоило ${ev.cost_tokens} токенов.`
-            : `Карточку фактов обновить не удалось: ${ev.reason}. Прежняя сохранена.`;
-          box.appendChild(note);
+          box.appendChild(serviceNote(ev));
           if (current && ev.ok) { current.facts = JSON.stringify(ev.facts); showStrategy(current); }
         } else if (ev.type === "memory") {
           answerFormat = ((ev.memory || {}).profile || {}).format || "text";
           const line = memoryLine(ev.memory);
           if (line) box.appendChild(line);
         } else if (ev.type === "task_state") {
-          const note = el("div", "hint");
-          note.style.marginTop = "8px";
-          if (ev.moved) {
-            note.textContent =
-              `Этап: ${STAGE_LABELS[ev.from_stage]} → ${STAGE_LABELS[ev.stage]} — ${ev.reason} ` +
-              `(переключение стоило ${ev.cost_tokens} токенов).`;
-            const undo = el("button", "ghost small", "Отменить");
-            undo.style.marginLeft = "8px";
-            undo.onclick = async () => {
-              undo.disabled = true;
-              const res = await fetch(`/api/conversations/${current.id}/task/undo`, { method: "POST" });
-              if (res.ok) { taskState = await res.json(); renderTask(); note.textContent = "Переход отменён."; }
-              else undo.disabled = false;
-            };
-            note.appendChild(undo);
-          } else if (ev.rejected) {
-            note.textContent = `Переход отклонён: ${ev.rejected}. Этап остался прежним.`;
-          } else if (ev.ok === false) {
-            note.textContent = `Состояние задачи не обновлено: ${ev.reason}.`;
-          } else {
-            note.textContent = `Этап прежний (${STAGE_LABELS[ev.stage]})` +
-              (ev.step ? `, шаг: ${ev.step}` : "") + ".";
-          }
-          box.appendChild(note);
+          box.appendChild(serviceNote(ev, { undo: true }));
           loadTask(current);
         } else if (ev.type === "project_facts") {
           const note = el("div", "hint");
@@ -1286,11 +1325,7 @@ async function send(text) {
           note.textContent = "Обслуживание контекста не удалось: " + ev.message;
           box.appendChild(note);
         } else if (ev.type === "compressed") {
-          const note = el("div", "hint");
-          note.style.marginTop = "8px";
-          note.textContent = `История свёрнута: ${ev.folded_messages} сообщений заменены конспектом ` +
-            `на ${ev.summary_chars} символов, сборка стоила ${ev.cost_tokens} токенов.`;
-          box.appendChild(note);
+          box.appendChild(serviceNote(ev));
           if (current) { current.summary = "x".repeat(ev.summary_chars); showStrategy(current); }
         } else if (ev.type === "saved") {
           addBranchButton(box, ev.message_id);

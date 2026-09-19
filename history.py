@@ -180,11 +180,14 @@ def refresh_facts(conversation: dict, exchange: list[dict], *, model: str | None
         + f"Новые реплики:\n{transcript}"
     )
 
+    # keep_text=True: ответ этого вызова — сама карточка, и больше её нигде
+    # не покажут; вырезать текст значило бы показать пустой блок.
     result = llm.complete(
         [{"role": "system", "content": FACTS_SYSTEM},
          {"role": "user", "content": user_part}],
-        model=model, thinking=False,
+        model=model, thinking=False, keep_text=True,
     )
+    telemetry = {"kind": "facts", "request": result.request, "response": result.response}
 
     text = result.content.strip()
     if text.startswith("```"):
@@ -193,9 +196,11 @@ def refresh_facts(conversation: dict, exchange: list[dict], *, model: str | None
         updated = json.loads(text)
     except json.JSONDecodeError:
         # Модель ответила не JSON — прежнюю карточку не портим.
-        return {"ok": False, "cost_tokens": result.total_tokens, "reason": "ответ не разобран как JSON"}
+        return {"ok": False, "cost_tokens": result.total_tokens,
+                "reason": "ответ не разобран как JSON", **telemetry}
     if not isinstance(updated, dict):
-        return {"ok": False, "cost_tokens": result.total_tokens, "reason": "ожидался объект"}
+        return {"ok": False, "cost_tokens": result.total_tokens,
+                "reason": "ожидался объект", **telemetry}
 
     updated = dict(list(updated.items())[:FACTS_LIMIT])
     db.set_facts(conversation["id"], json.dumps(updated, ensure_ascii=False))
@@ -205,6 +210,7 @@ def refresh_facts(conversation: dict, exchange: list[dict], *, model: str | None
         "count": len(updated),
         "added": [k for k in updated if k not in current],
         "cost_tokens": result.total_tokens,
+        **telemetry,
     }
 
 
@@ -240,14 +246,17 @@ def refresh(conversation: dict, *, model: str | None = None) -> dict | None:
     result = llm.complete(
         [{"role": "system", "content": SUMMARY_SYSTEM},
          {"role": "user", "content": user_part}],
-        model=model, thinking=False,
+        model=model, thinking=False, keep_text=True,
     )
     summary = result.content.strip()
     db.set_summary(conversation["id"], summary, stale[-1]["id"])
 
     return {
+        "kind": "summary",
         "folded_messages": len(stale),
         "summary_chars": len(summary),
         "cost_tokens": result.total_tokens,
         "upto_message_id": stale[-1]["id"],
+        "request": result.request,
+        "response": result.response,
     }

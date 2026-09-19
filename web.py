@@ -855,10 +855,15 @@ async def conversation_send(
         # Обслуживание контекста идёт после ответа: пользователь его уже видит,
         # и задержка на конспект или карточку фактов до него не доходит.
         fresh = _owned(conversation_id, user)
+        # Служебные вызовы идут уже после сохранения ответа, поэтому их
+        # телеметрию дописываем в meta отдельной правкой — иначе после
+        # перезагрузки страницы от них не осталось бы и следа.
+        service: list[dict] = []
         try:
             if history.needs_refresh(fresh):
                 info = await asyncio.to_thread(history.refresh, fresh, model=model)
                 if info:
+                    service.append(info)
                     yield sse({"type": "compressed", **info})
             elif (fresh["strategy"] or db.FULL) == db.FACTS:
                 exchange = [{"role": "user", "content": content},
@@ -867,6 +872,7 @@ async def conversation_send(
                     history.refresh_facts, fresh, exchange, model=model
                 )
                 if info:
+                    service.append(info)
                     yield sse({"type": "facts", **info})
                     # Факты диалога — то же знание, что нужно проекту. Переливаем
                     # без обращения к модели: они уже извлечены строкой выше.
@@ -886,9 +892,16 @@ async def conversation_send(
                 model=model,
             )
             if moved:
+                service.append(moved)
                 yield sse({"type": "task_state", **moved})
         except llm.LLMError as err:
             yield sse({"type": "context_error", "message": str(err)})
+
+        # Дописываем после except: даже если один из вызовов сорвался,
+        # телеметрия предыдущих должна сохраниться.
+        if service:
+            meta["service"] = service
+            db.update_message_meta(saved["id"], json.dumps(meta, ensure_ascii=False))
 
     return StreamingResponse(
         events(),

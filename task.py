@@ -234,15 +234,19 @@ def refresh(conversation: dict, exchange: list[dict], *, model: str | None = Non
          {"role": "user", "content": user_part}],
         model=model, thinking=False, max_tokens=400,
         response_format={"type": db.JSON_FORMAT},
+        # Ответ переключателя — его решение; в интерфейсе он виден только здесь.
+        keep_text=True,
     )
+    telemetry = {"kind": "task", "request": result.request, "response": result.response}
     parsed = _parse(result.content)
     if parsed is None:
         return {"ok": False, "reason": "ответ переключателя не разобран как JSON",
-                "cost_tokens": result.total_tokens}
+                "cost_tokens": result.total_tokens, **telemetry}
 
     info = {
         "ok": True,
         "cost_tokens": result.total_tokens,
+        **telemetry,
         "from_stage": stage,
         "stage": stage,
         "moved": False,

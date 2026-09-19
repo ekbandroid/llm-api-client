@@ -179,25 +179,32 @@ def describe_request(payload: dict) -> dict:
     }
 
 
-def describe_response(body: dict, *, streamed: bool = False, chunks: int = 0) -> dict:
+def describe_response(
+    body: dict, *, streamed: bool = False, chunks: int = 0, keep_text: bool = False
+) -> dict:
     """Ответ API без самого текста ответа.
 
     Текст уже отрисован пользователю выше, повторять его в JSON незачем —
     он только мешает разглядеть служебные поля: usage, finish_reason,
     идентификатор запроса. Вместо текста остаётся его длина.
+
+    keep_text=True — для служебных вызовов: там текст ответа это и есть
+    карточка фактов или решение переключателя этапов, и больше его нигде
+    не видно. Вырезать его значило бы показать пустой блок.
     """
     trimmed = copy.deepcopy(body)
-    for choice in trimmed.get("choices") or []:
-        for part_name in ("message", "delta"):
-            part = choice.get(part_name)
-            if not isinstance(part, dict):
-                continue
-            for field in ("content", "reasoning_content"):
-                value = part.get(field)
-                # Пустую строку оставляем как есть: в куске потока текста и
-                # правда нет, подпись «0 символов» только путала бы.
-                if isinstance(value, str) and value:
-                    part[field] = f"<{len(value)} символов, показано выше>"
+    if not keep_text:
+        for choice in trimmed.get("choices") or []:
+            for part_name in ("message", "delta"):
+                part = choice.get(part_name)
+                if not isinstance(part, dict):
+                    continue
+                for field in ("content", "reasoning_content"):
+                    value = part.get(field)
+                    # Пустую строку оставляем как есть: в куске потока текста
+                    # и правда нет, подпись «0 символов» только путала бы.
+                    if isinstance(value, str) and value:
+                        part[field] = f"<{len(value)} символов, показано выше>"
     if streamed:
         trimmed["примечание"] = (
             f"собрано приложением из {chunks} кусков потока: по отдельности "
@@ -242,8 +249,14 @@ def _headers() -> dict:
     return {"Authorization": f"Bearer {API_KEY}"}
 
 
-def complete(messages: list[dict], *, timeout: int = 120, **options) -> Completion:
-    """Синхронный вызов: ждёт ответ целиком и возвращает его с телеметрией."""
+def complete(
+    messages: list[dict], *, timeout: int = 120, keep_text: bool = False, **options
+) -> Completion:
+    """Синхронный вызов: ждёт ответ целиком и возвращает его с телеметрией.
+
+    keep_text=True оставляет текст ответа в телеметрии — так вызывают
+    служебные обращения, у которых этот текст нигде больше не показан.
+    """
     payload = build_payload(messages, **options)
 
     started = time.monotonic()
@@ -279,7 +292,7 @@ def complete(messages: list[dict], *, timeout: int = 120, **options) -> Completi
         reasoning_tokens=(usage.get("completion_tokens_details") or {}).get("reasoning_tokens", 0),
         elapsed=elapsed,
         request=describe_request(payload),
-        response=describe_response(body),
+        response=describe_response(body, keep_text=keep_text),
     )
 
 

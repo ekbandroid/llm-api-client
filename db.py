@@ -1067,6 +1067,18 @@ def set_summary(conversation_id: int, summary: str, upto_message_id: int) -> Non
         )
 
 
+def update_message_meta(message_id: int, meta_json: str) -> bool:
+    """Заменяет телеметрию уже сохранённого сообщения.
+
+    Служебные вызовы — карточка фактов, конспект, переключатель этапов — идут
+    после ответа, когда сообщение уже в базе. Другого способа сохранить их
+    рядом с ответом, кроме правки meta, нет.
+    """
+    with connect() as conn:
+        cur = conn.execute("UPDATE messages SET meta = ? WHERE id = ?", (meta_json, message_id))
+    return cur.rowcount > 0
+
+
 def delete_message(message_id: int) -> bool:
     """Удаляет сообщение. Нужно, чтобы откатить неудавшийся обмен."""
     with connect() as conn:
