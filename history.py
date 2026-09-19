@@ -109,6 +109,8 @@ def transcript_line(message: dict) -> str:
     противореча ему. Что именно просили, остаётся понятным из ответа
     ассистента: отказ называет и просьбу, и альтернативу, и он идёт целиком.
     """
+    if message["role"] == "system":
+        return f"Система: {message['content']}"
     if message["role"] != "user":
         return f"Ассистент: {message['content']}"
     if codes := rejected_codes(message):

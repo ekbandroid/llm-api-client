@@ -943,9 +943,16 @@ async def _exchange(
         try:
             # Судья идёт первым: вердикт должен стоять сразу под ответом, и
             # пометка об отказе нужна карточке фактов до её обновления.
-            if rules:
+            # Ревизор проверяет две пары правил сразу: инварианты проекта и
+            # правило текущего этапа. Поэтому он нужен и там, где инвариантов
+            # нет, но задача идёт по этапам.
+            stage_rule = task.STAGE_RULES[task.stage_of(fresh)] if task.is_task(fresh) else ""
+            if rules or stage_rule:
                 verdict = await asyncio.to_thread(
-                    invariants_mod.check, rules, content, answer, model=model
+                    invariants_mod.check, rules, content, answer,
+                    stage_rule=stage_rule,
+                    stage_label=task.LABELS[task.stage_of(fresh)] if stage_rule else "",
+                    model=model,
                 )
                 service.append(verdict)
                 rejected_by = verdict.get("defended") or []
@@ -1159,6 +1166,9 @@ async def autopilot_run(
 class TaskPatch(BaseModel):
     mode: str | None = None
     stage: str | None = None
+    # Отметки условий перехода: {"plan_approved": true}. Отдельное действие —
+    # отметить условие значит утвердить работу предыдущего этапа.
+    guards: dict[str, bool] | None = None
     paused: bool | None = None
     auto: bool | None = None
     autopilot: bool | None = None
@@ -1187,6 +1197,8 @@ def _task_view(conversation: dict) -> dict:
         "updated_at": conversation["task_updated_at"],
         "stages": [{"id": st, "label": task.LABELS[st]} for st in db.STAGES],
         "allowed": list(task.allowed(stage)),
+        "guards": task.guards(conversation),
+        "blocked": {st: task.blocked(conversation, st) for st in task.allowed(stage)},
         "tokens": (task.describe(conversation) or {}).get("tokens", 0),
         "events": db.list_task_events(conversation["id"]),
     }
@@ -1224,6 +1236,13 @@ async def task_set(
     except ValueError as err:
         raise HTTPException(400, str(err)) from err
 
+    if payload.guards:
+        for guard, value in payload.guards.items():
+            try:
+                conversation = db.set_task_guard(conversation_id, user["id"], guard, value)
+            except ValueError as err:
+                raise HTTPException(400, str(err)) from err
+
     if payload.paused is not None:
         conversation = db.set_task_pause(
             conversation_id, user["id"], payload.paused, note=payload.note
@@ -1241,6 +1260,9 @@ async def task_set(
                     f"не разрешён. Отсюда можно: "
                     f"{', '.join(task.LABELS[st] for st in task.allowed(current)) or 'никуда'}.",
                 )
+            # Условие входа обязательно для всех: и для кнопки, и для API.
+            if reason := task.blocked(conversation, payload.stage):
+                raise HTTPException(400, reason[0].upper() + reason[1:] + ".")
             conversation = db.set_task_stage(
                 conversation_id, user["id"], payload.stage, note=payload.note
             )

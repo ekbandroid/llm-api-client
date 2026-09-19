@@ -97,6 +97,10 @@ def describe(project: dict | None, items: list[dict]) -> dict:
 
 # ---------- проверка ответа ----------
 
+# Ревизор проверяет две пары правил сразу: инварианты проекта и правило
+# текущего этапа. Один вызов вместо двух — и по цене, и по месту в чате.
+STAGE_VIOLATION = "ЭТАП"
+
 JUDGE_SYSTEM = (
     "Ты проверяешь ответ ассистента на соблюдение инвариантов проекта. "
     "Нарушение — только когда ответ ПРЕДЛАГАЕТ, СОВЕТУЕТ или РЕАЛИЗУЕТ решение, "
@@ -105,6 +109,10 @@ JUDGE_SYSTEM = (
     "нарушением НЕ считается: «Redis брать не буду» — не нарушение.\n"
     "Отдельно отметь инварианты, по которым ответ ОТКАЗАЛ: пользователь просил "
     "то, что противоречит правилу, а ответ отклонил это со ссылкой на правило.\n"
+    "Если дано правило текущего этапа задачи, проверь и его: ответ, сделавший "
+    "работу следующего этапа — выдал реализацию на этапе планирования, объявил "
+    "задачу законченной мимо проверки, начал новую работу на проверке, — это "
+    f'нарушение с id "{STAGE_VIOLATION}". Отказ сделать это нарушением не считается.\n'
     "Верни ТОЛЬКО json-объект: "
     '{"violations": [{"id": "INV-N", "quote": "<короткий фрагмент ответа>", '
     '"why": "<чем противоречит>"}], "defended": ["INV-N"]}. '
@@ -112,12 +120,16 @@ JUDGE_SYSTEM = (
 )
 
 
-def check(items: list[dict], request: str, answer: str, *, model: str | None = None) -> dict:
-    """Судья: нарушает ли ответ инварианты и по каким из них был отказ."""
+def check(
+    items: list[dict], request: str, answer: str, *,
+    stage_rule: str = "", stage_label: str = "", model: str | None = None,
+) -> dict:
+    """Судья: нарушает ли ответ инварианты и правило этапа, где был отказ."""
     known = {code(i): i for i in items}
     user_part = (
-        f"Инварианты:\n{listing(items)}\n\n"
-        f"Запрос пользователя:\n{request}\n\n"
+        (f"Инварианты:\n{listing(items)}\n\n" if items else "Инвариантов у проекта нет.\n\n")
+        + (f"Правило текущего этапа «{stage_label}»:\n{stage_rule}\n\n" if stage_rule else "")
+        + f"Запрос пользователя:\n{request}\n\n"
         f"Ответ ассистента:\n{answer}"
     )
     result = llm.complete(
@@ -130,7 +142,7 @@ def check(items: list[dict], request: str, answer: str, *, model: str | None = N
     )
     info = {
         "kind": "invariants",
-        "count": len(items),
+        "count": len(items) + (1 if stage_rule else 0),
         "cost_tokens": result.total_tokens,
         "request": result.request,
         "response": result.response,
@@ -145,14 +157,21 @@ def check(items: list[dict], request: str, answer: str, *, model: str | None = N
     # а красная пометка о несуществующем правиле хуже, чем никакой.
     violations = []
     for v in verdict.get("violations") or []:
-        inv = known.get(str(v.get("id", "")).upper())
-        if inv:
+        name = str(v.get("id", "")).upper()
+        quote = (v.get("quote") or "").strip()[:300]
+        why = (v.get("why") or "").strip()[:300]
+        if name == STAGE_VIOLATION and stage_rule:
+            violations.append({
+                "id": STAGE_VIOLATION, "category": "жизненный цикл",
+                "rule": f"этап «{stage_label}»", "quote": quote, "why": why,
+            })
+        elif inv := known.get(name):
             violations.append({
                 "id": code(inv),
                 "category": LABELS[inv["category"]],
                 "rule": inv["rule"],
-                "quote": (v.get("quote") or "").strip()[:300],
-                "why": (v.get("why") or "").strip()[:300],
+                "quote": quote,
+                "why": why,
             })
     defended = [c for c in (str(d).upper() for d in verdict.get("defended") or []) if c in known]
     return {**info, "ok": True, "violations": violations, "defended": defended}

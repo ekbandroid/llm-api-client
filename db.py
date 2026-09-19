@@ -1,5 +1,6 @@
 """Хранилище пользователей на SQLite."""
 
+import json
 import os
 import sqlite3
 from datetime import datetime, timezone
@@ -203,6 +204,10 @@ MIGRATIONS = {
         # этапы сама. Лимит ходов — предохранитель от бесконечного цикла.
         "task_autopilot": "INTEGER NOT NULL DEFAULT 0",
         "task_max_turns": "INTEGER NOT NULL DEFAULT 8",
+        # Условия входа в этап: без отметки вперёд не пускают никого.
+        "guard_plan_approved": "INTEGER NOT NULL DEFAULT 0",
+        "guard_result_ready": "INTEGER NOT NULL DEFAULT 0",
+        "guard_validation_passed": "INTEGER NOT NULL DEFAULT 0",
     },
 }
 
@@ -971,9 +976,31 @@ TASK_MODES = (CHAT_MODE, TASK_MODE)
 
 PLANNING, EXECUTION, VALIDATION, DONE = "planning", "execution", "validation", "done"
 STAGES = (PLANNING, EXECUTION, VALIDATION, DONE)
+STAGE_LABELS = {
+    PLANNING: "планирование",
+    EXECUTION: "выполнение",
+    VALIDATION: "проверка",
+    DONE: "готово",
+}
 
 USER_ACTOR, ASSISTANT_ACTOR = "user", "assistant"
 ACTORS = (USER_ACTOR, ASSISTANT_ACTOR)
+
+# Условие входа в этап. Ключ — название условия, значение — этап, который оно
+# открывает. Сама таблица переходов живёт в task.py, здесь только хранение.
+PLAN_APPROVED, RESULT_READY, VALIDATION_PASSED = (
+    "plan_approved", "result_ready", "validation_passed")
+GUARD_STAGE = {
+    PLAN_APPROVED: EXECUTION,
+    RESULT_READY: VALIDATION,
+    VALIDATION_PASSED: DONE,
+}
+GUARD_COLUMN = {name: f"guard_{name}" for name in GUARD_STAGE}
+GUARD_LABELS = {
+    PLAN_APPROVED: "план утверждён",
+    RESULT_READY: "результат предъявлен",
+    VALIDATION_PASSED: "проверка пройдена",
+}
 
 STEP_LIMIT = 500
 
@@ -1039,6 +1066,32 @@ def update_task(
     return get_conversation(conversation_id, user_id) if cur.rowcount else None
 
 
+def set_task_guard(
+    conversation_id: int, user_id: int, guard: str, value: bool, *,
+    note: str | None = None, author: str = "user",
+) -> dict | None:
+    """Отмечает или снимает условие перехода. Отдельное действие, не побочный
+    эффект переключения этапа: отметка — это и есть акт утверждения."""
+    if guard not in GUARD_STAGE:
+        raise ValueError(f"Неизвестное условие: {guard}")
+    conversation = get_conversation(conversation_id, user_id)
+    if conversation is None:
+        return None
+
+    with connect() as conn:
+        conn.execute(
+            f"UPDATE conversations SET {GUARD_COLUMN[guard]} = ?, task_updated_at = ?"
+            " WHERE id = ? AND user_id = ?",
+            (int(value), _now(), conversation_id, user_id),
+        )
+        _add_task_event(
+            conn, conversation_id, "guard", GUARD_STAGE[guard],
+            note=note or (GUARD_LABELS[guard] if value else f"снято: {GUARD_LABELS[guard]}"),
+            author=author,
+        )
+    return get_conversation(conversation_id, user_id)
+
+
 def set_task_stage(
     conversation_id: int, user_id: int, stage: str, *,
     note: str | None = None, author: str = "user",
@@ -1054,12 +1107,43 @@ def set_task_stage(
     if conversation is None:
         return None
 
+    # Возврат назад снимает условия своего этапа и всех последующих: иначе
+    # можно было бы вернуться к планированию и тут же прыгнуть вперёд по
+    # старой отметке, хотя план уже переделывают.
+    back_to = STAGES.index(stage)
+    cleared = [
+        name for name, opens in GUARD_STAGE.items()
+        if STAGES.index(opens) > back_to and conversation[GUARD_COLUMN[name]]
+    ] if back_to < STAGES.index(conversation["task_stage"]) else []
+
     with connect() as conn:
         conn.execute(
             "UPDATE conversations SET task_stage = ?, task_updated_at = ?"
             " WHERE id = ? AND user_id = ?",
             (stage, _now(), conversation_id, user_id),
         )
+        # Отметка в самой переписке. Блока состояния мало: в истории остаются
+        # реплики, сказанные на прежнем этапе, и модель повторяла «сейчас этап
+        # планирования», когда задача уже была в выполнении.
+        if conversation["task_stage"] != stage:
+            conn.execute(
+                "INSERT INTO messages (conversation_id, role, content, reasoning,"
+                " tokens_completion, tokens_total, meta, created_at)"
+                " VALUES (?, 'system', ?, NULL, 0, 0, ?, ?)",
+                (conversation_id,
+                 f"Этап задачи изменён: {STAGE_LABELS[conversation['task_stage']]} → "
+                 f"{STAGE_LABELS[stage]}.",
+                 json.dumps({"stage_change": {"from": conversation["task_stage"], "to": stage,
+                                              "author": author}}, ensure_ascii=False),
+                 _now()),
+            )
+        for name in cleared:
+            conn.execute(
+                f"UPDATE conversations SET {GUARD_COLUMN[name]} = 0 WHERE id = ?",
+                (conversation_id,),
+            )
+            _add_task_event(conn, conversation_id, "guard", GUARD_STAGE[name],
+                            note=f"снято возвратом: {GUARD_LABELS[name]}", author=author)
         # Заведение задачи — это не переход «этап → тот же этап»: у первого
         # события предыдущего этапа нет, и журнал показывает его как начало.
         previous = conversation["task_stage"]

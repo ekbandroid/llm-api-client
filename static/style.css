@@ -349,6 +349,24 @@ td.actions button { margin-left: 6px; }
 .event .what { flex: 1 1 0; min-width: 0; overflow-wrap: anywhere; }
 .event.model .what { color: var(--text); }
 
+/* Отметка о смене этапа внутри переписки. */
+.stagechange {
+  margin: 10px auto; padding: 4px 12px; border-radius: 12px; width: fit-content;
+  font-size: 12px; color: var(--muted); border: 1px dashed var(--border);
+}
+
+/* ---------- условия перехода ---------- */
+.guards { display: flex; flex-direction: column; gap: 4px; margin: 0 0 12px; }
+.guard {
+  display: flex; align-items: center; gap: 8px; font-size: 12.5px;
+  color: var(--muted); margin: 0; cursor: pointer;
+}
+.guard input { margin: 0; }
+.guard.met { color: var(--text); }
+/* Условие следующего этапа — то, чего ждут прямо сейчас. */
+.guard.next .guardlabel { font-weight: 600; }
+.guard .guardopens { margin-left: auto; font-family: var(--mono); font-size: 11px; opacity: .7; }
+
 /* ---------- инварианты ---------- */
 .inv { border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; margin-bottom: 8px; }
 .inv.off { opacity: .55; }

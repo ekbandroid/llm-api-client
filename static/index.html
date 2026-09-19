@@ -166,6 +166,7 @@
         <fieldset>
           <legend>Этап</legend>
           <div class="stages" id="taskStages"></div>
+          <div class="guards" id="taskGuards"></div>
           <div class="stagebtns">
             <button id="taskBack" class="ghost small">← Назад</button>
             <button id="taskNext" class="ghost small">Дальше →</button>
@@ -851,10 +852,14 @@ function renderTask() {
     chain.appendChild(item);
   });
 
+  renderGuards();
+
   // «Дальше» и «Назад» — это разрешённые переходы вперёд и назад по цепочке
   const forward = taskState.allowed.find(st => STAGE_ORDER.indexOf(st) > here);
   const backward = taskState.allowed.find(st => STAGE_ORDER.indexOf(st) < here);
-  $("taskNext").disabled = !forward;
+  // Вперёд не пускают без отметки условия — ни человека, ни модель.
+  const blocked = forward ? taskState.blocked[forward] : null;
+  $("taskNext").disabled = !forward || !!blocked;
   $("taskBack").disabled = !backward;
   $("taskNext").textContent = forward ? `${STAGE_LABELS[forward]} →` : "Дальше →";
   $("taskBack").textContent = backward ? `← ${STAGE_LABELS[backward]}` : "← Назад";
@@ -864,6 +869,8 @@ function renderTask() {
   $("taskPause").textContent = taskState.paused ? "▶ Продолжить" : "⏸ Пауза";
   $("taskStageHint").textContent = taskState.paused
     ? "Задача на паузе: на следующее сообщение агент только подтвердит, на чём остановились."
+    : blocked
+    ? blocked[0].toUpperCase() + blocked.slice(1) + "."
     : `Отсюда можно: ${taskState.allowed.map(st => STAGE_LABELS[st]).join(", ") || "никуда"}.`;
 
   $("taskStep").value = taskState.step;
@@ -876,6 +883,26 @@ function renderTask() {
   badge.className = "taskbadge" + (taskState.paused ? " paused" : "");
   badge.textContent = `Задача: ${STAGE_LABELS[taskState.stage]}` +
                       (taskState.paused ? " · на паузе" : "");
+}
+
+/** Чек-лист условий: отметка — отдельное действие, а не побочный эффект. */
+function renderGuards() {
+  const box = $("taskGuards");
+  box.innerHTML = "";
+  const here = STAGE_ORDER.indexOf(taskState.stage);
+  for (const guard of taskState.guards) {
+    const next = STAGE_ORDER.indexOf(guard.opens) === here + 1;
+    const row = el("label", "guard" + (guard.met ? " met" : "") + (next ? " next" : ""));
+    const box2 = el("input");
+    box2.type = "checkbox";
+    box2.checked = guard.met;
+    box2.disabled = !!taskState.paused;
+    box2.onchange = () => patchTask({ guards: { [guard.id]: box2.checked } });
+    row.appendChild(box2);
+    row.appendChild(el("span", "guardlabel", guard.label));
+    row.appendChild(el("span", "guardopens", `→ ${guard.opens_label}`));
+    box.appendChild(row);
+  }
 }
 
 function renderTaskEvents(events) {
@@ -895,6 +922,8 @@ function renderTaskEvents(events) {
       what = e.from_stage
         ? `${STAGE_LABELS[e.from_stage]} → ${STAGE_LABELS[e.stage]}`
         : `задача заведена: ${STAGE_LABELS[e.stage]}`;
+    } else if (e.kind === "guard") {
+      what = "условие";
     } else if (e.kind === "pause") {
       what = `пауза на этапе «${STAGE_LABELS[e.stage]}»`;
     } else {
@@ -1196,8 +1225,9 @@ function serviceText(info) {
   if (info.kind === "invariants") {
     if (info.ok === false) return `Проверка инвариантов не удалась: ${info.reason}.`;
     if (info.violations && info.violations.length) {
-      return info.violations.map(v =>
-        `Нарушен ${v.id} [${v.category}]: «${v.quote}» — ${v.why}`).join(" ") +
+      return info.violations.map(v => v.id === "ЭТАП"
+        ? `Ответ забежал вперёд (${v.rule}): «${v.quote}» — ${v.why}`
+        : `Нарушен ${v.id} [${v.category}]: «${v.quote}» — ${v.why}`).join(" ") +
         ` (проверка стоила ${info.cost_tokens} токенов).`;
     }
     return "Проверка инвариантов: нарушений нет" +
@@ -1214,7 +1244,9 @@ function serviceText(info) {
   if (info.kind === "task") {
     if (info.moved) {
       return `Этап: ${STAGE_LABELS[info.from_stage]} → ${STAGE_LABELS[info.stage]} — ` +
-             `${info.reason} (переключение стоило ${info.cost_tokens} токенов).`;
+             `${info.reason}` +
+             (info.guard_label ? `; модель отметила условие «${info.guard_label}»` : "") +
+             ` (переключение стоило ${info.cost_tokens} токенов).`;
     }
     if (info.rejected) return `Переход отклонён: ${info.rejected}. Этап остался прежним.`;
     if (info.ok === false) return `Состояние задачи не обновлено: ${info.reason}.`;
@@ -1352,6 +1384,13 @@ function statsLine(m) {
 
 /** Сообщение, поднятое из базы, — со всей сохранённой телеметрией. */
 function renderStored(m) {
+  // Отметка о смене этапа — не реплика собеседника, а событие задачи.
+  if (m.role === "system") {
+    const note = el("div", "stagechange", m.content);
+    if (log.querySelector(".empty")) log.innerHTML = "";
+    log.appendChild(note);
+    return;
+  }
   if (m.role === "user" && m.meta && m.meta.simulated) {
     simulatedMessage({ ...m.meta, text: m.content });
     return;
