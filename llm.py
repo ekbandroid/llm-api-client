@@ -179,7 +179,7 @@ def describe_request(payload: dict) -> dict:
     }
 
 
-def describe_response(body: dict, *, streamed: bool = False) -> dict:
+def describe_response(body: dict, *, streamed: bool = False, chunks: int = 0) -> dict:
     """Ответ API без самого текста ответа.
 
     Текст уже отрисован пользователю выше, повторять его в JSON незачем —
@@ -194,16 +194,46 @@ def describe_response(body: dict, *, streamed: bool = False) -> dict:
                 continue
             for field in ("content", "reasoning_content"):
                 value = part.get(field)
-                # Пустую строку оставляем как есть: в последнем куске потока
-                # текста и правда нет, подпись «0 символов» только путала бы.
+                # Пустую строку оставляем как есть: в куске потока текста и
+                # правда нет, подпись «0 символов» только путала бы.
                 if isinstance(value, str) and value:
                     part[field] = f"<{len(value)} символов, показано выше>"
     if streamed:
         trimmed["примечание"] = (
-            "последний кусок потока: ответ пришёл частями, "
-            "usage и finish_reason приходят в самом конце"
+            f"собрано приложением из {chunks} кусков потока: по отдельности "
+            "каждый кусок несёт несколько символов текста, а usage и "
+            "finish_reason приходят только в последнем"
         )
     return trimmed
+
+
+def assemble_stream(
+    header: dict, *, content: str, reasoning: str, finish_reason: str, usage: dict,
+) -> dict:
+    """Склеивает куски потока в ответ того же вида, что приходит без потока.
+
+    Показывать последний кусок бессмысленно: в нём пустой delta.content и
+    служебные поля, по которым не видно ни самого ответа, ни его длины.
+    Показывать все куски тоже нельзя — их сотни. Поэтому собираем один объект:
+    поля берём из первого куска, текст и причину остановки — накопленные.
+    """
+    message: dict = {"role": "assistant", "content": content}
+    if reasoning:
+        message["reasoning_content"] = reasoning
+    return {
+        "id": header.get("id"),
+        "object": "chat.completion",
+        "created": header.get("created"),
+        "model": header.get("model"),
+        "system_fingerprint": header.get("system_fingerprint"),
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "logprobs": None,
+            "finish_reason": finish_reason,
+        }],
+        "usage": usage,
+    }
 
 
 def _headers() -> dict:
@@ -275,7 +305,12 @@ async def stream(
     started = time.monotonic()
     finish_reason = "unknown"
     usage: dict = {}
-    last_chunk: dict = {}
+    # Куски потока копим не целиком: для показа нужны служебные поля первого
+    # куска, накопленный текст и счёт кусков.
+    header: dict = {}
+    chunks = 0
+    content_parts: list[str] = []
+    reasoning_parts: list[str] = []
 
     try:
         limits = httpx.Timeout(timeout, connect=CONNECT_TIMEOUT, read=STALL_TIMEOUT)
@@ -320,7 +355,9 @@ async def stream(
                     except json.JSONDecodeError:
                         continue
 
-                    last_chunk = chunk
+                    chunks += 1
+                    if not header:
+                        header = chunk
                     if chunk.get("usage"):
                         usage = chunk["usage"]
                     for choice in chunk.get("choices") or []:
@@ -329,17 +366,29 @@ async def stream(
                         delta = choice.get("delta") or {}
                         if reasoning := delta.get("reasoning_content"):
                             produced = True
+                            reasoning_parts.append(reasoning)
                             yield {"type": "reasoning", "text": reasoning}
                         if content := delta.get("content"):
                             produced = True
+                            content_parts.append(content)
                             yield {"type": "content", "text": content}
     except httpx.HTTPError as err:
         raise LLMError(
             _network_message(err), diagnostics=_network_diagnostics(err, timeout)
         ) from err
 
-    if last_chunk:
-        yield {"type": "response", "response": describe_response(last_chunk, streamed=True)}
+    if header:
+        assembled = assemble_stream(
+            header,
+            content="".join(content_parts),
+            reasoning="".join(reasoning_parts),
+            finish_reason=finish_reason,
+            usage=usage,
+        )
+        yield {
+            "type": "response",
+            "response": describe_response(assembled, streamed=True, chunks=chunks),
+        }
 
     yield {
         "type": "done",
