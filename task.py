@@ -1,0 +1,279 @@
+"""Состояние задачи как конечный автомат: этап, шаг, ожидаемое действие, пауза.
+
+Память отвечает на вопрос «что мы знаем», состояние — «где мы сейчас в работе».
+Это разные вещи, поэтому и модуль отдельный от memory.py.
+
+Автомат здесь настоящий, а не подпись к диалогу: переходы разрешены только по
+цепочке, и запрос на прыжок «планирование → готово» отклоняется — кем бы он ни
+был предложен, человеком через API или моделью в автоматическом режиме.
+
+Пауза — ортогональный флаг, а не пятый этап. Разница между паузой и ожиданием
+ответа видна в одном месте: что агент делает, когда придёт следующее сообщение.
+Ожидание — норма хода, работа идёт; на паузе работа приостановлена, и агент
+обязан не продолжать.
+"""
+
+import json
+
+import db
+import llm
+import tokens as tokens_mod
+
+LABELS = {
+    db.PLANNING: "планирование",
+    db.EXECUTION: "выполнение",
+    db.VALIDATION: "проверка",
+    db.DONE: "готово",
+}
+CHAIN = " → ".join(LABELS.values())
+
+# Разрешённые переходы. Назад — не «отмена», а нормальная часть работы:
+# план оказался негодным, проверка не прошла, готовую задачу вернули в работу.
+TRANSITIONS = {
+    db.PLANNING: (db.EXECUTION,),
+    db.EXECUTION: (db.VALIDATION, db.PLANNING),
+    db.VALIDATION: (db.DONE, db.EXECUTION),
+    db.DONE: (db.EXECUTION,),
+}
+
+# Ради этих инструкций состояние и существует: без них этап остаётся подписью,
+# которая ни на что не влияет.
+STAGE_RULES = {
+    db.PLANNING: (
+        "Этап планирования: уточняй непонятное, предлагай план по шагам и жди "
+        "его утверждения. К реализации не переходи, пока план не принят."
+    ),
+    db.EXECUTION: (
+        "Этап выполнения: работай по утверждённому плану, не возвращайся к его "
+        "обсуждению без запроса, отмечай, какой шаг закрыт."
+    ),
+    db.VALIDATION: (
+        "Этап проверки: сверяй результат с планом, ищи расхождения и предлагай "
+        "правки. Новую работу не начинай."
+    ),
+    db.DONE: (
+        "Задача завершена: отвечай кратко и справочно. Если просят продолжать — "
+        "скажи, что задачу нужно вернуть в работу."
+    ),
+}
+
+PAUSED_RULE = (
+    "Задача на паузе. Остановись: коротко подтверди, на чём остановились — "
+    "этап и текущий шаг, — и жди возобновления. Работу не продолжай и по "
+    "существу задачи не отвечай."
+)
+
+ACTOR_LABELS = {db.USER_ACTOR: "пользователя", db.ASSISTANT_ACTOR: "ассистента"}
+
+
+def paused_reply(conversation: dict) -> str:
+    """Ответ на сообщение в паузу — его формирует приложение, а не модель.
+
+    Проверено на живой модели: одной инструкции в системном блоке мало. Стоит
+    пользователю написать «продолжай», и модель продолжает работу, потому что
+    прямая просьба в последнем сообщении перевешивает указание в системном
+    блоке. Пауза — правило, а правила соблюдает код: к API мы просто не идём.
+    Заодно это ничего не стоит и отвечает мгновенно.
+    """
+    stage = stage_of(conversation)
+    lines = [f"Задача на паузе. Остановились на этапе «{LABELS[stage]}»."]
+    if step := (conversation.get("task_step") or "").strip():
+        lines.append(f"Текущий шаг: {step}")
+    if expected := (conversation.get("task_expected") or "").strip():
+        actor = ACTOR_LABELS.get(conversation.get("task_actor") or db.USER_ACTOR, "пользователя")
+        lines.append(f"Ожидается: {expected} — ход {actor}.")
+    lines.append(
+        "Сообщение сохранено в диалоге. Работа продолжится после нажатия "
+        "«Продолжить» во вкладке «Задача»."
+    )
+    return "\n\n".join(lines)
+
+
+def is_paused(conversation: dict) -> bool:
+    """Приостановлена ли задача. Для обычного чата — всегда нет."""
+    return is_task(conversation) and bool(conversation.get("task_paused"))
+
+
+def is_task(conversation: dict) -> bool:
+    """Включён ли у диалога режим задачи."""
+    return (conversation.get("task_mode") or db.CHAT_MODE) == db.TASK_MODE
+
+
+def stage_of(conversation: dict) -> str:
+    return conversation.get("task_stage") or db.PLANNING
+
+
+def allowed(stage: str) -> tuple:
+    """Куда можно уйти с этого этапа."""
+    return TRANSITIONS.get(stage, ())
+
+
+def can_move(from_stage: str, to_stage: str) -> bool:
+    return to_stage in allowed(from_stage)
+
+
+def state_text(conversation: dict) -> str:
+    """Текст блока состояния для запроса."""
+    stage = stage_of(conversation)
+    parts = [f"Состояние задачи. Этап: {LABELS[stage]} ({CHAIN})."]
+
+    if step := (conversation.get("task_step") or "").strip():
+        parts.append(f"Текущий шаг: {step}")
+
+    expected = (conversation.get("task_expected") or "").strip()
+    actor = ACTOR_LABELS.get(conversation.get("task_actor") or db.USER_ACTOR, "пользователя")
+    if expected:
+        parts.append(f"Сейчас ход {actor}, ожидается: {expected}")
+    else:
+        parts.append(f"Сейчас ход {actor}.")
+
+    # Правило паузы важнее правила этапа: оно отменяет работу целиком.
+    parts.append(PAUSED_RULE if conversation.get("task_paused") else STAGE_RULES[stage])
+    return "\n".join(parts)
+
+
+def blocks(conversation: dict) -> list[dict]:
+    """System-сообщение с состоянием — только для диалогов в режиме задачи."""
+    if not is_task(conversation):
+        return []
+    return [{"role": "system", "content": state_text(conversation)}]
+
+
+def describe(conversation: dict) -> dict:
+    """Что состояние добавило к запросу — для интерфейса и meta сообщения."""
+    if not is_task(conversation):
+        return {}
+    text = state_text(conversation)
+    return {
+        "stage": stage_of(conversation),
+        "label": LABELS[stage_of(conversation)],
+        "paused": bool(conversation.get("task_paused")),
+        "auto": bool(conversation.get("task_auto")),
+        "tokens": tokens_mod.estimate_tokens(text),
+    }
+
+
+# ---------- автоматическое переключение ----------
+#
+# Служебный запрос после ответа. В него уходит не вся переписка (на длинном
+# диалоге это тысячи токенов), а состояние, карточка фактов и последний обмен:
+# карточка уже хранит цель, договорённости и принятые решения, то есть
+# согласованный план в сжатом виде.
+
+SWITCH_SYSTEM = (
+    "Ты следишь за состоянием задачи и не участвуешь в разговоре. Тебе дают "
+    "текущее состояние, известные факты и последний обмен репликами. Верни "
+    "ТОЛЬКО json-объект вида "
+    '{"stage": "<этап или null>", "step": "<текущий шаг>", '
+    '"expected": "<ожидаемое действие>", "actor": "user|assistant", '
+    '"reason": "<коротко, почему переход>"}.\n'
+    "Этапы: planning → execution → validation → done.\n"
+    "Переход засчитывается только по признаку:\n"
+    "- planning → execution: план сформулирован по шагам И пользователь его "
+    "принял (явное согласие либо он сам перешёл к деталям реализации);\n"
+    "- execution → validation: все шаги плана закрыты, результат предъявлен;\n"
+    "- execution → planning: план оказался негодным — новое требование или "
+    "противоречие;\n"
+    "- validation → done: проверка проведена, расхождений нет либо они "
+    "исправлены и приняты;\n"
+    "- validation → execution: найдены расхождения, которые надо править;\n"
+    "- done → execution: пользователь просит доработать.\n"
+    "Если признака нет или есть сомнение — верни \"stage\": null. Остаться "
+    "дешевле, чем откатывать ошибочный переход.\n"
+    "Переход назад засчитывается только по сигналу от пользователя, а не по "
+    "рассуждению ассистента.\n"
+    "Поля step, expected и actor заполняй всегда по последнему обмену, даже "
+    "когда этап не меняется. Без непустого reason переход не будет принят."
+)
+
+
+def _parse(text: str) -> dict | None:
+    """Разбирает ответ переключателя. Не JSON — значит, состояние не трогаем."""
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.strip("`").removeprefix("json").strip()
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def refresh(conversation: dict, exchange: list[dict], *, model: str | None = None) -> dict | None:
+    """Обновляет состояние по последнему обмену. Возвращает сведения или None.
+
+    Возвращает None, когда переключатель не должен работать вовсе: обычный чат,
+    ручной режим или пауза. Пауза — именно остановка: пока она стоит, этапы не
+    двигаются, и снимать её может только человек.
+    """
+    if not is_task(conversation) or not conversation.get("task_auto"):
+        return None
+    if conversation.get("task_paused"):
+        return None
+    if not exchange:
+        return None
+
+    stage = stage_of(conversation)
+    transcript = "\n".join(
+        f"{'Пользователь' if m['role'] == 'user' else 'Ассистент'}: {m['content']}"
+        for m in exchange
+    )
+    facts = conversation.get("facts") or ""
+    user_part = (
+        f"Этап: {stage}\n"
+        f"Текущий шаг: {conversation.get('task_step') or '(не задан)'}\n"
+        f"Ожидается: {conversation.get('task_expected') or '(не задано)'}\n"
+        f"Чей ход: {conversation.get('task_actor') or db.USER_ACTOR}\n"
+        f"Допустимые переходы отсюда: {', '.join(allowed(stage)) or 'нет'}\n\n"
+        + (f"Известные факты: {facts}\n\n" if facts else "")
+        + f"Последний обмен:\n{transcript}"
+    )
+
+    result = llm.complete(
+        [{"role": "system", "content": SWITCH_SYSTEM},
+         {"role": "user", "content": user_part}],
+        model=model, thinking=False, max_tokens=400,
+        response_format={"type": db.JSON_FORMAT},
+    )
+    parsed = _parse(result.content)
+    if parsed is None:
+        return {"ok": False, "reason": "ответ переключателя не разобран как JSON",
+                "cost_tokens": result.total_tokens}
+
+    info = {
+        "ok": True,
+        "cost_tokens": result.total_tokens,
+        "from_stage": stage,
+        "stage": stage,
+        "moved": False,
+        "reason": (parsed.get("reason") or "").strip(),
+    }
+
+    # Шаг, ожидаемое действие и чей ход обновляем всегда: именно свежесть
+    # этих полей избавляет от повторных объяснений после паузы.
+    step = (parsed.get("step") or "").strip()
+    expected = (parsed.get("expected") or "").strip()
+    actor = parsed.get("actor") if parsed.get("actor") in db.ACTORS else None
+    if step or expected or actor:
+        db.update_task(
+            conversation["id"], conversation["user_id"],
+            step=step or None, expected=expected or None, actor=actor,
+        )
+        info.update(step=step, expected=expected, actor=actor)
+
+    proposed = parsed.get("stage")
+    if not proposed or proposed == stage:
+        return info
+
+    # Выбор перехода модели доверяем, соблюдение правил — нет.
+    if not can_move(stage, proposed):
+        info["rejected"] = f"переход {stage} → {proposed} недопустим"
+        return info
+    if not info["reason"]:
+        info["rejected"] = "переход без причины"
+        return info
+
+    db.set_task_stage(conversation["id"], conversation["user_id"], proposed,
+                      note=info["reason"], author="model")
+    info.update(stage=proposed, moved=True)
+    return info

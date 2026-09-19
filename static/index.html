@@ -33,6 +33,9 @@
   <button class="railbtn" data-tab="memory" title="Память агента" aria-label="Память">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>
   </button>
+  <button class="railbtn" data-tab="task" title="Состояние задачи" aria-label="Задача">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+  </button>
   <button class="railbtn" data-tab="tokens" title="Расход токенов" aria-label="Токены">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>
   </button>
@@ -120,6 +123,52 @@
     </div>
   </section>
 
+  <section class="tab" data-tab="task">
+    <div class="tabhead"><span>Задача</span><span class="grow"></span><button class="hide" title="Свернуть панель">‹</button></div>
+    <div class="tabbody">
+      <fieldset>
+        <legend>Режим</legend>
+        <label><span>Режим диалога</span><select id="taskMode">
+          <option value="chat">Обычный чат</option>
+          <option value="task">Задача</option>
+        </select></label>
+        <label><span>Переключение этапов</span><select id="taskAuto">
+          <option value="0">Вручную</option>
+          <option value="1">Автоматически</option>
+        </select></label>
+        <div class="hint" id="taskModeHint"></div>
+      </fieldset>
+
+      <div id="taskBox" hidden>
+        <fieldset>
+          <legend>Этап</legend>
+          <div class="stages" id="taskStages"></div>
+          <div class="stagebtns">
+            <button id="taskBack" class="ghost small">← Назад</button>
+            <button id="taskNext" class="ghost small">Дальше →</button>
+            <button id="taskPause" class="ghost small">⏸ Пауза</button>
+          </div>
+          <div class="hint" id="taskStageHint"></div>
+        </fieldset>
+
+        <fieldset>
+          <legend>Шаг и ожидание</legend>
+          <label><span>Текущий шаг</span><input type="text" id="taskStep" maxlength="500" placeholder="что делаем прямо сейчас"></label>
+          <label><span>Ожидается</span><input type="text" id="taskExpected" maxlength="500" placeholder="какое действие закроет этот шаг"></label>
+          <label><span>Чей ход</span><select id="taskActor">
+            <option value="user">Пользователя</option>
+            <option value="assistant">Ассистента</option>
+          </select></label>
+        </fieldset>
+
+        <fieldset>
+          <legend>Журнал</legend>
+          <div class="events" id="taskEvents"></div>
+        </fieldset>
+      </div>
+    </div>
+  </section>
+
   <section class="tab" data-tab="tokens">
     <div class="tabhead"><span>Расход токенов</span><span class="grow"></span><button class="hide" title="Свернуть панель">‹</button></div>
     <div class="tabbody">
@@ -132,6 +181,7 @@
 <main>
   <div class="convtitle" id="convTitle" hidden>
     <b>Диалог:</b><input type="text" id="titleInput" maxlength="60">
+    <span class="taskbadge" id="taskBadge" hidden></span>
   </div>
   <div id="log"><div class="empty">Создайте диалог или напишите сообщение — диалог заведётся сам.</div></div>
   <form id="form" class="composer">
@@ -148,6 +198,7 @@ const $ = id => document.getElementById(id);
 const log = $("log");
 let conversations = [], projects = [], current = null, busy = false;
 let currentProject = null, currentProfile = null;
+let taskState = null, taskTokens = 0;
 // Название проекта вводится прямо в списке: модальное окно ради одной строки —
 // лишний шаг, а на узкой панели ещё и теряет из виду сам список.
 let creatingProject = false, renamingProject = null;
@@ -464,6 +515,7 @@ function showEmpty() {
   log.appendChild(el("div", "empty", "Создайте диалог или напишите сообщение — диалог заведётся сам."));
   $("convTitle").hidden = true;
   showMemory(null);
+  loadTask(null);
 }
 
 async function openConversation(id) {
@@ -492,6 +544,7 @@ async function openConversation(id) {
   // и есть, и до присваивания их счётчик показывал бы ноль.
   showStrategy(current);
   showMemory(current);
+  loadTask(current);
   updateTokenStats();
   log.scrollTop = log.scrollHeight;
   renderList();
@@ -543,6 +596,152 @@ function parseFacts(raw) {
   try { const v = JSON.parse(raw); return v && typeof v === "object" ? v : {}; }
   catch { return {}; }
 }
+
+// ---------- вкладка «Задача» ----------
+//
+// Состояние — конечный автомат: этап, текущий шаг, ожидаемое действие и пауза.
+// Недопустимые переходы здесь просто недоступны кнопками; на сервере они
+// проверяются ещё раз, потому что интерфейс — не место для правил.
+
+const STAGE_LABELS = {
+  planning: "планирование", execution: "выполнение",
+  validation: "проверка", done: "готово",
+};
+const STAGE_ORDER = ["planning", "execution", "validation", "done"];
+
+async function loadTask(conv) {
+  if (!conv) { taskState = null; taskTokens = 0; renderTask(); return; }
+  const res = await fetch(`/api/conversations/${conv.id}/task`);
+  if (!res.ok) return;
+  taskState = await res.json();
+  renderTask();
+}
+
+async function patchTask(payload) {
+  if (!current) return;
+  const res = await fetch(`/api/conversations/${current.id}/task`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const info = await httpErrorResponse(res);
+    alert((info && info.detail) || `Не удалось изменить состояние (HTTP ${res.status})`);
+    await loadTask(current);
+    return;
+  }
+  taskState = await res.json();
+  renderTask();
+  updateTokenStats();
+}
+
+function renderTask() {
+  const box = $("taskBox");
+  const badge = $("taskBadge");
+  const controls = ["taskMode", "taskAuto", "taskStep", "taskExpected", "taskActor",
+                    "taskBack", "taskNext", "taskPause"];
+  for (const id of controls) $(id).disabled = !taskState;
+
+  if (!taskState) {
+    box.hidden = true;
+    badge.hidden = true;
+    taskTokens = 0;
+    $("taskModeHint").textContent = "Диалог не выбран.";
+    return;
+  }
+
+  $("taskMode").value = taskState.mode;
+  $("taskAuto").value = taskState.auto ? "1" : "0";
+  box.hidden = taskState.mode !== "task";
+  taskTokens = taskState.mode === "task" ? taskState.tokens : 0;
+
+  $("taskModeHint").textContent = taskState.mode !== "task"
+    ? "Обычный чат: состояние в запрос не уходит и служебных запросов нет."
+    : (taskState.auto
+        ? `Этап двигает модель после каждого обмена (примерно 300 токенов на обмен). Блок состояния — ~${taskState.tokens} токенов в каждом запросе.`
+        : `Этап переключается кнопками. Блок состояния — ~${taskState.tokens} токенов в каждом запросе.`);
+
+  if (taskState.mode !== "task") { badge.hidden = true; return; }
+
+  // цепочка этапов
+  const chain = $("taskStages");
+  chain.innerHTML = "";
+  const here = STAGE_ORDER.indexOf(taskState.stage);
+  STAGE_ORDER.forEach((id, i) => {
+    const item = el("span", "stage" + (i === here ? " on" : i < here ? " done" : ""));
+    item.appendChild(el("span", "dot"));
+    item.appendChild(el("span", "name", STAGE_LABELS[id]));
+    chain.appendChild(item);
+  });
+
+  // «Дальше» и «Назад» — это разрешённые переходы вперёд и назад по цепочке
+  const forward = taskState.allowed.find(st => STAGE_ORDER.indexOf(st) > here);
+  const backward = taskState.allowed.find(st => STAGE_ORDER.indexOf(st) < here);
+  $("taskNext").disabled = !forward;
+  $("taskBack").disabled = !backward;
+  $("taskNext").textContent = forward ? `${STAGE_LABELS[forward]} →` : "Дальше →";
+  $("taskBack").textContent = backward ? `← ${STAGE_LABELS[backward]}` : "← Назад";
+  $("taskNext").dataset.stage = forward || "";
+  $("taskBack").dataset.stage = backward || "";
+
+  $("taskPause").textContent = taskState.paused ? "▶ Продолжить" : "⏸ Пауза";
+  $("taskStageHint").textContent = taskState.paused
+    ? "Задача на паузе: на следующее сообщение агент только подтвердит, на чём остановились."
+    : `Отсюда можно: ${taskState.allowed.map(st => STAGE_LABELS[st]).join(", ") || "никуда"}.`;
+
+  $("taskStep").value = taskState.step;
+  $("taskExpected").value = taskState.expected;
+  $("taskActor").value = taskState.actor;
+
+  renderTaskEvents(taskState.events);
+
+  badge.hidden = false;
+  badge.className = "taskbadge" + (taskState.paused ? " paused" : "");
+  badge.textContent = `Задача: ${STAGE_LABELS[taskState.stage]}` +
+                      (taskState.paused ? " · на паузе" : "");
+}
+
+function renderTaskEvents(events) {
+  const box = $("taskEvents");
+  box.innerHTML = "";
+  if (!events.length) {
+    box.appendChild(el("div", "hint", "Событий пока нет."));
+    return;
+  }
+  for (const e of events) {
+    const row = el("div", "event" + (e.author === "model" ? " model" : ""));
+    row.appendChild(el("span", "when", new Date(e.created_at).toLocaleString("ru-RU", {
+      day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit",
+    })));
+    let what;
+    if (e.kind === "stage") {
+      what = e.from_stage
+        ? `${STAGE_LABELS[e.from_stage]} → ${STAGE_LABELS[e.stage]}`
+        : `задача заведена: ${STAGE_LABELS[e.stage]}`;
+    } else if (e.kind === "pause") {
+      what = `пауза на этапе «${STAGE_LABELS[e.stage]}»`;
+    } else {
+      what = `продолжено с этапа «${STAGE_LABELS[e.stage]}»`;
+    }
+    if (e.author === "model") what += " · модель";
+    if (e.note) what += ` — ${e.note}`;
+    row.appendChild(el("span", "what", what));
+    box.appendChild(row);
+  }
+}
+
+$("taskMode").addEventListener("change", () => patchTask({ mode: $("taskMode").value }));
+$("taskAuto").addEventListener("change", () => patchTask({ auto: $("taskAuto").value === "1" }));
+$("taskNext").addEventListener("click", () => {
+  if ($("taskNext").dataset.stage) patchTask({ stage: $("taskNext").dataset.stage });
+});
+$("taskBack").addEventListener("click", () => {
+  if ($("taskBack").dataset.stage) patchTask({ stage: $("taskBack").dataset.stage });
+});
+$("taskPause").addEventListener("click", () => patchTask({ paused: !taskState.paused }));
+$("taskStep").addEventListener("change", () => patchTask({ step: $("taskStep").value }));
+$("taskExpected").addEventListener("change", () => patchTask({ expected: $("taskExpected").value }));
+$("taskActor").addEventListener("change", () => patchTask({ actor: $("taskActor").value }));
 
 // ---------- вкладка «Память» ----------
 //
@@ -786,8 +985,12 @@ $("useProject").addEventListener("change", async () => {
 
 /** Строка о том, сколько памяти ушло в этот запрос. */
 function memoryLine(mem) {
-  if (!mem || (!mem.profile && !mem.project)) return null;
+  if (!mem || (!mem.profile && !mem.project && !mem.task)) return null;
   const parts = [];
+  if (mem.task) {
+    parts.push(`задача: ${STAGE_LABELS[mem.task.stage] || mem.task.stage}` +
+               (mem.task.paused ? " (на паузе)" : "") + ` ~${mem.task.tokens} токенов`);
+  }
   if (mem.profile) {
     parts.push(`профиль «${mem.profile.title}» ~${mem.profile.tokens} токенов` +
                (mem.profile.format === "json_object" ? ", ответ JSON-объектом" : ""));
@@ -807,7 +1010,8 @@ function updateTokenStats() {
   if (!current) { box.innerHTML = '<span>диалог не выбран</span>'; return; }
 
   const draft = $("prompt").value;
-  const memory = (current.use_profile ? profileTokens : 0) + (current.use_project ? projectTokens : 0);
+  const memory = (current.use_profile ? profileTokens : 0) +
+                 (current.use_project ? projectTokens : 0) + taskTokens;
   const next = estimateMessages(loadedTexts) + (draft ? estimateTokens(draft) + 4 : 0) + memory;
   const spent = loadedTotals;
 
@@ -1042,6 +1246,32 @@ async function send(text) {
           answerFormat = ((ev.memory || {}).profile || {}).format || "text";
           const line = memoryLine(ev.memory);
           if (line) box.appendChild(line);
+        } else if (ev.type === "task_state") {
+          const note = el("div", "hint");
+          note.style.marginTop = "8px";
+          if (ev.moved) {
+            note.textContent =
+              `Этап: ${STAGE_LABELS[ev.from_stage]} → ${STAGE_LABELS[ev.stage]} — ${ev.reason} ` +
+              `(переключение стоило ${ev.cost_tokens} токенов).`;
+            const undo = el("button", "ghost small", "Отменить");
+            undo.style.marginLeft = "8px";
+            undo.onclick = async () => {
+              undo.disabled = true;
+              const res = await fetch(`/api/conversations/${current.id}/task/undo`, { method: "POST" });
+              if (res.ok) { taskState = await res.json(); renderTask(); note.textContent = "Переход отменён."; }
+              else undo.disabled = false;
+            };
+            note.appendChild(undo);
+          } else if (ev.rejected) {
+            note.textContent = `Переход отклонён: ${ev.rejected}. Этап остался прежним.`;
+          } else if (ev.ok === false) {
+            note.textContent = `Состояние задачи не обновлено: ${ev.reason}.`;
+          } else {
+            note.textContent = `Этап прежний (${STAGE_LABELS[ev.stage]})` +
+              (ev.step ? `, шаг: ${ev.step}` : "") + ".";
+          }
+          box.appendChild(note);
+          loadTask(current);
         } else if (ev.type === "project_facts") {
           const note = el("div", "hint");
           note.style.marginTop = "8px";
@@ -1175,7 +1405,7 @@ $("prompt").addEventListener("keydown", e => {
 
 loadProfiles()
   .then(loadConversations)
-  .then(() => { if (!current) showMemory(null); });
+  .then(() => { if (!current) { showMemory(null); loadTask(null); } });
 updateTokenStats();
 </script>
 </body>

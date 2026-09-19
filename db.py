@@ -85,6 +85,23 @@ CREATE TABLE IF NOT EXISTS conversations (
 );
 CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations(user_id, updated_at DESC);
 
+-- Журнал состояния задачи. Текущее состояние лежит в conversations и при
+-- каждом нажатии перезаписывается; здесь остаётся хронология — в том числе
+-- единственный след того, что задача стояла на паузе.
+CREATE TABLE IF NOT EXISTS task_events (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    -- Вид события отдельной колонкой: пауза не меняет этап, и класть 'paused'
+    -- в колонку этапов значило бы хранить в ней не этап.
+    kind            TEXT    NOT NULL,   -- 'stage' | 'pause' | 'resume'
+    from_stage      TEXT,               -- только у kind='stage'
+    stage           TEXT    NOT NULL,   -- куда перешли; для паузы — где она случилась
+    note            TEXT,
+    author          TEXT    NOT NULL DEFAULT 'user',   -- 'user' | 'model'
+    created_at      TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_task_events_conv ON task_events(conversation_id, id);
+
 -- tokens_* вынесены в колонки: по ним будет считаться месячный расход.
 -- Остальная телеметрия ответа лежит в meta — она только показывается.
 CREATE TABLE IF NOT EXISTS messages (
@@ -144,6 +161,16 @@ MIGRATIONS = {
         "use_project": "INTEGER NOT NULL DEFAULT 1",
         # Какой профиль долговременной памяти подключён к диалогу.
         "profile_id": "INTEGER",
+        # Состояние задачи: этап, текущий шаг, ожидаемое действие и чей ход.
+        # Пауза — отдельный флаг, а не этап: приостановить можно на любом.
+        "task_mode": "TEXT NOT NULL DEFAULT 'chat'",
+        "task_stage": "TEXT NOT NULL DEFAULT 'planning'",
+        "task_step": "TEXT",
+        "task_expected": "TEXT",
+        "task_actor": "TEXT NOT NULL DEFAULT 'user'",
+        "task_paused": "INTEGER NOT NULL DEFAULT 0",
+        "task_auto": "INTEGER NOT NULL DEFAULT 0",
+        "task_updated_at": "TEXT",
     },
 }
 
@@ -801,6 +828,157 @@ def touch_conversation(conversation_id: int) -> None:
         conn.execute(
             "UPDATE conversations SET updated_at = ? WHERE id = ?", (_now(), conversation_id)
         )
+
+
+# ---------- состояние задачи ----------
+#
+# Хранение состояния и журнал. Правила переходов живут в task.py: здесь только
+# запись, иначе модуль базы начал бы знать, как устроена работа над задачей.
+
+CHAT_MODE, TASK_MODE = "chat", "task"
+TASK_MODES = (CHAT_MODE, TASK_MODE)
+
+PLANNING, EXECUTION, VALIDATION, DONE = "planning", "execution", "validation", "done"
+STAGES = (PLANNING, EXECUTION, VALIDATION, DONE)
+
+USER_ACTOR, ASSISTANT_ACTOR = "user", "assistant"
+ACTORS = (USER_ACTOR, ASSISTANT_ACTOR)
+
+STEP_LIMIT = 500
+
+
+def _add_task_event(conn, conversation_id: int, kind: str, stage: str, *,
+                    from_stage: str | None = None, note: str | None = None,
+                    author: str = "user") -> None:
+    conn.execute(
+        "INSERT INTO task_events (conversation_id, kind, from_stage, stage, note,"
+        " author, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (conversation_id, kind, from_stage, stage, (note or "").strip()[:STEP_LIMIT] or None,
+         author, _now()),
+    )
+
+
+def update_task(
+    conversation_id: int, user_id: int, *, mode: str | None = None,
+    step: str | None = None, expected: str | None = None, actor: str | None = None,
+    auto: bool | None = None,
+) -> dict | None:
+    """Меняет настройки задачи. Этап и пауза идут отдельными функциями —
+    у них есть правила и журнал."""
+    sets, values = [], []
+    if mode is not None:
+        if mode not in TASK_MODES:
+            raise ValueError(f"Неизвестный режим диалога: {mode}")
+        sets.append("task_mode = ?")
+        values.append(mode)
+    for name, value in (("task_step", step), ("task_expected", expected)):
+        if value is not None:
+            sets.append(f"{name} = ?")
+            values.append(value.strip()[:STEP_LIMIT])
+    if actor is not None:
+        if actor not in ACTORS:
+            raise ValueError(f"Неизвестный участник: {actor}")
+        sets.append("task_actor = ?")
+        values.append(actor)
+    if auto is not None:
+        sets.append("task_auto = ?")
+        values.append(int(auto))
+    if not sets:
+        return get_conversation(conversation_id, user_id)
+
+    sets.append("task_updated_at = ?")
+    values.extend([_now(), conversation_id, user_id])
+    with connect() as conn:
+        cur = conn.execute(
+            f"UPDATE conversations SET {', '.join(sets)} WHERE id = ? AND user_id = ?", values
+        )
+    return get_conversation(conversation_id, user_id) if cur.rowcount else None
+
+
+def set_task_stage(
+    conversation_id: int, user_id: int, stage: str, *,
+    note: str | None = None, author: str = "user",
+) -> dict | None:
+    """Ставит этап и записывает переход в журнал.
+
+    Допустимость перехода проверяет вызывающий (task.py): здесь нет знания
+    о том, какой этап за каким следует.
+    """
+    if stage not in STAGES:
+        raise ValueError(f"Неизвестный этап: {stage}")
+    conversation = get_conversation(conversation_id, user_id)
+    if conversation is None:
+        return None
+
+    with connect() as conn:
+        conn.execute(
+            "UPDATE conversations SET task_stage = ?, task_updated_at = ?"
+            " WHERE id = ? AND user_id = ?",
+            (stage, _now(), conversation_id, user_id),
+        )
+        # Заведение задачи — это не переход «этап → тот же этап»: у первого
+        # события предыдущего этапа нет, и журнал показывает его как начало.
+        previous = conversation["task_stage"]
+        _add_task_event(conn, conversation_id, "stage", stage,
+                        from_stage=previous if previous != stage else None,
+                        note=note, author=author)
+    return get_conversation(conversation_id, user_id)
+
+
+def set_task_pause(conversation_id: int, user_id: int, paused: bool,
+                   *, note: str | None = None) -> dict | None:
+    """Ставит задачу на паузу или снимает её. Этап при этом не меняется."""
+    conversation = get_conversation(conversation_id, user_id)
+    if conversation is None:
+        return None
+
+    with connect() as conn:
+        conn.execute(
+            "UPDATE conversations SET task_paused = ?, task_updated_at = ?"
+            " WHERE id = ? AND user_id = ?",
+            (int(paused), _now(), conversation_id, user_id),
+        )
+        _add_task_event(conn, conversation_id, "pause" if paused else "resume",
+                        conversation["task_stage"], note=note)
+    return get_conversation(conversation_id, user_id)
+
+
+def undo_task_stage(conversation_id: int, user_id: int) -> dict | None:
+    """Отменяет последний переход между этапами.
+
+    Отмена — не новый переход, а возврат к прежнему состоянию, поэтому правила
+    TRANSITIONS здесь не применяются: иначе откатить «проверка → готово» было бы
+    нельзя, ведь обратного перехода в цепочке нет.
+    """
+    conversation = get_conversation(conversation_id, user_id)
+    if conversation is None:
+        return None
+
+    with connect() as conn:
+        last = conn.execute(
+            "SELECT * FROM task_events WHERE conversation_id = ? AND kind = 'stage'"
+            " ORDER BY id DESC LIMIT 1", (conversation_id,),
+        ).fetchone()
+        if last is None or not last["from_stage"]:
+            return None
+        conn.execute(
+            "UPDATE conversations SET task_stage = ?, task_updated_at = ?"
+            " WHERE id = ? AND user_id = ?",
+            (last["from_stage"], _now(), conversation_id, user_id),
+        )
+        _add_task_event(conn, conversation_id, "stage", last["from_stage"],
+                        from_stage=last["stage"], note="отмена перехода")
+    return get_conversation(conversation_id, user_id)
+
+
+def list_task_events(conversation_id: int, limit: int = 50) -> list[dict]:
+    """Хронология состояния: переходы, паузы и возобновления вперемешку."""
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM task_events WHERE conversation_id = ?"
+            " ORDER BY id DESC LIMIT ?", (conversation_id, limit),
+        ).fetchall()
+    return [dict(r) for r in reversed(rows)]
 
 
 # ---------- сообщения ----------

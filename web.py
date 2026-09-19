@@ -22,6 +22,7 @@ import history
 import llm
 import memory
 import reasoning
+import task
 import temperature as temperature_mod
 import tokens as tokens_mod
 
@@ -760,9 +761,15 @@ async def conversation_send(
 
     # Заново читаем диалог: только что добавленный вопрос должен войти в план.
     layers = memory.collect(conversation, user)
+    described = memory.describe(layers)
+    # Состояние задачи — отдельный блок и отдельный ключ телеметрии: это не
+    # память, а то, где мы сейчас в работе.
+    if state := task.describe(conversation):
+        described["task"] = state
     plan = history.plan_request(
         _owned(conversation_id, user), system_prompt,
-        memory_blocks=memory.blocks(layers), memory_info=memory.describe(layers),
+        memory_blocks=memory.blocks(layers) + task.blocks(conversation),
+        memory_info=described,
     )
     messages = plan.messages
 
@@ -777,6 +784,24 @@ async def conversation_send(
         # в запрос, можно было бы только перезагрузив страницу.
         if plan.memory:
             yield sse({"type": "memory", "memory": plan.memory})
+
+        # Пауза — правило приложения, а не просьба к модели: на паузе к API
+        # не идём вовсе. Иначе прямое «продолжай» в последнем сообщении
+        # перевешивает инструкцию в системном блоке, и работа продолжается.
+        if task.is_paused(conversation):
+            reply = task.paused_reply(conversation)
+            yield sse({"type": "content", "text": reply})
+            yield sse({"type": "done", "finish_reason": "paused", "usage": {}, "elapsed": 0})
+            saved = db.add_message(
+                conversation_id, "assistant", reply,
+                meta=json.dumps({"system": system_prompt, "model": model,
+                                 "memory": plan.memory, "paused": True,
+                                 "finish_reason": "paused", "elapsed": 0},
+                                ensure_ascii=False),
+            )
+            yield sse({"type": "saved", "message_id": saved["id"],
+                       "title": _owned(conversation_id, user)["title"]})
+            return
 
         try:
             async for event in llm.stream(
@@ -851,6 +876,17 @@ async def conversation_send(
                         )
                         if moved:
                             yield sse({"type": "project_facts", **moved})
+            # Переключатель этапов идёт последним: ему нужна карточка фактов,
+            # уже обновлённая этим обменом.
+            after = _owned(conversation_id, user)
+            moved = await asyncio.to_thread(
+                task.refresh, after,
+                [{"role": "user", "content": content},
+                 {"role": "assistant", "content": answer}],
+                model=model,
+            )
+            if moved:
+                yield sse({"type": "task_state", **moved})
         except llm.LLMError as err:
             yield sse({"type": "context_error", "message": str(err)})
 
@@ -859,6 +895,105 @@ async def conversation_send(
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# ---------- состояние задачи ----------
+
+class TaskPatch(BaseModel):
+    mode: str | None = None
+    stage: str | None = None
+    paused: bool | None = None
+    auto: bool | None = None
+    step: str | None = None
+    expected: str | None = None
+    actor: str | None = None
+    note: str | None = None
+
+
+def _task_view(conversation: dict) -> dict:
+    """Состояние задачи вместе с журналом — всё, что нужно панели."""
+    stage = task.stage_of(conversation)
+    return {
+        "mode": conversation["task_mode"] or db.CHAT_MODE,
+        "stage": stage,
+        "label": task.LABELS[stage],
+        "step": conversation["task_step"] or "",
+        "expected": conversation["task_expected"] or "",
+        "actor": conversation["task_actor"] or db.USER_ACTOR,
+        "paused": bool(conversation["task_paused"]),
+        "auto": bool(conversation["task_auto"]),
+        "updated_at": conversation["task_updated_at"],
+        "stages": [{"id": st, "label": task.LABELS[st]} for st in db.STAGES],
+        "allowed": list(task.allowed(stage)),
+        "tokens": (task.describe(conversation) or {}).get("tokens", 0),
+        "events": db.list_task_events(conversation["id"]),
+    }
+
+
+@app.get("/api/conversations/{conversation_id}/task")
+async def task_get(conversation_id: int, user: dict = Depends(require_approved)) -> dict:
+    return _task_view(_owned(conversation_id, user))
+
+
+@app.post("/api/conversations/{conversation_id}/task")
+async def task_set(
+    conversation_id: int, payload: TaskPatch, user: dict = Depends(require_approved)
+) -> dict:
+    """Меняет состояние задачи. Переход между этапами проверяется автоматом."""
+    conversation = _owned(conversation_id, user)
+
+    try:
+        if payload.mode is not None:
+            conversation = db.update_task(conversation_id, user["id"], mode=payload.mode)
+            # Первое включение режима начинает журнал: иначе у задачи не видно
+            # момента, когда она вообще появилась.
+            if payload.mode == db.TASK_MODE and not db.list_task_events(conversation_id):
+                conversation = db.set_task_stage(
+                    conversation_id, user["id"], task.stage_of(conversation),
+                    note="задача заведена",
+                )
+        if any(v is not None for v in (payload.step, payload.expected, payload.actor, payload.auto)):
+            conversation = db.update_task(
+                conversation_id, user["id"], step=payload.step, expected=payload.expected,
+                actor=payload.actor, auto=payload.auto,
+            )
+    except ValueError as err:
+        raise HTTPException(400, str(err)) from err
+
+    if payload.paused is not None:
+        conversation = db.set_task_pause(
+            conversation_id, user["id"], payload.paused, note=payload.note
+        )
+
+    if payload.stage is not None:
+        current = task.stage_of(conversation)
+        if payload.stage != current:
+            if payload.stage not in db.STAGES:
+                raise HTTPException(400, f"Неизвестный этап: {payload.stage}")
+            if not task.can_move(current, payload.stage):
+                raise HTTPException(
+                    400,
+                    f"Переход «{task.LABELS[current]} → {task.LABELS[payload.stage]}» "
+                    f"не разрешён. Отсюда можно: "
+                    f"{', '.join(task.LABELS[st] for st in task.allowed(current)) or 'никуда'}.",
+                )
+            conversation = db.set_task_stage(
+                conversation_id, user["id"], payload.stage, note=payload.note
+            )
+
+    if conversation is None:
+        raise HTTPException(404, "Диалог не найден")
+    return _task_view(conversation)
+
+
+@app.post("/api/conversations/{conversation_id}/task/undo")
+async def task_undo(conversation_id: int, user: dict = Depends(require_approved)) -> dict:
+    """Отменяет последний переход — в том числе сделанный автоматически."""
+    _owned(conversation_id, user)
+    conversation = db.undo_task_stage(conversation_id, user["id"])
+    if conversation is None:
+        raise HTTPException(400, "Отменять нечего")
+    return _task_view(conversation)
 
 
 # ---------- сравнение стратегий ----------
@@ -959,6 +1094,8 @@ async def conversation_tokens(
     # занижала бы размер ровно на ту часть, которую пользователь не видит
     # в переписке.
     described = memory.describe(memory.collect(conversation, user))
+    if state := task.describe(conversation):
+        described["task"] = state
     memory_tokens = sum(layer["tokens"] for layer in described.values())
 
     return {
