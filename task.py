@@ -25,6 +25,31 @@ import tokens as tokens_mod
 LABELS = db.STAGE_LABELS
 CHAIN = " → ".join(LABELS.values())
 
+# Чей ход двигает этап дальше. От этого зависит, когда работает переключатель:
+# переход вызывает та сторона, чья реплика служит признаком. Раньше он всегда
+# работал после ответа — и реплику «план принят, приступай» ассистент отвечал,
+# находясь ещё на планировании: либо отказывался писать код, либо писал и
+# получал от ревизора «забежал вперёд». Виновато было приложение, не модель.
+STAGE_TRIGGER = {
+    db.PLANNING: db.USER_ACTOR,        # пользователь утверждает план
+    db.EXECUTION: db.ASSISTANT_ACTOR,  # ассистент предъявляет результат
+    db.VALIDATION: db.USER_ACTOR,      # пользователь принимает или находит расхождения
+    db.DONE: db.USER_ACTOR,            # пользователь возвращает задачу в работу
+}
+
+
+def switches_before_answer(conversation: dict) -> bool:
+    """Нужно ли проверить переход до ответа — по этапу на начало обмена.
+
+    Позиция выбирается один раз, поэтому вызов переключателя остаётся один.
+    """
+    if not is_task(conversation) or not conversation.get("task_auto"):
+        return False
+    if conversation.get("task_paused"):
+        return False
+    return STAGE_TRIGGER[stage_of(conversation)] == db.USER_ACTOR
+
+
 # Разрешённые переходы. Назад — не «отмена», а нормальная часть работы:
 # план оказался негодным, проверка не прошла, готовую задачу вернули в работу.
 TRANSITIONS = {

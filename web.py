@@ -804,8 +804,25 @@ async def conversation_delete(
     return {"ok": db.delete_conversation(conversation_id, user["id"])}
 
 
+ASSISTANT_TURN_NOTE = (
+    "Ассистент продолжает работу: пользователь ничего не писал, ход у ассистента. "
+    "Продолжай по текущему шагу задачи."
+)
+
+
+def _last_answer(conversation_id: int) -> str:
+    """Последний настоящий ответ ассистента. Заготовку паузы пропускаем."""
+    for m in reversed(db.list_messages(conversation_id)):
+        if m["role"] != "assistant":
+            continue
+        meta = json.loads(m["meta"]) if m["meta"] else {}
+        if not meta.get("paused"):
+            return m["content"]
+    return ""
+
+
 async def _exchange(
-    conversation_id: int, user: dict, content: str, *,
+    conversation_id: int, user: dict, content: str | None, *,
     outcome: dict, simulated: dict | None = None,
 ) -> AsyncIterator[str]:
     """Один обмен: сохранить реплику, собрать запрос, стримить ответ, обслужить.
@@ -814,6 +831,9 @@ async def _exchange(
     иначе автопилот проверял бы не то приложение, которое видит человек.
     simulated — телеметрия вызова, написавшего реплику за пользователя; она
     сохраняется в meta этой реплики.
+
+    content=None — ход ассистента без реплики пользователя: в переписку идёт
+    отметка о том, что ход перешёл к нему, и она же служит инструкцией.
 
     Итог пишется в outcome: ok, answer, tokens (основной ответ плюс служебные
     вызовы), paused. Вернуть значение из асинхронного генератора нельзя.
@@ -824,14 +844,43 @@ async def _exchange(
     model = conversation["model"] or llm.MODEL
     thinking = bool(conversation["thinking"])
     max_tokens = conversation["max_tokens"] or None
+    # Телеметрия служебных вызовов копится с самого начала: переключатель
+    # этапов может отработать ещё до ответа.
+    service: list[dict] = []
 
-    asked = db.add_message(
-        conversation_id, "user", content,
-        meta=json.dumps({"simulated": True, **simulated}, ensure_ascii=False) if simulated else None,
-    )
-    # Первое сообщение даёт диалогу имя — иначе список будет из «Новых диалогов».
-    if conversation["title"] == db.NEW_TITLE:
-        db.update_conversation(conversation_id, user["id"], title=content)
+    if content is None:
+        asked = db.add_message(
+            conversation_id, "system", ASSISTANT_TURN_NOTE,
+            meta=json.dumps({"assistant_turn": True}, ensure_ascii=False),
+        )
+    else:
+        asked = db.add_message(
+            conversation_id, "user", content,
+            meta=json.dumps({"simulated": True, **simulated}, ensure_ascii=False) if simulated else None,
+        )
+        # Первое сообщение даёт диалогу имя — иначе список будет из «Новых диалогов».
+        if conversation["title"] == db.NEW_TITLE:
+            db.update_conversation(conversation_id, user["id"], title=content)
+
+    # Переход вызывает та сторона, чья реплика служит признаком. На
+    # планировании это пользователь, поэтому переключатель работает ДО ответа:
+    # иначе ответ на «план принят» готовился бы ещё на планировании.
+    if content is not None and task.switches_before_answer(conversation):
+        if previous := _last_answer(conversation_id):
+            try:
+                moved = await asyncio.to_thread(
+                    task.refresh, conversation,
+                    [{"role": "assistant", "content": previous},
+                     {"role": "user", "content": content}],
+                    model=model,
+                )
+            except llm.LLMError as err:
+                moved = None
+                yield sse({"type": "context_error", "message": str(err)})
+            if moved:
+                service.append(moved)
+                yield sse({"type": "task_state", **moved})
+                conversation = _owned(conversation_id, user)
 
     # Заново читаем диалог: только что добавленный вопрос должен войти в план.
     layers = memory.collect(conversation, user)
@@ -933,10 +982,8 @@ async def _exchange(
         # Обслуживание контекста идёт после ответа: пользователь его уже видит,
         # и задержка на конспект или карточку фактов до него не доходит.
         fresh = _owned(conversation_id, user)
-        # Служебные вызовы идут уже после сохранения ответа, поэтому их
-        # телеметрию дописываем в meta отдельной правкой — иначе после
-        # перезагрузки страницы от них не осталось бы и следа.
-        service: list[dict] = []
+        # Служебные вызовы дописываются в meta ответа отдельной правкой —
+        # иначе после перезагрузки страницы от них не осталось бы и следа.
         # Отказ по инварианту помечает реплику пользователя: иначе карточка
         # фактов и конспект принимают отклонённую просьбу за решение.
         rejected_by: list[str] = []
@@ -949,14 +996,16 @@ async def _exchange(
             stage_rule = task.STAGE_RULES[task.stage_of(fresh)] if task.is_task(fresh) else ""
             if rules or stage_rule:
                 verdict = await asyncio.to_thread(
-                    invariants_mod.check, rules, content, answer,
+                    invariants_mod.check, rules,
+                    content if content is not None else "(ход ассистента, реплики пользователя нет)",
+                    answer,
                     stage_rule=stage_rule,
                     stage_label=task.LABELS[task.stage_of(fresh)] if stage_rule else "",
                     model=model,
                 )
                 service.append(verdict)
                 rejected_by = verdict.get("defended") or []
-                if rejected_by:
+                if rejected_by and content is not None:
                     marked = json.loads(asked["meta"]) if asked["meta"] else {}
                     marked["rejected_by"] = rejected_by
                     db.update_message_meta(asked["id"], json.dumps(marked, ensure_ascii=False))
@@ -968,8 +1017,9 @@ async def _exchange(
                     service.append(info)
                     yield sse({"type": "compressed", **info})
             elif (fresh["strategy"] or db.FULL) == db.FACTS:
-                exchange = [{"role": "user", "content": content, "rejected_by": rejected_by},
-                            {"role": "assistant", "content": answer}]
+                exchange = ([{"role": "user", "content": content, "rejected_by": rejected_by}]
+                            if content is not None else [])
+                exchange += [{"role": "assistant", "content": answer}]
                 info = await asyncio.to_thread(
                     history.refresh_facts, fresh, exchange, model=model
                 )
@@ -984,18 +1034,20 @@ async def _exchange(
                         )
                         if moved:
                             yield sse({"type": "project_facts", **moved})
-            # Переключатель этапов идёт последним: ему нужна карточка фактов,
-            # уже обновлённая этим обменом.
+            # Переключатель после ответа — только там, где переход вызывает
+            # сам ассистент (этап выполнения: он предъявляет результат).
+            # Остальные этапы проверены до ответа, второй раз платить незачем.
             after = _owned(conversation_id, user)
-            moved = await asyncio.to_thread(
-                task.refresh, after,
-                [{"role": "user", "content": content, "rejected_by": rejected_by},
-                 {"role": "assistant", "content": answer}],
-                model=model,
-            )
-            if moved:
-                service.append(moved)
-                yield sse({"type": "task_state", **moved})
+            if not task.switches_before_answer(conversation):
+                pair = ([{"role": "user", "content": content, "rejected_by": rejected_by}]
+                        if content is not None else [])
+                moved = await asyncio.to_thread(
+                    task.refresh, after, pair + [{"role": "assistant", "content": answer}],
+                    model=model,
+                )
+                if moved:
+                    service.append(moved)
+                    yield sse({"type": "task_state", **moved})
         except llm.LLMError as err:
             yield sse({"type": "context_error", "message": str(err)})
 
@@ -1111,6 +1163,54 @@ async def _autopilot(conversation_id: int, user: dict, request: Request) -> Asyn
     })
 
 
+# Сколько ходов подряд ассистент делает сам, пока ход не вернётся к
+# пользователю. Предохранитель: без него состояние «ход ассистента» могло бы
+# крутить ходы до бесконечности.
+ASSISTANT_TURNS_LIMIT = 3
+
+
+async def _assistant_turns(
+    conversation_id: int, user: dict, request: Request
+) -> AsyncIterator[str]:
+    """Ходы, которые ассистент делает сам, когда ход перешёл к нему.
+
+    Это не автопилот: реплики за пользователя никто не выдумывает. Приложение
+    лишь продолжает работу, которую состояние задачи уже числит за ассистентом,
+    — иначе после перехода в выполнение обещанная реализация не появлялась бы,
+    пока пользователь не напишет что-нибудь сам.
+    """
+    made = 0
+    while made < ASSISTANT_TURNS_LIMIT:
+        conversation = _owned(conversation_id, user)
+        if not (task.is_task(conversation) and conversation["task_auto"]):
+            break
+        if conversation["task_autopilot"] or conversation["task_paused"]:
+            break
+        if task.stage_of(conversation) == db.DONE:
+            break
+        # Сам ассистент продолжает только там, где работа этапа за ним. На
+        # проверке ход по смыслу пользователя: без этого условия ассистент
+        # делал три хода подряд со словами «жду вашего ответа».
+        if task.STAGE_TRIGGER[task.stage_of(conversation)] != db.ASSISTANT_ACTOR:
+            break
+        if (conversation["task_actor"] or db.USER_ACTOR) != db.ASSISTANT_ACTOR:
+            break
+        if await request.is_disconnected():
+            break
+
+        made += 1
+        yield sse({"type": "next_turn", "kind": "assistant",
+                   "turn": made, "max": ASSISTANT_TURNS_LIMIT})
+        outcome: dict = {}
+        async for chunk in _exchange(conversation_id, user, None, outcome=outcome):
+            yield chunk
+        if not outcome.get("ok"):
+            break
+
+    if made:
+        yield sse({"type": "assistant_turns_done", "turns": made})
+
+
 def _sse_response(events: AsyncIterator[str]) -> StreamingResponse:
     return StreamingResponse(
         events,
@@ -1140,10 +1240,15 @@ async def conversation_send(
         outcome: dict = {}
         async for chunk in _exchange(conversation_id, user, content, outcome=outcome):
             yield chunk
-        # На паузе автопилот не стартует: пауза — тормоз человека над автоматом.
+        # На паузе ни автопилот, ни самостоятельные ходы не стартуют: пауза —
+        # тормоз человека над автоматом.
         if outcome.get("ok") and not outcome.get("paused"):
-            async for chunk in _autopilot(conversation_id, user, request):
-                yield chunk
+            if task.is_autopilot(_owned(conversation_id, user)):
+                async for chunk in _autopilot(conversation_id, user, request):
+                    yield chunk
+            else:
+                async for chunk in _assistant_turns(conversation_id, user, request):
+                    yield chunk
 
     return _sse_response(events())
 

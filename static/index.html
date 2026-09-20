@@ -1585,6 +1585,20 @@ async function streamInto(url, payload, turn) {
 
         // Новый ход автопилота: закрываем прежний блок, рисуем реплику
         // «за пользователя» и заводим новый блок ответа.
+        // Ассистент делает ещё один ход сам: реплики пользователя нет,
+        // поэтому просто закрываем прежний блок и заводим новый.
+        if (ev.type === "next_turn") {
+          if (turn) turn.body.classList.remove("cursor");
+          const note = el("div", "stagechange", `Ход ассистента ${ev.turn} из ${ev.max}: продолжает работу сам.`);
+          if (log.querySelector(".empty")) log.innerHTML = "";
+          log.appendChild(note);
+          turn = newTurn();
+          log.scrollTop = log.scrollHeight;
+          continue;
+        }
+        if (ev.type === "assistant_turns_done") {
+          continue;
+        }
         if (ev.type === "autopilot_turn") {
           if (turn) turn.body.classList.remove("cursor");
           simulatedMessage(ev);
