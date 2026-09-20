@@ -993,7 +993,10 @@ async def _exchange(
             # Ревизор проверяет две пары правил сразу: инварианты проекта и
             # правило текущего этапа. Поэтому он нужен и там, где инвариантов
             # нет, но задача идёт по этапам.
-            stage_rule = task.STAGE_RULES[task.stage_of(fresh)] if task.is_task(fresh) else ""
+            # Ревизору идёт не то правило, что модели: ему нужен закрытый
+            # список «работа этапа / прыжок через этап», иначе он помечает
+            # нарушением саму работу этапа.
+            stage_rule = task.judge_rule(task.stage_of(fresh)) if task.is_task(fresh) else ""
             if rules or stage_rule:
                 verdict = await asyncio.to_thread(
                     invariants_mod.check, rules,
