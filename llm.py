@@ -139,6 +139,7 @@ def build_payload(
     thinking: bool | None = None,
     temperature: float | None = None,
     response_format: dict | None = None,
+    tools: list[dict] | None = None,
 ) -> dict:
     """Собирает тело запроса к /chat/completions."""
     use_thinking = THINKING if thinking is None else thinking
@@ -156,6 +157,10 @@ def build_payload(
         payload["stop"] = stop
     if temperature is not None:
         payload["temperature"] = temperature
+    # Схемы инструментов MCP. Решает по ним модель: приложение лишь выполняет
+    # то, что она запросила, и возвращает результат следующим запросом.
+    if tools:
+        payload["tools"] = tools
     if response_format:
         payload["response_format"] = response_format
         if response_format.get("type") == "json_object" and not _mentions_json(messages):
@@ -216,6 +221,7 @@ def describe_response(
 
 def assemble_stream(
     header: dict, *, content: str, reasoning: str, finish_reason: str, usage: dict,
+    tool_calls: list[dict] | None = None,
 ) -> dict:
     """Склеивает куски потока в ответ того же вида, что приходит без потока.
 
@@ -227,6 +233,8 @@ def assemble_stream(
     message: dict = {"role": "assistant", "content": content}
     if reasoning:
         message["reasoning_content"] = reasoning
+    if tool_calls:
+        message["tool_calls"] = tool_calls
     return {
         "id": header.get("id"),
         "object": "chat.completion",
@@ -307,7 +315,8 @@ async def stream(
       {"type": "reasoning", "text": ...} — кусок рассуждения (если thinking включён);
       {"type": "content",   "text": ...} — кусок ответа;
       {"type": "response", "response": {...}} — ответ API без текста;
-      {"type": "done", "finish_reason": ..., "usage": {...}, "elapsed": ...}.
+      {"type": "done", "finish_reason": ..., "usage": {...}, "elapsed": ...,
+       "tool_calls": [...]} — вызовы инструментов, если модель их запросила.
     """
     payload = build_payload(messages, **options)
     payload["stream"] = True
@@ -324,6 +333,9 @@ async def stream(
     chunks = 0
     content_parts: list[str] = []
     reasoning_parts: list[str] = []
+    # Вызовы инструментов приходят кусками, как и текст: в первом куске имя и
+    # id, в следующих — аргументы по частям. Собираем по индексу вызова.
+    calls: dict[int, dict] = {}
 
     try:
         limits = httpx.Timeout(timeout, connect=CONNECT_TIMEOUT, read=STALL_TIMEOUT)
@@ -385,11 +397,26 @@ async def stream(
                             produced = True
                             content_parts.append(content)
                             yield {"type": "content", "text": content}
+                        for call in delta.get("tool_calls") or []:
+                            produced = True
+                            slot = calls.setdefault(
+                                call.get("index", 0),
+                                {"id": "", "type": "function",
+                                 "function": {"name": "", "arguments": ""}},
+                            )
+                            if call.get("id"):
+                                slot["id"] = call["id"]
+                            piece = call.get("function") or {}
+                            if piece.get("name"):
+                                slot["function"]["name"] = piece["name"]
+                            if piece.get("arguments"):
+                                slot["function"]["arguments"] += piece["arguments"]
     except httpx.HTTPError as err:
         raise LLMError(
             _network_message(err), diagnostics=_network_diagnostics(err, timeout)
         ) from err
 
+    ordered = [calls[i] for i in sorted(calls)]
     if header:
         assembled = assemble_stream(
             header,
@@ -397,6 +424,7 @@ async def stream(
             reasoning="".join(reasoning_parts),
             finish_reason=finish_reason,
             usage=usage,
+            tool_calls=ordered,
         )
         yield {
             "type": "response",
@@ -408,4 +436,5 @@ async def stream(
         "finish_reason": finish_reason,
         "usage": usage,
         "elapsed": round(time.monotonic() - started, 2),
+        "tool_calls": ordered,
     }

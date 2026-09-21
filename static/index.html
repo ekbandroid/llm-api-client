@@ -793,6 +793,7 @@ function markRejected(userBox, codes) {
 // времени на соединение.
 
 let mcpServers = [];
+let mcpTokens = 0;
 
 async function loadMcp() {
   const res = await fetch("/api/mcp");
@@ -802,6 +803,8 @@ async function loadMcp() {
 }
 
 function renderMcp() {
+  mcpTokens = mcpServers.filter(s => s.enabled).reduce((n, s) => n + (s.tokens || 0), 0);
+  updateTokenStats();
   const list = $("mcpList");
   list.innerHTML = "";
   if (!mcpServers.length) {
@@ -1356,6 +1359,7 @@ const SERVICE_LABELS = {
   task: "переключение этапа",
   simulated_user: "реплика за пользователя",
   invariants: "проверка инвариантов",
+  mcp: "вызов инструмента MCP",
 };
 
 /** Текст заметки: что именно сделал служебный вызов. */
@@ -1371,6 +1375,16 @@ function serviceText(info) {
     return "Проверка инвариантов: нарушений нет" +
       (info.defended && info.defended.length ? `; ответ отказал по ${info.defended.join(", ")}` : ` (правил — ${info.count})`) +
       ` (проверка стоила ${info.cost_tokens} токенов).`;
+  }
+  if (info.kind === "mcp") {
+    const args = Object.entries(info.arguments || {})
+      .map(([k, v]) => `${k}=${v}`).join(", ") || "без аргументов";
+    const head = info.server
+      ? `Вызван инструмент ${info.tool} сервера «${info.server}» (${args})`
+      : `Инструмент ${info.name} вызвать не удалось`;
+    return info.ok
+      ? `${head}: ответ на ${(info.result || "").length} символов за ${info.elapsed} с.`
+      : `${head}: ${(info.result || "").slice(0, 200)}`;
   }
   if (info.kind === "simulated_user") {
     return `Реплику написала модель вместо пользователя (стоила ${info.cost_tokens} токенов).`;
@@ -1432,8 +1446,11 @@ function serviceNote(info, { undo = false } = {}) {
 
 /** Строка о том, сколько памяти ушло в этот запрос. */
 function memoryLine(mem) {
-  if (!mem || (!mem.profile && !mem.project && !mem.task && !mem.invariants)) return null;
+  if (!mem || (!mem.profile && !mem.project && !mem.task && !mem.invariants && !mem.mcp)) return null;
   const parts = [];
+  if (mem.mcp) {
+    parts.push(`инструменты MCP: ${mem.mcp.tools} с ${mem.mcp.servers} серверов ~${mem.mcp.tokens} токенов`);
+  }
   if (mem.invariants) {
     parts.push(`инварианты: ${mem.invariants.codes.join(", ")} ~${mem.invariants.tokens} токенов`);
   }
@@ -1461,7 +1478,8 @@ function updateTokenStats() {
 
   const draft = $("prompt").value;
   const memory = (current.use_profile ? profileTokens : 0) +
-                 (current.use_project ? projectTokens : 0) + taskTokens + invariantTokens;
+                 (current.use_project ? projectTokens : 0) + taskTokens + invariantTokens +
+                 mcpTokens;
   const next = estimateMessages(loadedTexts) + (draft ? estimateTokens(draft) + 4 : 0) + memory;
   const spent = loadedTotals;
 
@@ -1815,6 +1833,8 @@ async function streamInto(url, payload, turn) {
           // Реплика пользователя этого хода — последняя в ленте перед ответом.
           const users = [...log.querySelectorAll(".msg.user")];
           markRejected(users[users.length - 1], ev.defended);
+        } else if (ev.type === "mcp") {
+          box.appendChild(serviceNote(ev));
         } else if (ev.type === "facts") {
           box.appendChild(serviceNote(ev));
           if (current && ev.ok) { current.facts = JSON.stringify(ev.facts); showStrategy(current); }

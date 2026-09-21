@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import secrets
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -720,6 +721,11 @@ def _mcp_view(server: dict) -> dict:
                    "required": list((t.get("schema") or {}).get("required") or [])}
                   for t in tools],
         "count": len(tools),
+        # Во сколько обойдутся схемы этого сервера в каждом запросе — цифра
+        # для вкладки «Токены». Считаем по тому же виду, в каком они уходят
+        # в запрос, иначе оценка разошлась бы со строкой в чате.
+        "tokens": tokens_mod.estimate_tokens(json.dumps(
+            mcp_tools.request_tools([server])[0], ensure_ascii=False)),
         "checked_at": server["checked_at"],
         "error": server["error"],
     }
@@ -940,6 +946,54 @@ def _last_answer(conversation_id: int) -> str:
     return ""
 
 
+# Сколько кругов «модель просит инструмент — приложение выполняет» допускается
+# в одном обмене. Предохранитель: без него ошибка инструмента, на которую
+# модель отвечает новым вызовом, крутилась бы без конца.
+MCP_ROUNDS_LIMIT = 3
+
+# Сколько текста инструмента уходит модели. Ответы бывают на десятки тысяч
+# символов, и целиком они вытеснили бы из запроса саму переписку.
+MCP_RESULT_LIMIT = 6000
+
+
+async def _run_tool(call: dict, routes: dict) -> dict:
+    """Выполняет один запрошенный моделью вызов и описывает его для чата.
+
+    Ошибка инструмента не прерывает обмен: её текст возвращается модели как
+    результат. Так она объяснит пользователю, что случилось, — вместо того
+    чтобы выдумать число, которого не получила.
+    """
+    name = (call.get("function") or {}).get("name") or ""
+    raw = (call.get("function") or {}).get("arguments") or "{}"
+    try:
+        arguments = json.loads(raw) if raw.strip() else {}
+    except json.JSONDecodeError:
+        arguments = {}
+    note = {"kind": "mcp", "name": name, "arguments": arguments, "ok": False}
+
+    route = routes.get(name)
+    if route is None:
+        note["result"] = f"ОШИБКА: инструмент {name} не подключён"
+        note["server"] = ""
+        return note
+
+    server, tool = route
+    note.update(server=server["title"], tool=tool, url=server["url"])
+    note["request"] = {"method": "tools/call", "url": server["url"],
+                       "body": {"name": tool, "arguments": arguments}}
+    started = time.monotonic()
+    try:
+        result = await mcp_tools.call_tool(server["url"], tool, arguments)
+    except mcp_tools.MCPError as err:
+        note["result"] = f"ОШИБКА: {err}"
+    else:
+        note["ok"] = not result.startswith("ОШИБКА")
+        note["result"] = result[:MCP_RESULT_LIMIT]
+    note["elapsed"] = round(time.monotonic() - started, 2)
+    note["response"] = {"chars": len(note["result"]), "text": note["result"][:1000]}
+    return note
+
+
 async def _exchange(
     conversation_id: int, user: dict, content: str | None, *,
     outcome: dict, simulated: dict | None = None,
@@ -1012,10 +1066,25 @@ async def _exchange(
     # память, а то, где мы сейчас в работе.
     if state := task.describe(conversation):
         described["task"] = state
+    # Инструменты подключённых серверов MCP. Схемы берутся из кэша; если
+    # сервер включили, а за схемами ещё не ходили, сходим один раз здесь.
+    servers = db.list_mcp_servers(user["id"], only_enabled=True)
+    for server in servers:
+        if not mcp_tools.cached_tools(server):
+            await _refresh_mcp(server, user)
+    servers = db.list_mcp_servers(user["id"], only_enabled=True)
+    tool_schemas, tool_routes = mcp_tools.request_tools(servers)
+    if tool_schemas:
+        described["mcp"] = {
+            "servers": len(servers),
+            "tools": len(tool_schemas),
+            "tokens": tokens_mod.estimate_tokens(
+                json.dumps(tool_schemas, ensure_ascii=False)),
+        }
     plan = history.plan_request(
         _owned(conversation_id, user), system_prompt,
         memory_blocks=(memory.blocks(layers) + invariants_mod.blocks(project, rules)
-                       + task.blocks(conversation)),
+                       + task.blocks(conversation) + mcp_tools.blocks(servers)),
         memory_info=described,
     )
     messages = plan.messages
@@ -1053,32 +1122,75 @@ async def _exchange(
                        "title": _owned(conversation_id, user)["title"]})
             return
 
-        try:
-            async for event in llm.stream(
-                messages, model=model, thinking=thinking, max_tokens=max_tokens,
-                # Формат ответа — настройка профиля: служебные вызовы
-                # (карточка фактов, конспект) его не наследуют.
-                response_format=memory.response_format(layers),
-            ):
-                if event["type"] == "content":
-                    answer += event["text"]
-                elif event["type"] == "reasoning":
-                    reasoning += event["text"]
-                elif event["type"] == "request":
-                    meta["request"] = event["request"]
-                elif event["type"] == "response":
-                    meta["response"] = event["response"]
-                elif event["type"] == "done":
-                    usage = event.get("usage") or {}
-                    completion_tokens = usage.get("completion_tokens", 0)
-                    total_tokens = usage.get("total_tokens", 0)
-                    finish_reason = event["finish_reason"]
-                    elapsed = event["elapsed"]
-                yield sse(event)
-        except llm.LLMError as err:
-            # Вопрос без ответа удалит finally ниже — так же, как при обрыве.
-            yield sse({"type": "error", "message": str(err), "response": err.response, "diagnostics": err.diagnostics})
-            return
+        # Кругов может быть несколько: модель просит инструмент, приложение
+        # его выполняет и спрашивает снова. Текст всех кругов — один ответ:
+        # пользователь видит его сплошным потоком, как обычно.
+        rounds = 0
+        while True:
+            calls: list[dict] = []
+            said = ""
+            try:
+                async for event in llm.stream(
+                    messages, model=model, thinking=thinking, max_tokens=max_tokens,
+                    # Формат ответа — настройка профиля: служебные вызовы
+                    # (карточка фактов, конспект) его не наследуют.
+                    response_format=memory.response_format(layers),
+                    tools=tool_schemas or None,
+                ):
+                    if event["type"] == "content":
+                        answer += event["text"]
+                        said += event["text"]
+                    elif event["type"] == "reasoning":
+                        reasoning += event["text"]
+                    elif event["type"] == "request":
+                        meta["request"] = event["request"]
+                    elif event["type"] == "response":
+                        meta["response"] = event["response"]
+                    elif event["type"] == "done":
+                        usage = event.get("usage") or {}
+                        completion_tokens += usage.get("completion_tokens", 0)
+                        total_tokens += usage.get("total_tokens", 0)
+                        finish_reason = event["finish_reason"]
+                        elapsed += event["elapsed"]
+                        calls = event.get("tool_calls") or []
+                        # Ход не закончен: «done» в интерфейсе закрыл бы ответ,
+                        # а после инструмента будет продолжение.
+                        if calls and rounds < MCP_ROUNDS_LIMIT:
+                            continue
+                        if rounds:
+                            # В последнем «done» показываем расход за все круги:
+                            # иначе в чате была бы цена одного, а в сохранённом
+                            # сообщении — сумма, и числа разошлись бы.
+                            event = {**event, "usage": {
+                                **usage, "completion_tokens": completion_tokens,
+                                "total_tokens": total_tokens, "rounds": rounds + 1}}
+                    yield sse(event)
+            except llm.LLMError as err:
+                # Вопрос без ответа удалит finally ниже — так же, как при обрыве.
+                yield sse({"type": "error", "message": str(err), "response": err.response, "diagnostics": err.diagnostics})
+                return
+
+            if not calls:
+                break
+            if rounds >= MCP_ROUNDS_LIMIT:
+                # Предел исчерпан, а модель просит ещё. Молчать нельзя: ответ
+                # оборван на полуслове, и пользователь должен знать почему.
+                yield sse({"type": "context_error", "message":
+                           f"Предел кругов вызова инструментов ({MCP_ROUNDS_LIMIT}) "
+                           "исчерпан — ответ оборван. Спросите точнее или "
+                           "повторите вопрос."})
+                break
+            rounds += 1
+            messages = messages + [
+                {"role": "assistant", "content": said, "tool_calls": calls}]
+            for call in calls:
+                note = await _run_tool(call, tool_routes)
+                service.append(note)
+                yield sse({"type": "mcp", **note})
+                messages.append({
+                    "role": "tool", "tool_call_id": call.get("id") or "",
+                    "content": note["result"],
+                })
 
         meta.update(
             finish_reason=finish_reason, elapsed=elapsed,
