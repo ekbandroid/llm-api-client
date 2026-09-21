@@ -80,6 +80,14 @@ async function httpErrorResponse(res) {
   return { url: res.url, status: res.status, statusText: res.statusText, body };
 }
 
+/** Причина отказа словами приложения: FastAPI кладёт её в body.detail. */
+function httpDetail(info, fallback) {
+  const body = info && info.body;
+  const detail = body && typeof body === "object" ? body.detail : null;
+  return (typeof detail === "string" && detail) || fallback;
+}
+
+
 /** Понятное объяснение для кодов, которые пользователь может увидеть. */
 function httpErrorHint(status) {
   return {

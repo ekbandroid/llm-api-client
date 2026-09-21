@@ -128,6 +128,24 @@ CREATE TABLE IF NOT EXISTS task_events (
 );
 CREATE INDEX IF NOT EXISTS idx_task_events_conv ON task_events(conversation_id, id);
 
+-- Серверы MCP, добавленные пользователем. Список свой у каждого: адрес —
+-- это то, куда приложение пойдёт с его запросом, и общий перечень означал бы
+-- общий выбор. Схемы инструментов кэшируются здесь же: ходить за ними на
+-- сервер в каждом запросе к модели значило бы добавлять задержку к каждому
+-- сообщению.
+CREATE TABLE IF NOT EXISTS mcp_servers (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    title      TEXT    NOT NULL,
+    url        TEXT    NOT NULL,
+    enabled    INTEGER NOT NULL DEFAULT 0,
+    tools      TEXT,               -- JSON: кэш схем, полученных от сервера
+    checked_at TEXT,               -- когда последний раз сходили успешно
+    error      TEXT,               -- текст последней ошибки, если она была
+    created_at TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mcp_user ON mcp_servers(user_id, id);
+
 -- tokens_* вынесены в колонки: по ним будет считаться месячный расход.
 -- Остальная телеметрия ответа лежит в meta — она только показывается.
 CREATE TABLE IF NOT EXISTS messages (
@@ -171,6 +189,8 @@ MIGRATIONS = {
         # Готовые профили заводятся один раз; флаг не даёт завести их снова
         # после того, как пользователь их поправил или удалил.
         "profiles_seeded": "INTEGER NOT NULL DEFAULT 0",
+        # Готовые MCP-серверы заводятся один раз — тем же правилом, что профили.
+        "mcp_seeded": "INTEGER NOT NULL DEFAULT 0",
     },
     "conversations": {
         "max_tokens": "INTEGER",
@@ -239,9 +259,13 @@ def init() -> None:
         columns = {r[1] for r in conn.execute("PRAGMA table_info(users)")}
         pending = [r[0] for r in conn.execute(
             "SELECT id FROM users WHERE COALESCE(profiles_seeded, 0) = 0")]
+        pending_mcp = [r[0] for r in conn.execute(
+            "SELECT id FROM users WHERE COALESCE(mcp_seeded, 0) = 0")]
     # Готовые профили заводим и тем, кто зарегистрировался до их появления.
     for user_id in pending:
         seed_profiles(user_id)
+    for user_id in pending_mcp:
+        seed_mcp_servers(user_id)
     missing = {"login", "password_hash", "status", "is_admin"} - columns
     if missing:
         raise SchemaError(
@@ -287,6 +311,7 @@ def create_user(
     # второй писатель в WAL упёрся бы в блокировку.
     if user:
         seed_profiles(user["id"])
+        seed_mcp_servers(user["id"])
         user = get(user["id"])
     return user
 
@@ -359,6 +384,7 @@ def upsert_from_yandex(profile: dict, *, admin_logins: set[str]) -> dict:
         user = _fetch(conn, "yandex_id = ?", yandex_id)
     if user:
         seed_profiles(user["id"])
+        seed_mcp_servers(user["id"])
         user = get(user["id"])
     return user
 
@@ -823,6 +849,128 @@ def delete_invariant(invariant_id: int, user_id: int) -> bool:
             (_now(), invariant_id, user_id),
         )
     return cur.rowcount > 0
+
+
+# ---------- серверы MCP ----------
+#
+# Каждый сервер объявляет инструменты со схемами аргументов; включённые
+# уходят в запрос к модели, и она сама решает, что вызвать. Владелец, как и
+# везде, проверяется прямо в запросе.
+
+MCP_TITLE_LIMIT = 80
+MCP_URL_LIMIT = 500
+
+# Готовые серверы — все проверены живым запросом: отвечают без ключа и
+# регистрации. Включён только сервер курсов: схемы выключенных не занимают
+# токены в запросе, а курсы — то, чего обученная модель знать не может.
+MCP_PRESETS = (
+    {"title": "Курсы валют",
+     "url": "https://currency-mcp.wesbos.com/mcp", "enabled": 1},
+    {"title": "DeepWiki — документация репозиториев",
+     "url": "https://mcp.deepwiki.com/mcp", "enabled": 0},
+    {"title": "Context7 — документация библиотек",
+     "url": "https://mcp.context7.com/mcp", "enabled": 0},
+    {"title": "GitMCP — документация по ссылке",
+     "url": "https://gitmcp.io/docs", "enabled": 0},
+)
+
+
+def list_mcp_servers(user_id: int, *, only_enabled: bool = False) -> list[dict]:
+    """Серверы пользователя. only_enabled — те, что уходят в запрос."""
+    where = " AND enabled = 1" if only_enabled else ""
+    with connect() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM mcp_servers WHERE user_id = ?{where} ORDER BY id",
+            (user_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_mcp_server(server_id: int, user_id: int) -> dict | None:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM mcp_servers WHERE id = ? AND user_id = ?",
+            (server_id, user_id),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def create_mcp_server(user_id: int, *, title: str, url: str,
+                      enabled: bool = False) -> dict:
+    with connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO mcp_servers (user_id, title, url, enabled, created_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (user_id, title.strip()[:MCP_TITLE_LIMIT] or url[:MCP_TITLE_LIMIT],
+             url.strip()[:MCP_URL_LIMIT], int(enabled), _now()),
+        )
+        row = conn.execute(
+            "SELECT * FROM mcp_servers WHERE id = ?", (cur.lastrowid,)
+        ).fetchone()
+    return dict(row)
+
+
+def set_mcp_enabled(server_id: int, user_id: int, enabled: bool) -> bool:
+    with connect() as conn:
+        cur = conn.execute(
+            "UPDATE mcp_servers SET enabled = ? WHERE id = ? AND user_id = ?",
+            (int(enabled), server_id, user_id),
+        )
+    return cur.rowcount > 0
+
+
+def set_mcp_tools(server_id: int, user_id: int, *,
+                  tools_json: str | None, error: str | None) -> bool:
+    """Запоминает результат похода на сервер: схемы или текст ошибки.
+
+    Прежний кэш при ошибке не стирается: сервер мог отвалиться на минуту, а
+    диалог с его инструментами продолжается.
+    """
+    with connect() as conn:
+        if error:
+            cur = conn.execute(
+                "UPDATE mcp_servers SET error = ? WHERE id = ? AND user_id = ?",
+                (error[:500], server_id, user_id),
+            )
+        else:
+            cur = conn.execute(
+                "UPDATE mcp_servers SET tools = ?, checked_at = ?, error = NULL"
+                " WHERE id = ? AND user_id = ?",
+                (tools_json, _now(), server_id, user_id),
+            )
+    return cur.rowcount > 0
+
+
+def delete_mcp_server(server_id: int, user_id: int) -> bool:
+    with connect() as conn:
+        cur = conn.execute(
+            "DELETE FROM mcp_servers WHERE id = ? AND user_id = ?",
+            (server_id, user_id),
+        )
+    return cur.rowcount > 0
+
+
+def seed_mcp_servers(user_id: int) -> int:
+    """Заводит готовые серверы один раз на пользователя.
+
+    Флаг важнее, чем «серверов нет»: иначе удалённые заготовки возвращались бы
+    после каждого перезапуска — ровно как с готовыми профилями.
+    """
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(mcp_seeded, 0) AS seeded FROM users WHERE id = ?",
+            (user_id,),
+        ).fetchone()
+        if row is None or row["seeded"]:
+            return 0
+        for preset in MCP_PRESETS:
+            conn.execute(
+                "INSERT INTO mcp_servers (user_id, title, url, enabled, created_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (user_id, preset["title"], preset["url"], preset["enabled"], _now()),
+            )
+        conn.execute("UPDATE users SET mcp_seeded = 1 WHERE id = ?", (user_id,))
+    return len(MCP_PRESETS)
 
 
 # ---------- диалоги ----------

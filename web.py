@@ -7,6 +7,7 @@ import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -21,6 +22,7 @@ import benchmark
 import history
 import invariants as invariants_mod
 import llm
+import mcp_tools
 import memory
 import reasoning
 import task
@@ -664,6 +666,123 @@ async def project_fact_delete(
         raise HTTPException(404, "Такого факта нет")
     db.set_project_facts(project_id, json.dumps(facts, ensure_ascii=False))
     return {"ok": True, "facts": facts}
+
+
+# ---------- серверы MCP ----------
+#
+# Сервер объявляет инструменты, включённые уходят схемами в запрос к модели.
+# Схемы кэшируются в базе: ходить за ними на чужой сервер перед каждым
+# сообщением значило бы добавлять его задержку к каждому ответу.
+
+class MCPCreate(BaseModel):
+    title: str = ""
+    url: str
+
+
+class MCPToggle(BaseModel):
+    enabled: bool
+
+
+# Адреса, по которым приложению ходить нечего: запрос уходит с сервера, и на
+# проде «localhost» означал бы стук в собственную сеть, а не в машину того,
+# кто вписал адрес.
+PRIVATE_HOSTS = ("localhost", "127.", "0.", "10.", "192.168.", "169.254.",
+                 "::1", "[::1]", "metadata.google.internal")
+
+
+def _check_mcp_url(url: str) -> str:
+    url = (url or "").strip()
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise HTTPException(400, "Адрес должен начинаться с http:// или https://")
+    host = parsed.hostname.lower()
+    private = (
+        host.startswith(PRIVATE_HOSTS)
+        or host.endswith((".local", ".internal"))
+        or any(host.startswith(f"172.{n}.") for n in range(16, 32))
+    )
+    if private:
+        raise HTTPException(
+            400, "Локальные и внутренние адреса недоступны: запрос уходит "
+                 "с сервера приложения, а не из вашего браузера")
+    return url
+
+
+def _mcp_view(server: dict) -> dict:
+    tools = mcp_tools.cached_tools(server)
+    return {
+        "id": server["id"],
+        "title": server["title"],
+        "url": server["url"],
+        "enabled": bool(server["enabled"]),
+        "slug": mcp_tools.server_slug(server),
+        "tools": [{"name": t["name"], "description": mcp_tools.describe_tool(t, server),
+                   "required": list((t.get("schema") or {}).get("required") or [])}
+                  for t in tools],
+        "count": len(tools),
+        "checked_at": server["checked_at"],
+        "error": server["error"],
+    }
+
+
+async def _refresh_mcp(server: dict, user: dict) -> dict:
+    """Сходить на сервер и обновить кэш схем. Ошибку не прячем, а показываем."""
+    try:
+        found = await mcp_tools.list_tools(server["url"])
+    except mcp_tools.MCPError as err:
+        db.set_mcp_tools(server["id"], user["id"], tools_json=None, error=str(err))
+        return _mcp_view(db.get_mcp_server(server["id"], user["id"]))
+    db.set_mcp_tools(server["id"], user["id"],
+                     tools_json=mcp_tools.tools_json(found), error=None)
+    view = _mcp_view(db.get_mcp_server(server["id"], user["id"]))
+    view["server_name"] = found.name
+    view["protocol"] = found.protocol
+    return view
+
+
+def _owned_mcp(server_id: int, user: dict) -> dict:
+    server = db.get_mcp_server(server_id, user["id"])
+    if server is None:
+        raise HTTPException(404, "Сервер не найден")
+    return server
+
+
+@app.get("/api/mcp")
+async def mcp_list(user: dict = Depends(require_approved)) -> dict:
+    return {"servers": [_mcp_view(s) for s in db.list_mcp_servers(user["id"])]}
+
+
+@app.post("/api/mcp")
+async def mcp_create(payload: MCPCreate, user: dict = Depends(require_approved)) -> dict:
+    """Добавляет сервер и сразу идёт к нему за списком инструментов."""
+    url = _check_mcp_url(payload.url)
+    server = db.create_mcp_server(user["id"], title=payload.title, url=url)
+    return await _refresh_mcp(server, user)
+
+
+@app.post("/api/mcp/{server_id}/check")
+async def mcp_check(server_id: int, user: dict = Depends(require_approved)) -> dict:
+    return await _refresh_mcp(_owned_mcp(server_id, user), user)
+
+
+@app.post("/api/mcp/{server_id}/enabled")
+async def mcp_enable(
+    server_id: int, payload: MCPToggle, user: dict = Depends(require_approved)
+) -> dict:
+    """Тумблер. При включении схемы подтягиваются, если их ещё нет."""
+    server = _owned_mcp(server_id, user)
+    db.set_mcp_enabled(server_id, user["id"], payload.enabled)
+    server = db.get_mcp_server(server_id, user["id"])
+    if payload.enabled and not mcp_tools.cached_tools(server):
+        return await _refresh_mcp(server, user)
+    return _mcp_view(server)
+
+
+@app.delete("/api/mcp/{server_id}")
+async def mcp_delete(server_id: int, user: dict = Depends(require_approved)) -> dict:
+    _owned_mcp(server_id, user)
+    db.delete_mcp_server(server_id, user["id"])
+    return {"ok": True}
 
 
 # ---------- диалоги ----------

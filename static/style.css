@@ -447,3 +447,27 @@ td.actions button { margin-left: 6px; }
 .withbtn { display: flex; gap: 6px; align-items: stretch; }
 .withbtn select { flex: 1 1 auto; min-width: 0; }
 .withbtn button { flex: 0 0 auto; padding: 0 10px; font-size: 15px; line-height: 1; }
+
+/* ---------- вкладка MCP ---------- */
+.mcp {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+}
+.mcp.off { opacity: .6; }
+.mcphead { display: flex; align-items: center; gap: 8px; }
+.mcptitle { font-size: 13px; }
+.mcpurl {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: var(--muted);
+  word-break: break-all;
+  margin: 4px 0 6px;
+}
+.mcp .hint { margin: 0; }
+.mcptools { margin-top: 8px; font-size: 12px; }
+.mcptools summary { cursor: pointer; color: var(--muted); }
+.mcptool { margin: 6px 0 0 8px; line-height: 1.4; }
+.mcptool b { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }
+.mcpactions { display: flex; gap: 8px; margin-top: 10px; }

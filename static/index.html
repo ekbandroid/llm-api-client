@@ -39,6 +39,9 @@
   <button class="railbtn" data-tab="task" title="Состояние задачи" aria-label="Задача">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
   </button>
+  <button class="railbtn" data-tab="mcp" title="Серверы MCP" aria-label="MCP">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="7" width="20" height="10" rx="2"/><path d="M7 7V4"/><path d="M17 7V4"/><path d="M12 17v3"/></svg>
+  </button>
   <button class="railbtn" data-tab="tokens" title="Расход токенов" aria-label="Токены">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>
   </button>
@@ -190,6 +193,21 @@
           <div class="events" id="taskEvents"></div>
         </fieldset>
       </div>
+    </div>
+  </section>
+
+  <section class="tab" data-tab="mcp">
+    <div class="tabhead"><span>Серверы MCP</span><span class="grow"></span><button class="hide" title="Свернуть панель">‹</button></div>
+    <div class="tabbody">
+      <div class="hint" style="margin:0 0 10px">Инструменты подключённых серверов уходят в запрос, и модель сама решает, какой вызвать. Выключенные не стоят ни токенов, ни времени.</div>
+      <div id="mcpList"></div>
+      <fieldset style="margin-top:14px">
+        <legend>Новый сервер</legend>
+        <label><span>Название</span><input type="text" id="mcpTitle" maxlength="80" placeholder="Курсы валют"></label>
+        <label><span>Адрес</span><input type="text" id="mcpUrl" placeholder="https://пример.ru/mcp"></label>
+        <button id="mcpAdd">Добавить</button>
+        <div class="hint" id="mcpAddState"></div>
+      </fieldset>
     </div>
   </section>
 
@@ -728,7 +746,7 @@ async function patchInvariant(id, payload) {
   });
   if (!res.ok) {
     const info = await httpErrorResponse(res);
-    alert((info && info.detail) || "Не удалось сохранить инвариант");
+    alert(httpDetail(info, "Не удалось сохранить инвариант"));
   } else {
     invState = await res.json();
   }
@@ -753,7 +771,7 @@ $("invAdd").addEventListener("click", async () => {
   });
   if (!res.ok) {
     const info = await httpErrorResponse(res);
-    alert((info && info.detail) || "Не удалось добавить инвариант");
+    alert(httpDetail(info, "Не удалось добавить инвариант"));
     return;
   }
   invState = await res.json();
@@ -767,6 +785,126 @@ function markRejected(userBox, codes) {
   if (!userBox || !codes || !codes.length || userBox.querySelector(".rejected")) return;
   userBox.querySelector(".who").appendChild(el("span", "rejected", `отклонено: ${codes.join(", ")}`));
 }
+
+// ---------- вкладка «MCP» ----------
+//
+// Список серверов пользователя. Тумблер решает, уйдут ли схемы инструментов
+// сервера в запрос к модели; выключенный сервер не стоит ни токенов, ни
+// времени на соединение.
+
+let mcpServers = [];
+
+async function loadMcp() {
+  const res = await fetch("/api/mcp");
+  if (!res.ok) return;
+  mcpServers = (await res.json()).servers;
+  renderMcp();
+}
+
+function renderMcp() {
+  const list = $("mcpList");
+  list.innerHTML = "";
+  if (!mcpServers.length) {
+    list.appendChild(el("div", "hint", "Серверов пока нет."));
+    return;
+  }
+  for (const s of mcpServers) list.appendChild(mcpRow(s));
+}
+
+function mcpRow(s) {
+  const row = el("div", "mcp" + (s.enabled ? "" : " off"));
+
+  const head = el("div", "mcphead");
+  const on = el("label", "check");
+  const box = el("input");
+  box.type = "checkbox";
+  box.checked = s.enabled;
+  box.onchange = () => mcpPost(`/api/mcp/${s.id}/enabled`, { enabled: box.checked });
+  on.appendChild(box);
+  on.appendChild(document.createTextNode("подключён"));
+  head.appendChild(el("b", "mcptitle", s.title));
+  head.appendChild(el("span", "grow"));
+  head.appendChild(on);
+  row.appendChild(head);
+
+  row.appendChild(el("div", "mcpurl", s.url));
+
+  const state = el("div", "hint");
+  if (s.error) {
+    state.className = "hint violation";
+    state.textContent = s.error;
+  } else if (s.count) {
+    state.textContent = `${s.count} инструментов · префикс имени «${s.slug}__»`;
+  } else {
+    state.textContent = "Инструменты ещё не запрашивались.";
+  }
+  row.appendChild(state);
+
+  if (s.tools.length) {
+    const box2 = el("details", "mcptools");
+    const sum = el("summary", "", `Инструменты (${s.tools.length})`);
+    box2.appendChild(sum);
+    for (const t of s.tools) {
+      const line = el("div", "mcptool");
+      line.appendChild(el("b", "", t.name));
+      const args = t.required.length ? ` (${t.required.join(", ")})` : "";
+      line.appendChild(document.createTextNode(args + " — " + t.description));
+      box2.appendChild(line);
+    }
+    row.appendChild(box2);
+  }
+
+  const actions = el("div", "mcpactions");
+  const check = el("button", "small ghost", "Проверить");
+  check.onclick = () => mcpPost(`/api/mcp/${s.id}/check`, null, check);
+  actions.appendChild(check);
+  const kill = el("button", "small ghost", "Удалить");
+  kill.onclick = async () => {
+    if (!confirm(`Удалить сервер «${s.title}»? Его инструменты перестанут быть доступны модели.`)) return;
+    const res = await fetch(`/api/mcp/${s.id}`, { method: "DELETE" });
+    if (res.ok) loadMcp();
+  };
+  actions.appendChild(kill);
+  row.appendChild(actions);
+  return row;
+}
+
+/** Обращение к серверу с обновлением строки: ответ — сама строка сервера. */
+async function mcpPost(url, body, button) {
+  if (button) { button.disabled = true; button.textContent = "Проверяю…"; }
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: body === null ? undefined : JSON.stringify(body),
+  });
+  if (button) { button.disabled = false; button.textContent = "Проверить"; }
+  if (!res.ok) return;
+  const updated = await res.json();
+  mcpServers = mcpServers.map(s => (s.id === updated.id ? updated : s));
+  renderMcp();
+}
+
+$("mcpAdd").addEventListener("click", async () => {
+  const url = $("mcpUrl").value.trim();
+  const note = $("mcpAddState");
+  if (!url) { note.textContent = "Впишите адрес сервера."; return; }
+  note.textContent = "Соединяюсь…";
+  const res = await fetch("/api/mcp", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title: $("mcpTitle").value.trim(), url }),
+  });
+  if (!res.ok) {
+    const info = await httpErrorResponse(res);
+    note.textContent = httpDetail(info, "Не удалось добавить сервер");
+    return;
+  }
+  const added = await res.json();
+  note.textContent = added.error ? added.error : `Готово: ${added.count} инструментов.`;
+  $("mcpTitle").value = "";
+  $("mcpUrl").value = "";
+  loadMcp();
+});
 
 // ---------- вкладка «Задача» ----------
 //
@@ -797,7 +935,7 @@ async function patchTask(payload) {
   });
   if (!res.ok) {
     const info = await httpErrorResponse(res);
-    alert((info && info.detail) || `Не удалось изменить состояние (HTTP ${res.status})`);
+    alert(httpDetail(info, `Не удалось изменить состояние (HTTP ${res.status})`));
     await loadTask(current);
     return;
   }
@@ -1553,7 +1691,7 @@ async function streamInto(url, payload, turn) {
     if (!res.ok) {
       const info = await httpErrorResponse(res);
       const hint = httpErrorHint(res.status);
-      const text = (info && info.detail) || `Сбой запроса: HTTP ${res.status}` + (hint ? ` — ${hint}` : "");
+      const text = httpDetail(info, `Сбой запроса: HTTP ${res.status}` + (hint ? ` — ${hint}` : ""));
       if (turn) {
         turn.body.classList.add("error");
         turn.body.textContent = text;
@@ -1845,6 +1983,7 @@ $("prompt").addEventListener("keydown", e => {
 loadProfiles()
   .then(loadConversations)
   .then(() => { if (!current) { showMemory(null); loadTask(null); } });
+loadMcp();
 updateTokenStats();
 </script>
 </body>
