@@ -260,7 +260,8 @@ def init() -> None:
         pending = [r[0] for r in conn.execute(
             "SELECT id FROM users WHERE COALESCE(profiles_seeded, 0) = 0")]
         pending_mcp = [r[0] for r in conn.execute(
-            "SELECT id FROM users WHERE COALESCE(mcp_seeded, 0) = 0")]
+            "SELECT id FROM users WHERE COALESCE(mcp_seeded, 0) < ?",
+            (MCP_PRESETS_VERSION,))]
     # Готовые профили заводим и тем, кто зарегистрировался до их появления.
     for user_id in pending:
         seed_profiles(user_id)
@@ -860,18 +861,31 @@ def delete_invariant(invariant_id: int, user_id: int) -> bool:
 MCP_TITLE_LIMIT = 80
 MCP_URL_LIMIT = 500
 
+# Свой сервер погоды — соседний процесс на том же хосте. Адрес переменной:
+# пока он смотрит только внутрь, но публичный вариант включится одной
+# строкой в .env, без правок кода.
+WEATHER_MCP_URL = os.getenv("WEATHER_MCP_URL", "http://127.0.0.1:8001/mcp")
+
 # Готовые серверы — все проверены живым запросом: отвечают без ключа и
-# регистрации. Включён только сервер курсов: схемы выключенных не занимают
-# токены в запросе, а курсы — то, чего обученная модель знать не может.
+# регистрации. Включены те, что знают меняющиеся данные: курсы и погоду.
+# Схемы выключенных не занимают токены в запросе.
+#
+# since — версия, в которой сервер появился в списке. Колонка users.mcp_seeded
+# хранит не «да/нет», а номер версии: иначе добавить пресет тем, кто уже вошёл,
+# было бы нечем — сброс флага вернул бы им и удалённые заготовки.
+MCP_PRESETS_VERSION = 2
+
 MCP_PRESETS = (
-    {"title": "Курсы валют",
+    {"title": "Курсы валют", "since": 1,
      "url": "https://currency-mcp.wesbos.com/mcp", "enabled": 1},
-    {"title": "DeepWiki — документация репозиториев",
+    {"title": "DeepWiki — документация репозиториев", "since": 1,
      "url": "https://mcp.deepwiki.com/mcp", "enabled": 0},
-    {"title": "Context7 — документация библиотек",
+    {"title": "Context7 — документация библиотек", "since": 1,
      "url": "https://mcp.context7.com/mcp", "enabled": 0},
-    {"title": "GitMCP — документация по ссылке",
+    {"title": "GitMCP — документация по ссылке", "since": 1,
      "url": "https://gitmcp.io/docs", "enabled": 0},
+    {"title": "Погода, прогноз и качество воздуха", "since": 2,
+     "url": WEATHER_MCP_URL, "enabled": 1},
 )
 
 
@@ -951,26 +965,32 @@ def delete_mcp_server(server_id: int, user_id: int) -> bool:
 
 
 def seed_mcp_servers(user_id: int) -> int:
-    """Заводит готовые серверы один раз на пользователя.
+    """Доводит список готовых серверов до текущей версии пресетов.
 
-    Флаг важнее, чем «серверов нет»: иначе удалённые заготовки возвращались бы
-    после каждого перезапуска — ровно как с готовыми профилями.
+    Заводятся только те, что появились позже отметки пользователя: удалённые
+    им заготовки прежних версий не возвращаются — ровно как с готовыми
+    профилями, где тем же занят флаг profiles_seeded.
     """
     with connect() as conn:
         row = conn.execute(
             "SELECT COALESCE(mcp_seeded, 0) AS seeded FROM users WHERE id = ?",
             (user_id,),
         ).fetchone()
-        if row is None or row["seeded"]:
+        if row is None or row["seeded"] >= MCP_PRESETS_VERSION:
             return 0
+        added = 0
         for preset in MCP_PRESETS:
+            if preset["since"] <= row["seeded"]:
+                continue
             conn.execute(
                 "INSERT INTO mcp_servers (user_id, title, url, enabled, created_at)"
                 " VALUES (?, ?, ?, ?, ?)",
                 (user_id, preset["title"], preset["url"], preset["enabled"], _now()),
             )
-        conn.execute("UPDATE users SET mcp_seeded = 1 WHERE id = ?", (user_id,))
-    return len(MCP_PRESETS)
+            added += 1
+        conn.execute("UPDATE users SET mcp_seeded = ? WHERE id = ?",
+                     (MCP_PRESETS_VERSION, user_id))
+    return added
 
 
 # ---------- диалоги ----------

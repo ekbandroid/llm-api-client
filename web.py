@@ -696,6 +696,11 @@ def _check_mcp_url(url: str) -> str:
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise HTTPException(400, "Адрес должен начинаться с http:// или https://")
+    # Свой сервер погоды — исключение из запрета на приватные адреса: он и
+    # должен слушать только петлю. Без этого удалённую заготовку нельзя было
+    # бы вернуть руками.
+    if url == db.WEATHER_MCP_URL:
+        return url
     host = parsed.hostname.lower()
     private = (
         host.startswith(PRIVATE_HOSTS)

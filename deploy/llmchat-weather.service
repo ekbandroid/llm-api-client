@@ -1,0 +1,43 @@
+; Свой MCP-сервер погоды — соседний процесс рядом с чатом.
+;
+; Тот же пользователь, тот же каталог и то же виртуальное окружение, что у
+; llmchat: код лежит в одном репозитории и приезжает одной выкаткой. Порт
+; другой, и слушает только петлю — наружу сервер не смотрит, nginx его не
+; проксирует. Чтобы открыть его миру, понадобится location в nginx и
+; переменная WEATHER_MCP_URL в .env.
+;
+; Установка на сервере:
+;   sudo cp /opt/llmchat/app/deploy/llmchat-weather.service /etc/systemd/system/
+;   sudo systemctl daemon-reload && sudo systemctl enable --now llmchat-weather
+
+[Unit]
+Description=LLM chat weather MCP (Open-Meteo)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=llmchat
+Group=llmchat
+WorkingDirectory=/opt/llmchat/app
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/llmchat/venv/bin/uvicorn weather_mcp:app --host 127.0.0.1 --port 8001 --workers 1
+Restart=always
+RestartSec=3
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+
+[Install]
+WantedBy=multi-user.target
