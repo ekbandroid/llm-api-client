@@ -250,6 +250,9 @@
 const $ = id => document.getElementById(id);
 const log = $("log");
 let conversations = [], projects = [], current = null, busy = false;
+// Номер последнего отрисованного сообщения: по нему дозагружаются те, что
+// появились в переписке мимо страницы — ответы запланированных заданий.
+let lastMessageId = 0;
 let currentProject = null, currentProfile = null;
 let taskState = null, taskTokens = 0;
 let invState = null, invariantTokens = 0;
@@ -596,6 +599,7 @@ async function openConversation(id) {
   }
   loadedTotals = data.messages.reduce((s, m) => s + (m.tokens_total || 0), 0);
   loadedTexts = data.messages.map(m => m.content);
+  lastMessageId = data.messages.reduce((n, m) => Math.max(n, m.id || 0), 0);
   // Слои показываем после загрузки сообщений: краткосрочный слой — это они
   // и есть, и до присваивания их счётчик показывал бы ноль.
   showStrategy(current);
@@ -798,6 +802,52 @@ function markRejected(userBox, codes) {
   if (!userBox || !codes || !codes.length || userBox.querySelector(".rejected")) return;
   userBox.querySelector(".who").appendChild(el("span", "rejected", `отклонено: ${codes.join(", ")}`));
 }
+
+// ---------- дозагрузка новых сообщений ----------
+//
+// Запланированные задания выполняются в фоне и пишут ответ прямо в переписку.
+// Открытая страница об этом не знает: она читает сообщения только при открытии
+// диалога. Поэтому раз в несколько секунд спрашиваем, не появилось ли новых.
+
+const CATCHUP_SECONDS = 10;
+// В фоновой вкладке спрашиваем реже: человек её всё равно не видит, а совсем
+// отключать нельзя — вернувшись, он должен увидеть переписку целиком, и
+// событие возвращения не единственный способ туда попасть.
+const CATCHUP_HIDDEN_SECONDS = 60;
+
+let lastCatchUp = 0;
+
+async function catchUpMessages() {
+  // Во время своего же обмена не лезем: сообщения этого хода рисует поток.
+  if (!current || busy) return;
+  const pause = document.visibilityState === "visible"
+    ? CATCHUP_SECONDS : CATCHUP_HIDDEN_SECONDS;
+  if (Date.now() - lastCatchUp < pause * 1000 - 500) return;
+  lastCatchUp = Date.now();
+  const res = await fetch(`/api/conversations/${current.id}/messages?after=${lastMessageId}`);
+  if (!res.ok) return;
+  const fresh = (await res.json()).messages;
+  if (!fresh.length) return;
+
+  // Прокручиваем вниз, только если человек и так был внизу: иначе выдернули бы
+  // страницу из-под того, кто читает середину переписки.
+  const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 80;
+  for (const m of fresh) {
+    renderStored(m);
+    loadedTexts.push(m.content);
+    loadedTotals += m.tokens_total || 0;
+    lastMessageId = Math.max(lastMessageId, m.id || 0);
+  }
+  if (atBottom) log.scrollTop = log.scrollHeight;
+  updateTokenStats();
+  loadJobs(current);
+}
+
+setInterval(catchUpMessages, CATCHUP_SECONDS * 1000);
+// Возвращение на вкладку — повод проверить сразу, не дожидаясь таймера.
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") { lastCatchUp = 0; catchUpMessages(); }
+});
 
 // ---------- вкладка «Расписание» ----------
 //
@@ -1756,7 +1806,8 @@ function simulatedMessage(info) {
   const scheduled = !!info.scheduled;
   const box = addMessage("user simulated",
     scheduled ? `Задание · ${info.title || "по расписанию"}` : "Вы · автопилот");
-  box.querySelector(".body").textContent = info.text || info.prompt || "";
+  box.querySelector(".body").textContent =
+    (scheduled ? info.prompt || info.text : info.text) || "";
   if (!scheduled) box.appendChild(serviceNote(info));
   markRejected(box, info.rejected_by);
   return box;
@@ -1992,6 +2043,8 @@ async function streamInto(url, payload, turn) {
           if (current) { current.summary = "x".repeat(ev.summary_chars); showStrategy(current); }
         } else if (ev.type === "saved") {
           addBranchButton(box, ev.message_id);
+          // Сообщения этого хода уже на экране — дозагрузка их не повторит.
+          lastMessageId = Math.max(lastMessageId, ev.message_id || 0);
           // Первое сообщение дало диалогу имя — обновляем список и поле заголовка.
           current.title = ev.title;
           $("titleInput").value = ev.title;

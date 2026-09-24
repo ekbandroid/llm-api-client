@@ -894,6 +894,18 @@ async def conversation_get(
     }
 
 
+@app.get("/api/conversations/{conversation_id}/messages")
+async def conversation_messages(
+    conversation_id: int, after: int = 0, user: dict = Depends(require_approved)
+) -> dict:
+    """Сообщения новее указанного. Нужен открытой странице: задания пишут в
+    переписку в фоне, и без дозагрузки их ответы видны только после
+    переоткрытия диалога."""
+    _owned(conversation_id, user)
+    fresh = db.list_messages_after(conversation_id, after)
+    return {"messages": [_public_message(m) for m in fresh]}
+
+
 @app.patch("/api/conversations/{conversation_id}")
 async def conversation_patch(
     conversation_id: int, payload: ConversationPatch, user: dict = Depends(require_approved)
@@ -1551,7 +1563,10 @@ async def _execute_job(job: dict) -> None:
         async for chunk in _exchange(
             job["chat_id"], user, _job_prompt(job), outcome=outcome,
             simulated={"scheduled": True, "job_id": job["id"],
-                       "title": job["title"], "kind": job["kind"]},
+                       "title": job["title"], "kind": job["kind"],
+                       # Сам текст поручения: в ленте показываем его, а не
+                       # служебную шапку, которая ушла модели.
+                       "prompt": job["prompt"]},
         ):
             if '"type": "error"' in chunk or '"type":"error"' in chunk:
                 failure = chunk[len("data: "):].strip()[:400]

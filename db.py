@@ -1505,6 +1505,21 @@ def list_messages(conversation_id: int) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def list_messages_after(conversation_id: int, after: int) -> list[dict]:
+    """Только сообщения новее указанного.
+
+    Отдельный запрос, а не фильтр по списку: открытая страница спрашивает об
+    этом раз в несколько секунд, и перечитывать ради этого всю переписку —
+    работа, растущая вместе с диалогом.
+    """
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM messages WHERE conversation_id = ? AND id > ? ORDER BY id",
+            (conversation_id, after),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def history_for_api(conversation_id: int) -> list[dict]:
     """Полная история: только роль и текст, без сжатия."""
     with connect() as conn:
