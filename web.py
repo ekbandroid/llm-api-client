@@ -26,6 +26,7 @@ import llm
 import mcp_tools
 import memory
 import reasoning
+import scheduler
 import task
 import temperature as temperature_mod
 import tokens as tokens_mod
@@ -94,7 +95,12 @@ class ChatRequest(BaseModel):
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     db.init()
-    yield
+    scheduler.init()
+    runner = asyncio.create_task(_job_runner())
+    try:
+        yield
+    finally:
+        runner.cancel()
 
 
 app = FastAPI(title="LLM chat", lifespan=lifespan)
@@ -699,7 +705,7 @@ def _check_mcp_url(url: str) -> str:
     # Свой сервер погоды — исключение из запрета на приватные адреса: он и
     # должен слушать только петлю. Без этого удалённую заготовку нельзя было
     # бы вернуть руками.
-    if url == db.WEATHER_MCP_URL:
+    if url in db.OWN_MCP_URLS:
         return url
     host = parsed.hostname.lower()
     private = (
@@ -931,7 +937,11 @@ async def conversation_delete(
     conversation_id: int, user: dict = Depends(require_approved)
 ) -> dict:
     _owned(conversation_id, user)
-    return {"ok": db.delete_conversation(conversation_id, user["id"])}
+    # Задания живут в отдельной базе и внешним ключом к диалогу не связаны:
+    # убираем их сами, иначе исполнитель будет ходить в удалённую переписку.
+    dropped = scheduler.delete_chat_jobs(conversation_id)
+    return {"ok": db.delete_conversation(conversation_id, user["id"]),
+            "jobs_deleted": dropped}
 
 
 ASSISTANT_TURN_NOTE = (
@@ -961,7 +971,7 @@ MCP_ROUNDS_LIMIT = 3
 MCP_RESULT_LIMIT = 6000
 
 
-async def _run_tool(call: dict, routes: dict) -> dict:
+async def _run_tool(call: dict, routes: dict, *, chat_id: int) -> dict:
     """Выполняет один запрошенный моделью вызов и описывает его для чата.
 
     Ошибка инструмента не прерывает обмен: её текст возвращается модели как
@@ -983,6 +993,11 @@ async def _run_tool(call: dict, routes: dict) -> dict:
         return note
 
     server, tool = route
+    # Идентификатор диалога подставляет приложение: модель его не знает, и в
+    # схеме этого параметра нет вовсе. Иначе планировщику некуда было бы
+    # класть результат поручения.
+    for field in mcp_tools.app_args(server, tool):
+        arguments[field] = chat_id
     note.update(server=server["title"], tool=tool, url=server["url"])
     note["request"] = {"method": "tools/call", "url": server["url"],
                        "body": {"name": tool, "arguments": arguments}}
@@ -1079,6 +1094,11 @@ async def _exchange(
             await _refresh_mcp(server, user)
     servers = db.list_mcp_servers(user["id"], only_enabled=True)
     tool_schemas, tool_routes = mcp_tools.request_tools(servers)
+    # Выполнение задания не заводит новых заданий: инструменты планирования
+    # на это время снимаются. Одной просьбы в тексте мало — проверено, первое
+    # же напоминание, выполняясь, завело себе копию и продолжило бы вечно.
+    if simulated and simulated.get("scheduled"):
+        tool_schemas = mcp_tools.without_scheduling(tool_schemas, tool_routes)
     if tool_schemas:
         described["mcp"] = {
             "servers": len(servers),
@@ -1189,7 +1209,7 @@ async def _exchange(
             messages = messages + [
                 {"role": "assistant", "content": said, "tool_calls": calls}]
             for call in calls:
-                note = await _run_tool(call, tool_routes)
+                note = await _run_tool(call, tool_routes, chat_id=conversation_id)
                 service.append(note)
                 yield sse({"type": "mcp", **note})
                 messages.append({
@@ -1450,6 +1470,126 @@ async def _assistant_turns(
         yield sse({"type": "assistant_turns_done", "turns": made})
 
 
+# ---------- исполнитель заданий ----------
+#
+# Планировщик (scheduler_mcp.py) только ведёт очередь. Выполняет поручения
+# приложение — и тем же конвейером, что обычную реплику: заданию доступны
+# память, инварианты, состояние задачи и все инструменты MCP, а ответ ложится
+# сообщением в тот диалог, где поручение дали.
+
+# Как часто заглядываем в очередь. Минута точности достаточна: расписание
+# задаётся в минутах, а более частый опрос — это лишние чтения базы впустую.
+JOB_TICK_SECONDS = int(os.getenv("JOB_TICK_SECONDS", "30"))
+
+# Сколько результатов заданий-источников кладём в сводку.
+SUMMARY_LIMIT = 40
+
+# Замки на диалог: человек и исполнитель не должны писать в одну переписку
+# одновременно — сообщения перемешались бы, а история стала бы нечитаемой.
+_chat_locks: dict[int, asyncio.Lock] = {}
+
+
+def _chat_lock(conversation_id: int) -> asyncio.Lock:
+    lock = _chat_locks.get(conversation_id)
+    if lock is None:
+        lock = _chat_locks[conversation_id] = asyncio.Lock()
+    return lock
+
+
+# Шапка запланированного хода. Без неё поручение «напомни про чайник» читается
+# как просьба завести напоминание, а не выполнить его.
+JOB_HEADER = (
+    "Сработало запланированное поручение «{title}». Выполни его прямо сейчас и "
+    "ответь в этот диалог — это и есть выполнение, заводить новое задание не "
+    "нужно.\n\nПоручение: {prompt}"
+)
+
+
+def _job_prompt(job: dict) -> str:
+    """Поручение в том виде, в каком его получит агент.
+
+    Для сводки к тексту поручения подкладываются результаты заданий-источников
+    за прошедший период: модель не помнит, что писала в прошлые разы, и без
+    этого блока обобщать ей было бы нечего.
+    """
+    if job["kind"] != scheduler.SUMMARY:
+        return JOB_HEADER.format(title=job["title"], prompt=job["prompt"])
+
+    sources = json.loads(job["sources"] or "null") or [
+        other["id"] for other in scheduler.list_jobs(job["chat_id"])
+        if other["id"] != job["id"]
+    ]
+    hours = max(1, round((job["every_minutes"] or 60) / 60))
+    runs = scheduler.recent_runs(sources, hours=hours, limit=SUMMARY_LIMIT)
+    head = JOB_HEADER.format(title=job["title"], prompt=job["prompt"])
+    if not runs:
+        return (f"{head}\n\n(Результатов за последние {hours} ч не "
+                "накопилось — так и скажи.)")
+    lines = "\n".join(
+        f"- {r['ran_at']} · {r['title']}: {(r['answer'] or '').strip()[:300]}"
+        for r in runs
+    )
+    return (f"{head}\n\nРезультаты заданий за последние {hours} ч "
+            f"({len(runs)} шт.):\n{lines}")
+
+
+async def _execute_job(job: dict) -> None:
+    """Прогоняет поручение через обычный конвейер обмена."""
+    user = db.conversation_owner(job["chat_id"])
+    if user is None:
+        # Диалог удалили вместе с заданиями, но это могло произойти в другом
+        # процессе — просто убираем осиротевшее.
+        scheduler.delete_chat_jobs(job["chat_id"])
+        return
+
+    outcome: dict = {}
+    # События потока некому показывать, но сообщение об ошибке из них достать
+    # надо: без него в истории запусков осталось бы «ответ не получен» без
+    # единого слова о причине.
+    failure = ""
+    try:
+        async for chunk in _exchange(
+            job["chat_id"], user, _job_prompt(job), outcome=outcome,
+            simulated={"scheduled": True, "job_id": job["id"],
+                       "title": job["title"], "kind": job["kind"]},
+        ):
+            if '"type": "error"' in chunk or '"type":"error"' in chunk:
+                failure = chunk[len("data: "):].strip()[:400]
+    except Exception as err:  # noqa: BLE001 — падение задания не должно ронять петлю
+        scheduler.record(job["id"], ok=False, error=f"{type(err).__name__}: {err}")
+        print(f"планировщик: задание #{job['id']} упало — {type(err).__name__}: {err}")
+        return
+
+    ok = bool(outcome.get("ok"))
+    if not ok:
+        print(f"планировщик: задание #{job['id']} без ответа — {failure or 'причина неизвестна'}")
+    scheduler.record(
+        job["id"], ok=ok,
+        answer=outcome.get("answer", ""), tokens=outcome.get("tokens", 0),
+        error="" if ok else (failure or "ответ не получен"),
+    )
+
+
+async def _job_runner() -> None:
+    """Фоновая петля: раз в JOB_TICK_SECONDS забирает созревшие задания."""
+    while True:
+        try:
+            for job in scheduler.take_due():
+                lock = _chat_lock(job["chat_id"])
+                if lock.locked():
+                    # В диалоге сейчас пишет человек — вернём задание в очередь
+                    # и попробуем на следующем тике.
+                    scheduler.postpone(job["id"])
+                    continue
+                async with lock:
+                    await _execute_job(job)
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:  # noqa: BLE001 — петля переживает любой сбой
+            print(f"планировщик: тик не удался — {type(err).__name__}: {err}")
+        await asyncio.sleep(JOB_TICK_SECONDS)
+
+
 def _sse_response(events: AsyncIterator[str]) -> StreamingResponse:
     return StreamingResponse(
         events,
@@ -1476,20 +1616,63 @@ async def conversation_send(
         raise HTTPException(400, "Пустое сообщение")
 
     async def events() -> AsyncIterator[str]:
-        outcome: dict = {}
-        async for chunk in _exchange(conversation_id, user, content, outcome=outcome):
-            yield chunk
-        # На паузе ни автопилот, ни самостоятельные ходы не стартуют: пауза —
-        # тормоз человека над автоматом.
-        if outcome.get("ok") and not outcome.get("paused"):
-            if task.is_autopilot(_owned(conversation_id, user)):
-                async for chunk in _autopilot(conversation_id, user, request):
-                    yield chunk
-            else:
-                async for chunk in _assistant_turns(conversation_id, user, request):
-                    yield chunk
+        # Замок держится весь обмен: пока человек разговаривает, исполнитель
+        # заданий в этот диалог не пишет.
+        async with _chat_lock(conversation_id):
+            outcome: dict = {}
+            async for chunk in _exchange(conversation_id, user, content, outcome=outcome):
+                yield chunk
+            # На паузе ни автопилот, ни самостоятельные ходы не стартуют: пауза —
+            # тормоз человека над автоматом.
+            if outcome.get("ok") and not outcome.get("paused"):
+                if task.is_autopilot(_owned(conversation_id, user)):
+                    async for chunk in _autopilot(conversation_id, user, request):
+                        yield chunk
+                else:
+                    async for chunk in _assistant_turns(conversation_id, user, request):
+                        yield chunk
 
     return _sse_response(events())
+
+
+@app.get("/api/conversations/{conversation_id}/jobs")
+async def jobs_list(
+    conversation_id: int, user: dict = Depends(require_approved)
+) -> dict:
+    """Задания этого диалога для вкладки «Расписание»."""
+    _owned(conversation_id, user)
+    return {"jobs": [scheduler.describe(j)
+                     for j in scheduler.list_jobs(conversation_id)]}
+
+
+class JobStatus(BaseModel):
+    status: str
+
+
+@app.post("/api/conversations/{conversation_id}/jobs/{job_id}/status")
+async def job_status(
+    conversation_id: int, job_id: int, payload: JobStatus,
+    user: dict = Depends(require_approved),
+) -> dict:
+    """Пауза, возобновление или отмена задания."""
+    _owned(conversation_id, user)
+    try:
+        job = scheduler.set_status(job_id, payload.status, conversation_id)
+    except ValueError as err:
+        raise HTTPException(400, str(err)) from err
+    if job is None:
+        raise HTTPException(404, "Задание не найдено")
+    return scheduler.describe(job)
+
+
+@app.delete("/api/conversations/{conversation_id}/jobs/{job_id}")
+async def job_delete(
+    conversation_id: int, job_id: int, user: dict = Depends(require_approved)
+) -> dict:
+    _owned(conversation_id, user)
+    if not scheduler.delete(job_id, conversation_id):
+        raise HTTPException(404, "Задание не найдено")
+    return {"ok": True}
 
 
 @app.post("/api/conversations/{conversation_id}/autopilot")

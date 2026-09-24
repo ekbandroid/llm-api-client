@@ -471,3 +471,27 @@ td.actions button { margin-left: 6px; }
 .mcptool { margin: 6px 0 0 8px; line-height: 1.4; }
 .mcptool b { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }
 .mcpactions { display: flex; gap: 8px; margin-top: 10px; }
+
+/* ---------- вкладка «Расписание» ---------- */
+.job {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+}
+.job.off { opacity: .6; }
+.jobhead { display: flex; align-items: center; gap: 8px; }
+.jobtitle { font-size: 13px; }
+.jobkind {
+  font-size: 11px; color: var(--muted);
+  border: 1px solid var(--border); border-radius: 999px; padding: 1px 8px;
+}
+.job .hint { margin: 4px 0 0; }
+.jobprompt {
+  margin-top: 6px; font-size: 12px; line-height: 1.4;
+  color: var(--muted); white-space: pre-wrap;
+}
+.jobanswer { margin-top: 8px; font-size: 12px; }
+.jobanswer summary { cursor: pointer; color: var(--muted); }
+.jobanswer div { margin-top: 6px; white-space: pre-wrap; line-height: 1.4; }
+.jobactions { display: flex; gap: 8px; margin-top: 10px; }

@@ -861,10 +861,12 @@ def delete_invariant(invariant_id: int, user_id: int) -> bool:
 MCP_TITLE_LIMIT = 80
 MCP_URL_LIMIT = 500
 
-# Свой сервер погоды — соседний процесс на том же хосте. Адрес переменной:
-# пока он смотрит только внутрь, но публичный вариант включится одной
-# строкой в .env, без правок кода.
+# Свои серверы — соседние процессы на том же хосте. Адреса переменными: пока
+# они смотрят только внутрь, но публичный вариант включится одной строкой
+# в .env, без правок кода.
 WEATHER_MCP_URL = os.getenv("WEATHER_MCP_URL", "http://127.0.0.1:8001/mcp")
+SCHEDULER_MCP_URL = os.getenv("SCHEDULER_MCP_URL", "http://127.0.0.1:8002/mcp")
+OWN_MCP_URLS = (WEATHER_MCP_URL, SCHEDULER_MCP_URL)
 
 # Готовые серверы — все проверены живым запросом: отвечают без ключа и
 # регистрации. Включены те, что знают меняющиеся данные: курсы и погоду.
@@ -873,7 +875,7 @@ WEATHER_MCP_URL = os.getenv("WEATHER_MCP_URL", "http://127.0.0.1:8001/mcp")
 # since — версия, в которой сервер появился в списке. Колонка users.mcp_seeded
 # хранит не «да/нет», а номер версии: иначе добавить пресет тем, кто уже вошёл,
 # было бы нечем — сброс флага вернул бы им и удалённые заготовки.
-MCP_PRESETS_VERSION = 2
+MCP_PRESETS_VERSION = 3
 
 MCP_PRESETS = (
     {"title": "Курсы валют", "since": 1,
@@ -886,6 +888,8 @@ MCP_PRESETS = (
      "url": "https://gitmcp.io/docs", "enabled": 0},
     {"title": "Погода, прогноз и качество воздуха", "since": 2,
      "url": WEATHER_MCP_URL, "enabled": 1},
+    {"title": "Планировщик поручений", "since": 3,
+     "url": SCHEDULER_MCP_URL, "enabled": 1},
 )
 
 
@@ -1040,6 +1044,16 @@ def get_conversation(conversation_id: int, user_id: int) -> dict | None:
             "SELECT * FROM conversations WHERE id = ? AND user_id = ?", (conversation_id, user_id)
         ).fetchone()
     return dict(row) if row else None
+
+
+def conversation_owner(conversation_id: int) -> dict | None:
+    """Владелец диалога. Исполнителю заданий нужен пользователь, а не только чат:
+    задание приходит из планировщика, где пользователей нет вовсе."""
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT user_id FROM conversations WHERE id = ?", (conversation_id,)
+        ).fetchone()
+    return get(row["user_id"]) if row else None
 
 
 def list_conversations(user_id: int) -> list[dict]:

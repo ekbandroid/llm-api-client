@@ -1,0 +1,44 @@
+; MCP-сервер планировщика: очередь отложенных и повторяющихся поручений.
+;
+; Сам ничего не выполняет — ведёт очередь в /opt/llmchat/data/scheduler.db.
+; Выполняет поручения приложение (llmchat): агент, модель и переписка есть
+; только там. Отсюда ReadWritePaths: этому процессу нужна запись в базу, а
+; ProtectSystem=strict по умолчанию не даёт писать никуда.
+;
+; Установка на сервере:
+;   sudo cp /opt/llmchat/app/deploy/llmchat-scheduler.service /etc/systemd/system/
+;   sudo systemctl daemon-reload && sudo systemctl enable --now llmchat-scheduler
+
+[Unit]
+Description=LLM chat scheduler MCP (очередь поручений)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=llmchat
+Group=llmchat
+WorkingDirectory=/opt/llmchat/app
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+Environment=SCHEDULER_DB_PATH=/opt/llmchat/data/scheduler.db
+ExecStart=/opt/llmchat/venv/bin/uvicorn scheduler_mcp:app --host 127.0.0.1 --port 8002 --workers 1
+Restart=always
+RestartSec=3
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/llmchat/data
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+
+[Install]
+WantedBy=multi-user.target

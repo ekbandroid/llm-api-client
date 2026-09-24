@@ -42,6 +42,9 @@
   <button class="railbtn" data-tab="mcp" title="Серверы MCP" aria-label="MCP">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="7" width="20" height="10" rx="2"/><path d="M7 7V4"/><path d="M17 7V4"/><path d="M12 17v3"/></svg>
   </button>
+  <button class="railbtn" data-tab="jobs" title="Расписание заданий" aria-label="Расписание">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 14"/></svg>
+  </button>
   <button class="railbtn" data-tab="tokens" title="Расход токенов" aria-label="Токены">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>
   </button>
@@ -208,6 +211,14 @@
         <button id="mcpAdd">Добавить</button>
         <div class="hint" id="mcpAddState"></div>
       </fieldset>
+    </div>
+  </section>
+
+  <section class="tab" data-tab="jobs">
+    <div class="tabhead"><span>Расписание</span><span class="grow"></span><button class="hide" title="Свернуть панель">‹</button></div>
+    <div class="tabbody">
+      <div class="hint" style="margin:0 0 10px">Поручения этого диалога. Заводятся словами: «напомни через 15 минут…», «каждый час смотри…». Выполняет их ассистент сам, ответ придёт в эту же переписку.</div>
+      <div id="jobsList"></div>
     </div>
   </section>
 
@@ -560,6 +571,7 @@ function showEmpty() {
   showMemory(null);
   loadTask(null);
   loadInvariants(null);
+  loadJobs(null);
 }
 
 async function openConversation(id) {
@@ -590,6 +602,7 @@ async function openConversation(id) {
   showMemory(current);
   loadTask(current);
   loadInvariants(current);
+  loadJobs(current);
   updateTokenStats();
   log.scrollTop = log.scrollHeight;
   renderList();
@@ -784,6 +797,117 @@ $("invAdd").addEventListener("click", async () => {
 function markRejected(userBox, codes) {
   if (!userBox || !codes || !codes.length || userBox.querySelector(".rejected")) return;
   userBox.querySelector(".who").appendChild(el("span", "rejected", `отклонено: ${codes.join(", ")}`));
+}
+
+// ---------- вкладка «Расписание» ----------
+//
+// Поручения заводит модель инструментами планировщика; здесь они только
+// показываются и управляются руками: пауза, возобновление, удаление.
+
+const JOB_KINDS = { once: "разовое", repeat: "повторяющееся", summary: "сводка" };
+const JOB_STATUS = { active: "активно", paused: "на паузе", done: "выполнено" };
+
+let jobsTimer = null;
+
+async function loadJobs(conv) {
+  const list = $("jobsList");
+  if (!conv) {
+    list.innerHTML = "";
+    list.appendChild(el("div", "hint", "Диалог не выбран."));
+    return;
+  }
+  const res = await fetch(`/api/conversations/${conv.id}/jobs`);
+  if (!res.ok) return;
+  renderJobs((await res.json()).jobs);
+}
+
+function renderJobs(jobs) {
+  const list = $("jobsList");
+  list.innerHTML = "";
+  if (!jobs.length) {
+    list.appendChild(el("div", "hint", "Заданий пока нет."));
+    return;
+  }
+  for (const job of jobs) list.appendChild(jobRow(job));
+}
+
+/** «через 12 мин» — время запуска считаем в браузере: он знает часовой пояс. */
+function whenText(stamp) {
+  if (!stamp) return "не запланирован";
+  const at = new Date(stamp);
+  const minutes = Math.round((at - new Date()) / 60000);
+  const clock = at.toLocaleString("ru-RU", { day: "2-digit", month: "2-digit",
+                                             hour: "2-digit", minute: "2-digit" });
+  if (minutes <= 0) return `${clock} (вот-вот)`;
+  if (minutes < 60) return `${clock} (через ${minutes} мин)`;
+  const hours = minutes / 60;
+  if (hours < 24) return `${clock} (через ${hours.toFixed(1).replace(".0", "")} ч)`;
+  return `${clock} (через ${(hours / 24).toFixed(1).replace(".0", "")} сут)`;
+}
+
+function jobRow(job) {
+  const row = el("div", "job" + (job.status === "active" ? "" : " off"));
+
+  const head = el("div", "jobhead");
+  head.appendChild(el("b", "jobtitle", job.title));
+  head.appendChild(el("span", "grow"));
+  head.appendChild(el("span", "jobkind", JOB_KINDS[job.kind] || job.kind));
+  row.appendChild(head);
+
+  const state = el("div", "hint");
+  const parts = [JOB_STATUS[job.status] || job.status];
+  if (job.every_minutes) parts.push(`каждые ${job.every_minutes} мин`);
+  if (job.status === "active") parts.push(`следующий запуск ${whenText(job.next_run_at)}`);
+  if (job.runs) parts.push(`выполнено раз: ${job.runs}`);
+  state.textContent = parts.join(" · ");
+  row.appendChild(state);
+
+  const what = el("div", "jobprompt", job.prompt);
+  row.appendChild(what);
+
+  if (job.last_answer) {
+    const box = el("details", "jobanswer");
+    box.appendChild(el("summary", "", "Последний результат"));
+    box.appendChild(el("div", "", job.last_answer));
+    row.appendChild(box);
+  }
+
+  const actions = el("div", "jobactions");
+  if (job.status !== "done") {
+    const paused = job.status === "paused";
+    const toggle = el("button", "small ghost", paused ? "Возобновить" : "Пауза");
+    toggle.onclick = () => jobStatus(job.id, paused ? "active" : "paused");
+    actions.appendChild(toggle);
+  }
+  const kill = el("button", "small ghost", "Удалить");
+  kill.onclick = async () => {
+    if (!confirm(`Удалить задание «${job.title}»? Его история выполнений тоже уйдёт.`)) return;
+    const res = await fetch(`/api/conversations/${current.id}/jobs/${job.id}`, { method: "DELETE" });
+    if (res.ok) loadJobs(current);
+  };
+  actions.appendChild(kill);
+  row.appendChild(actions);
+  return row;
+}
+
+async function jobStatus(jobId, status) {
+  const res = await fetch(`/api/conversations/${current.id}/jobs/${jobId}/status`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ status }),
+  });
+  if (res.ok) loadJobs(current);
+}
+
+// Пока вкладка открыта, список обновляется сам: задания выполняются в фоне,
+// и без этого «следующий запуск» застыл бы на времени открытия.
+function watchJobs() {
+  if (jobsTimer) clearInterval(jobsTimer);
+  jobsTimer = setInterval(() => {
+    const visible = document.querySelector('.tab[data-tab="jobs"].on')
+      && !document.querySelector(".app").classList.contains("rail-only");
+    if (visible && current) loadJobs(current);
+  }, 20000);
 }
 
 // ---------- вкладка «MCP» ----------
@@ -1547,7 +1671,7 @@ function renderStored(m) {
     log.appendChild(note);
     return;
   }
-  if (m.role === "user" && m.meta && m.meta.simulated) {
+  if (m.role === "user" && m.meta && (m.meta.simulated || m.meta.scheduled)) {
     simulatedMessage({ ...m.meta, text: m.content });
     return;
   }
@@ -1626,9 +1750,14 @@ function newTurn() {
 
 /** Реплика, которую за пользователя написала модель. */
 function simulatedMessage(info) {
-  const box = addMessage("user simulated", "Вы · автопилот");
-  box.querySelector(".body").textContent = info.text;
-  box.appendChild(serviceNote(info));
+  // Реплику мог написать автопилот, а мог планировщик — подпись разная, потому
+  // что это разные вещи: там модель играет пользователя, здесь срабатывает
+  // заведённое вами поручение.
+  const scheduled = !!info.scheduled;
+  const box = addMessage("user simulated",
+    scheduled ? `Задание · ${info.title || "по расписанию"}` : "Вы · автопилот");
+  box.querySelector(".body").textContent = info.text || info.prompt || "";
+  if (!scheduled) box.appendChild(serviceNote(info));
   markRejected(box, info.rejected_by);
   return box;
 }
@@ -2004,6 +2133,7 @@ loadProfiles()
   .then(loadConversations)
   .then(() => { if (!current) { showMemory(null); loadTask(null); } });
 loadMcp();
+watchJobs();
 updateTokenStats();
 </script>
 </body>

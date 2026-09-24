@@ -178,6 +178,19 @@ async def call_tool(
 
 NAME_SEPARATOR = "__"
 
+# Инструменты, чьё имя начинается с подчёркивания, модели не показываются:
+# это служебная связь сервера с приложением. Так же и параметры из APP_ARGS —
+# их подставляет приложение, и знать о них модели незачем: идентификатор
+# диалога она всё равно не знает, а увидев поле в схеме, начала бы его
+# выдумывать.
+SERVICE_PREFIX = "_"
+APP_ARGS = ("chat_id",)
+
+# Инструменты, которые заводят задания планировщика. Во время выполнения
+# задания они убираются из запроса — иначе получается бесконечная цепочка:
+# проверено, первое же напоминание, выполняясь, завело себе копию.
+SCHEDULING_PREFIX = "schedule_"
+
 RULES = (
     "Подключены инструменты MCP. Правила обращения с ними:\n"
     "Данные, которые меняются со временем — курсы валют, котировки, погода, "
@@ -195,17 +208,38 @@ RULES = (
 )
 
 
-def server_slug(server: dict) -> str:
-    """Короткое имя сервера для составного имени инструмента.
+# Кириллица в латиницу: имя функции в запросе допускает только латиницу,
+# цифры, дефис и подчёркивание, а названия своих серверов написаны по-русски.
+TRANSLIT = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e",
+    "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m",
+    "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+    "ф": "f", "х": "h", "ц": "c", "ч": "ch", "ш": "sh", "щ": "sch", "ъ": "",
+    "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+}
 
-    Берётся из адреса, а не из названия: названия пользователь пишет
-    по-русски, а имя функции в запросе допускает только латиницу, цифры,
-    дефис и подчёркивание.
-    """
-    host = (urlparse(server.get("url") or "").hostname or "").lower()
-    label = host.removeprefix("www.").removeprefix("mcp.").split(".")[0]
-    label = label.replace("-mcp", "").replace("mcp-", "")
-    return re.sub(r"[^a-z0-9]+", "", label) or "mcp"
+# Имя из адреса осмысленно, пока адрес чужой. У своих серверов хост всегда
+# 127.0.0.1, и слаг «127» не сказал бы модели ничего, а два своих сервера
+# получили бы ещё и одинаковый.
+LOCAL_HOSTS = ("localhost", "127.0.0.1", "0.0.0.0", "::1")
+
+
+def _translit(text: str) -> str:
+    latin = "".join(TRANSLIT.get(ch, ch) for ch in (text or "").lower())
+    words = [w for w in re.split(r"[^a-z0-9]+", latin) if w]
+    return (words[0] if words else "")[:12]
+
+
+def server_slug(server: dict) -> str:
+    """Короткое имя сервера для составного имени инструмента."""
+    parsed = urlparse(server.get("url") or "")
+    host = (parsed.hostname or "").lower()
+    if host and host not in LOCAL_HOSTS:
+        label = host.removeprefix("www.").removeprefix("mcp.").split(".")[0]
+        label = label.replace("-mcp", "").replace("mcp-", "")
+        if clean := re.sub(r"[^a-z0-9]+", "", label):
+            return clean
+    return _translit(server.get("title") or "") or f"mcp{parsed.port or ''}" or "mcp"
 
 
 def tools_json(server: Server) -> str:
@@ -237,6 +271,29 @@ def describe_tool(tool: dict, server: dict) -> str:
     return text or f"инструмент сервера «{server.get('title') or server.get('url')}»"
 
 
+def app_args(server: dict, tool_name: str) -> list[str]:
+    """Параметры, которые приложение подставляет за модель."""
+    for tool in cached_tools(server):
+        if tool["name"] == tool_name:
+            properties = (tool.get("schema") or {}).get("properties") or {}
+            return [name for name in APP_ARGS if name in properties]
+    return []
+
+
+def _model_schema(tool: dict) -> dict:
+    """Схема аргументов без тех, что подставляет приложение."""
+    schema = dict(tool.get("schema") or {"type": "object", "properties": {}})
+    properties = dict(schema.get("properties") or {})
+    if not any(name in properties for name in APP_ARGS):
+        return schema
+    for name in APP_ARGS:
+        properties.pop(name, None)
+    schema["properties"] = properties
+    if required := schema.get("required"):
+        schema["required"] = [r for r in required if r not in APP_ARGS]
+    return schema
+
+
 def request_tools(servers: list[dict]) -> tuple[list[dict], dict[str, tuple[dict, str]]]:
     """Схемы для поля `tools` и отображение имени обратно в сервер и инструмент."""
     schemas: list[dict] = []
@@ -249,6 +306,8 @@ def request_tools(servers: list[dict]) -> tuple[list[dict], dict[str, tuple[dict
             slug = f"{slug}{server['id']}"
         used.add(slug)
         for tool in cached_tools(server):
+            if tool["name"].startswith(SERVICE_PREFIX):
+                continue
             name = f"{slug}{NAME_SEPARATOR}{tool['name']}"[:64]
             routes[name] = (server, tool["name"])
             schemas.append({
@@ -256,10 +315,19 @@ def request_tools(servers: list[dict]) -> tuple[list[dict], dict[str, tuple[dict
                 "function": {
                     "name": name,
                     "description": describe_tool(tool, server),
-                    "parameters": tool.get("schema") or {"type": "object", "properties": {}},
+                    "parameters": _model_schema(tool),
                 },
             })
     return schemas, routes
+
+
+def without_scheduling(
+    schemas: list[dict], routes: dict[str, tuple[dict, str]]
+) -> list[dict]:
+    """Схемы без инструментов заведения заданий."""
+    return [s for s in schemas
+            if not routes.get(s["function"]["name"], (None, ""))[1]
+            .startswith(SCHEDULING_PREFIX)]
 
 
 def blocks(servers: list[dict]) -> list[dict]:
