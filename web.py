@@ -1708,21 +1708,34 @@ async def files_list(
 
 @app.get("/api/conversations/{conversation_id}/files/{name}")
 async def file_download(
-    conversation_id: int, name: str, user: dict = Depends(require_approved)
+    conversation_id: int, name: str, view: bool = False,
+    user: dict = Depends(require_approved),
 ):
-    """Отдаёт файл на скачивание.
+    """Отдаёт файл: по умолчанию вложением, с view=1 — на показ в браузере.
 
-    Всегда вложением и всегда простым текстом: содержимое написала модель, и
-    открывать его в браузере как разметку нельзя — это чужой текст в нашем
-    домене со всеми вытекающими.
+    Содержимое написала модель, поэтому показ ограничен дважды. Во-первых,
+    показывать можно не всё: тип решает files_store, и неизвестное уедет
+    вложением, даже если в адресе попросили обратное. Во-вторых, разметка и
+    рисунки отдаются с заголовком песочницы — браузер считает такую страницу
+    чужим источником, и позвать наш API её скрипт уже не может. Без этого
+    страница из файла читала бы всю переписку: кука ушла бы автоматически,
+    потому что домен наш.
     """
     _owned(conversation_id, user)
     path = files_store.find(conversation_id, name)
     if path is None:
         raise HTTPException(404, "Файл не найден")
+
+    kind, viewable, sandbox = files_store.content_type(path.name)
+    if not (view and viewable):
+        return FileResponse(
+            path, media_type="text/plain; charset=utf-8",
+            filename=path.name, content_disposition_type="attachment",
+        )
     return FileResponse(
-        path, media_type="text/plain; charset=utf-8",
-        filename=path.name, content_disposition_type="attachment",
+        path, media_type=kind, filename=path.name,
+        content_disposition_type="inline",
+        headers={"Content-Security-Policy": "sandbox allow-scripts"} if sandbox else {},
     )
 
 

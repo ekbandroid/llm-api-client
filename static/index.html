@@ -907,8 +907,19 @@ function fileRow(file) {
   })));
 
   const actions = el("div", "fileactions");
+  const address = `/api/conversations/${current.id}/files/${encodeURIComponent(file.name)}`;
+
+  // Открывать можно не всё — решает сервер, здесь мы только показываем кнопку.
+  if (file.viewable) {
+    const open = el("a", "btn ghost small", "Открыть");
+    open.href = address + "?view=1";
+    open.target = "_blank";
+    open.rel = "noopener noreferrer";
+    actions.appendChild(open);
+  }
+
   const link = el("a", "btn ghost small", "Скачать");
-  link.href = `/api/conversations/${current.id}/files/${encodeURIComponent(file.name)}`;
+  link.href = address;
   link.download = file.name;
   actions.appendChild(link);
 

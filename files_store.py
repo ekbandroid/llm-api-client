@@ -9,6 +9,7 @@
 файлы одного разговора не смешивались с другим и удалялись вместе с ним.
 """
 
+import mimetypes
 import os
 import re
 from datetime import datetime, timezone
@@ -27,22 +28,71 @@ FILES_DIR = Path(os.getenv("FILES_DIR") or db.DB_PATH.resolve().parent / "files"
 # слэши вырезаются целиком — содержимое приходит от модели, и складывать по
 # её выбору куда угодно на диске мы не станем.
 NAME_ALLOWED = re.compile(r"[^A-Za-zА-Яа-яЁё0-9 _-]+")
-EXTENSIONS = (".md", ".txt")
+
+# Расширение — хвост из латинских букв и цифр. Список допустимых не ведём:
+# расширение само по себе ничего не решает, опасен был бы неверный тип при
+# отдаче, а его выбирает content_type ниже.
+EXTENSION = re.compile(r"^[A-Za-z0-9]{1,8}$")
+DEFAULT_EXTENSION = "md"
 
 # Предел на размер файла: место на диске общее с базой переписки.
 FILE_LIMIT = 100_000
+
+# Типы, которые браузер показывает сам. Текстовое отдаём как text/plain, а не
+# «настоящим» типом: csv и json браузер иначе скачает, а показать их полезнее.
+TEXT_EXTENSIONS = (
+    "md", "txt", "csv", "tsv", "json", "yaml", "yml", "xml", "log", "ini",
+    "py", "js", "ts", "sql", "sh", "css", "c", "h", "java", "kt", "go", "rs",
+)
+
+# Эти показываем в песочнице: разметку и рисунок браузер выполняет, а написала
+# их модель. Заголовок Content-Security-Policy при отдаче делает страницу
+# чужим источником — к нашим кукам и API у неё доступа нет.
+SANDBOX_TYPES = {"html": "text/html; charset=utf-8",
+                 "htm": "text/html; charset=utf-8",
+                 "svg": "image/svg+xml"}
+
+# Что браузер умеет показывать без песочницы. Картинок и звука модель пока
+# создать не может, но таблица нужна целиком: файлы появятся позже.
+MEDIA_PREFIXES = ("image/", "audio/", "video/")
+MEDIA_TYPES = {"pdf": "application/pdf"}
+
+
+def content_type(name: str) -> tuple[str, bool, bool]:
+    """Чем отдавать файл: тип, можно ли показать, нужна ли песочница.
+
+    Единственное место, где это решается: интерфейс спрашивает у сервера, а не
+    повторяет ту же таблицу у себя.
+    """
+    ext = Path(name).suffix.lstrip(".").lower()
+    if ext in SANDBOX_TYPES:
+        return SANDBOX_TYPES[ext], True, True
+    if ext in TEXT_EXTENSIONS:
+        return "text/plain; charset=utf-8", True, False
+    if ext in MEDIA_TYPES:
+        return MEDIA_TYPES[ext], True, False
+    guess, _ = mimetypes.guess_type(name)
+    if guess and guess.startswith(MEDIA_PREFIXES):
+        return guess, True, False
+    if guess and guess.startswith("text/"):
+        return "text/plain; charset=utf-8", True, False
+    # Неизвестное не показываем вовсе: пусть браузер честно скачает файл,
+    # вместо того чтобы гадать о содержимом.
+    return "application/octet-stream", False, False
 
 
 def safe_name(name: str) -> str:
     """Имя файла без каталогов и сюрпризов.
 
-    «../../etc/passwd» превращается в «passwd.md»: сначала отбрасывается путь,
-    потом всё, кроме букв, цифр, дефиса и подчёркивания.
+    «../../etc/passwd.html» превращается в «passwd.html»: сначала отбрасывается
+    путь, потом из имени вычищается всё, кроме букв, цифр, дефиса и
+    подчёркивания. Расширение сохраняется любое — оно задаёт вид файла, а
+    безопасность обеспечивает не оно, а тип при отдаче.
     """
     base = Path((name or "").strip()).name
     stem, dot, ext = base.rpartition(".")
-    if not dot or f".{ext.lower()}" not in EXTENSIONS:
-        stem, ext = base, "md"
+    if not dot or not EXTENSION.match(ext):
+        stem, ext = base, DEFAULT_EXTENSION
     clean = NAME_ALLOWED.sub("", stem).strip().replace(" ", "_")[:60]
     return f"{clean or 'заметка'}.{ext.lower()}"
 
@@ -69,15 +119,18 @@ def listing(chat_id: int) -> list[dict]:
     except OSError:
         return []
     items.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return [
-        {
+    listed = []
+    for p in items:
+        kind, viewable, _ = content_type(p.name)
+        listed.append({
             "name": p.name,
             "size": p.stat().st_size,
             "saved_at": datetime.fromtimestamp(
                 p.stat().st_mtime, timezone.utc).isoformat(timespec="seconds"),
-        }
-        for p in items
-    ]
+            "type": kind,
+            "viewable": viewable,
+        })
+    return listed
 
 
 def find(chat_id: int, name: str) -> Path | None:

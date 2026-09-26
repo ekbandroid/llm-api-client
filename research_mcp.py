@@ -223,7 +223,9 @@ async def summarize(
 @server.tool()
 async def save_to_file(
     name: Annotated[str, Field(
-        description="Имя файла с расширением .md или .txt: «выжимка.md»")],
+        description="Имя файла с расширением; расширение задаёт вид: "
+                    "«выжимка.md» для заметки, «отчёт.html» для страницы, "
+                    "«данные.csv» для таблицы, «скрипт.py» для кода")],
     content: Annotated[str, Field(
         description="Что записать. Обычно это результат summarize — "
                     "передавайте его текстом, не пересказывая заново")],
