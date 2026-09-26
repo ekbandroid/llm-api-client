@@ -18,11 +18,12 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from dotenv import load_dotenv
+import db
 
-load_dotenv()
-
-DB_PATH = Path(os.getenv("SCHEDULER_DB_PATH", "scheduler.db"))
+# Рядом с базой переписки, по той же причине, что и каталог файлов: один
+# путь уже отличает рабочую машину от сервера, второй переменной не нужно.
+DB_PATH = Path(os.getenv("SCHEDULER_DB_PATH")
+               or db.DB_PATH.resolve().parent / "scheduler.db")
 
 # Виды заданий. summary отличается от repeat только тем, что перед выполнением
 # приложение подкладывает в поручение результаты других заданий.

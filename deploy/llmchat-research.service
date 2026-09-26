@@ -1,9 +1,10 @@
 ; MCP-сервер поиска, пересказа и файлов.
 ;
 ; Ищет в Википедии, пересказывает своим обращением к модели (ключ берётся из
-; того же /opt/llmchat/app/.env, что и у приложения) и сохраняет результат в
-; /opt/llmchat/data/files. Отсюда ReadWritePaths: ProtectSystem=strict иначе
-; не даёт писать никуда.
+; того же /opt/llmchat/app/.env, что и у приложения) и сохраняет результат
+; рядом с базой переписки — путь считается от DB_PATH, чтобы у приложения и
+; сервера он был один. Отсюда ReadWritePaths: ProtectSystem=strict иначе не
+; даёт писать никуда.
 ;
 ; Установка на сервере:
 ;   sudo cp /opt/llmchat/app/deploy/llmchat-research.service /etc/systemd/system/
@@ -21,7 +22,6 @@ Group=llmchat
 WorkingDirectory=/opt/llmchat/app
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONUNBUFFERED=1
-Environment=FILES_DIR=/opt/llmchat/data/files
 ExecStart=/opt/llmchat/venv/bin/uvicorn research_mcp:app --host 127.0.0.1 --port 8003 --workers 1
 Restart=always
 RestartSec=3

@@ -14,11 +14,14 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
-from dotenv import load_dotenv
+import db
 
-load_dotenv()
-
-FILES_DIR = Path(os.getenv("FILES_DIR", "files"))
+# По умолчанию файлы лежат рядом с базой переписки, а не в текущем каталоге.
+# Так и должно быть: путь к базе уже отличает рабочую машину от сервера, и
+# второй переменной для того же самого не нужно. Прежний вариант стоил бага —
+# сервер писал в /opt/llmchat/data/files, а приложение искало в каталоге
+# кода, и вкладка «Файлы» показывала пустоту при существующих файлах.
+FILES_DIR = Path(os.getenv("FILES_DIR") or db.DB_PATH.resolve().parent / "files")
 
 # Имя файла: только то, что нельзя перепутать с путём. Каталоги, точки и
 # слэши вырезаются целиком — содержимое приходит от модели, и складывать по
@@ -59,11 +62,12 @@ def save(chat_id: int, name: str, content: str) -> Path:
 
 
 def listing(chat_id: int) -> list[dict]:
-    """Файлы диалога, новые сверху."""
+    """Файлы диалога, новые сверху. Недоступный каталог — пустой список."""
     path = folder(chat_id)
-    if not path.exists():
+    try:
+        items = [p for p in path.iterdir() if p.is_file()]
+    except OSError:
         return []
-    items = [p for p in path.iterdir() if p.is_file()]
     items.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return [
         {
@@ -83,7 +87,10 @@ def find(chat_id: int, name: str) -> Path | None:
     «../app.db», искать будут файл «app.db» внутри каталога диалога.
     """
     path = folder(chat_id) / safe_name(name)
-    return path if path.is_file() else None
+    try:
+        return path if path.is_file() else None
+    except OSError:
+        return None
 
 
 def delete(chat_id: int, name: str) -> bool:
