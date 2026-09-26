@@ -20,6 +20,7 @@ from starlette.middleware.sessions import SessionMiddleware
 import auth
 import db
 import benchmark
+import files_store
 import history
 import invariants as invariants_mod
 import llm
@@ -952,8 +953,10 @@ async def conversation_delete(
     # Задания живут в отдельной базе и внешним ключом к диалогу не связаны:
     # убираем их сами, иначе исполнитель будет ходить в удалённую переписку.
     dropped = scheduler.delete_chat_jobs(conversation_id)
+    # Файлы диалога живут в каталоге на диске — их тоже убираем сами.
+    erased = files_store.delete_chat_files(conversation_id)
     return {"ok": db.delete_conversation(conversation_id, user["id"]),
-            "jobs_deleted": dropped}
+            "jobs_deleted": dropped, "files_deleted": erased}
 
 
 ASSISTANT_TURN_NOTE = (
@@ -976,7 +979,11 @@ def _last_answer(conversation_id: int) -> str:
 # Сколько кругов «модель просит инструмент — приложение выполняет» допускается
 # в одном обмене. Предохранитель: без него ошибка инструмента, на которую
 # модель отвечает новым вызовом, крутилась бы без конца.
-MCP_ROUNDS_LIMIT = 3
+#
+# Шесть, а не три: звенья цепочки зависят друг от друга, поэтому каждое
+# занимает свой круг. «Найди — прочитай — перескажи — сохрани» это уже
+# четыре круга плюс пятый на сам ответ, и в прежний предел они не помещались.
+MCP_ROUNDS_LIMIT = 6
 
 # Сколько текста инструмента уходит модели. Ответы бывают на десятки тысяч
 # символов, и целиком они вытеснили бы из запроса саму переписку.
@@ -1688,6 +1695,45 @@ async def job_delete(
     if not scheduler.delete(job_id, conversation_id):
         raise HTTPException(404, "Задание не найдено")
     return {"ok": True}
+
+
+@app.get("/api/conversations/{conversation_id}/files")
+async def files_list(
+    conversation_id: int, user: dict = Depends(require_approved)
+) -> dict:
+    """Файлы, сохранённые агентом в этом диалоге."""
+    _owned(conversation_id, user)
+    return {"files": files_store.listing(conversation_id)}
+
+
+@app.get("/api/conversations/{conversation_id}/files/{name}")
+async def file_download(
+    conversation_id: int, name: str, user: dict = Depends(require_approved)
+):
+    """Отдаёт файл на скачивание.
+
+    Всегда вложением и всегда простым текстом: содержимое написала модель, и
+    открывать его в браузере как разметку нельзя — это чужой текст в нашем
+    домене со всеми вытекающими.
+    """
+    _owned(conversation_id, user)
+    path = files_store.find(conversation_id, name)
+    if path is None:
+        raise HTTPException(404, "Файл не найден")
+    return FileResponse(
+        path, media_type="text/plain; charset=utf-8",
+        filename=path.name, content_disposition_type="attachment",
+    )
+
+
+@app.delete("/api/conversations/{conversation_id}/files/{name}")
+async def file_delete(
+    conversation_id: int, name: str, user: dict = Depends(require_approved)
+) -> dict:
+    _owned(conversation_id, user)
+    if not files_store.delete(conversation_id, name):
+        raise HTTPException(404, "Файл не найден")
+    return {"ok": True, "files": files_store.listing(conversation_id)}
 
 
 @app.post("/api/conversations/{conversation_id}/autopilot")

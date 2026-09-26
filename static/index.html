@@ -45,6 +45,9 @@
   <button class="railbtn" data-tab="jobs" title="Расписание заданий" aria-label="Расписание">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 14"/></svg>
   </button>
+  <button class="railbtn" data-tab="files" title="Файлы диалога" aria-label="Файлы">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+  </button>
   <button class="railbtn" data-tab="tokens" title="Расход токенов" aria-label="Токены">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>
   </button>
@@ -219,6 +222,14 @@
     <div class="tabbody">
       <div class="hint" style="margin:0 0 10px">Поручения этого диалога. Заводятся словами: «напомни через 15 минут…», «каждый час смотри…». Выполняет их ассистент сам, ответ придёт в эту же переписку.</div>
       <div id="jobsList"></div>
+    </div>
+  </section>
+
+  <section class="tab" data-tab="files">
+    <div class="tabhead"><span>Файлы</span><span class="grow"></span><button class="hide" title="Свернуть панель">‹</button></div>
+    <div class="tabbody">
+      <div class="hint" style="margin:0 0 10px">Файлы, сохранённые агентом в этом диалоге. Просите словами: «сохрани выжимку в файл». Удаляются вместе с диалогом.</div>
+      <div id="filesList"></div>
     </div>
   </section>
 
@@ -575,6 +586,7 @@ function showEmpty() {
   loadTask(null);
   loadInvariants(null);
   loadJobs(null);
+  loadFiles(null);
 }
 
 async function openConversation(id) {
@@ -607,6 +619,7 @@ async function openConversation(id) {
   loadTask(current);
   loadInvariants(current);
   loadJobs(current);
+  loadFiles(current);
   updateTokenStats();
   log.scrollTop = log.scrollHeight;
   renderList();
@@ -841,6 +854,7 @@ async function catchUpMessages() {
   if (atBottom) log.scrollTop = log.scrollHeight;
   updateTokenStats();
   loadJobs(current);
+  loadFiles(current);
 }
 
 setInterval(catchUpMessages, CATCHUP_SECONDS * 1000);
@@ -848,6 +862,68 @@ setInterval(catchUpMessages, CATCHUP_SECONDS * 1000);
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") { lastCatchUp = 0; catchUpMessages(); }
 });
+
+// ---------- вкладка «Файлы» ----------
+//
+// Файлы пишет инструмент save_to_file на стороне MCP-сервера; здесь они
+// только показываются, скачиваются и удаляются.
+
+async function loadFiles(conv) {
+  const list = $("filesList");
+  list.innerHTML = "";
+  if (!conv) {
+    list.appendChild(el("div", "hint", "Диалог не выбран."));
+    return;
+  }
+  const res = await fetch(`/api/conversations/${conv.id}/files`);
+  if (!res.ok) return;
+  renderFiles((await res.json()).files);
+}
+
+function renderFiles(files) {
+  const list = $("filesList");
+  list.innerHTML = "";
+  if (!files.length) {
+    list.appendChild(el("div", "hint", "Файлов пока нет."));
+    return;
+  }
+  for (const file of files) list.appendChild(fileRow(file));
+}
+
+function fileRow(file) {
+  const row = el("div", "file");
+
+  const head = el("div", "filehead");
+  head.appendChild(el("b", "filename", file.name));
+  head.appendChild(el("span", "grow"));
+  const size = file.size < 1024
+    ? `${file.size} Б` : `${(file.size / 1024).toFixed(1)} КБ`;
+  head.appendChild(el("span", "filesize", size));
+  row.appendChild(head);
+
+  const when = new Date(file.saved_at);
+  row.appendChild(el("div", "hint", "сохранён " + when.toLocaleString("ru-RU", {
+    day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit",
+  })));
+
+  const actions = el("div", "fileactions");
+  const link = el("a", "btn ghost small", "Скачать");
+  link.href = `/api/conversations/${current.id}/files/${encodeURIComponent(file.name)}`;
+  link.download = file.name;
+  actions.appendChild(link);
+
+  const kill = el("button", "small ghost", "Удалить");
+  kill.onclick = async () => {
+    if (!confirm(`Удалить файл «${file.name}»?`)) return;
+    const res = await fetch(
+      `/api/conversations/${current.id}/files/${encodeURIComponent(file.name)}`,
+      { method: "DELETE" });
+    if (res.ok) renderFiles((await res.json()).files);
+  };
+  actions.appendChild(kill);
+  row.appendChild(actions);
+  return row;
+}
 
 // ---------- вкладка «Расписание» ----------
 //
@@ -2049,6 +2125,10 @@ async function streamInto(url, payload, turn) {
           current.title = ev.title;
           $("titleInput").value = ev.title;
           loadConversations();
+          // Файл или задание могли появиться прямо в этом ходе — инструменты
+          // пишут мимо страницы, и списки надо перечитать.
+          loadFiles(current);
+          loadJobs(current);
         }
       }
     }
@@ -2147,12 +2227,17 @@ function applyTab(tab, open) {
   saveTabState({ tab, open });
 }
 
+// Что перечитать при открытии вкладки: её содержимое могло измениться, пока
+// она была свёрнута, — файлы и задания создаются инструментами.
+const TAB_RELOAD = { files: loadFiles, jobs: loadJobs };
+
 for (const b of document.querySelectorAll(".railbtn")) {
   b.addEventListener("click", () => {
     const state = readTabState();
     // Повторный щелчок по раскрытой вкладке сворачивает панель.
     const open = !(state.open && state.tab === b.dataset.tab);
     applyTab(b.dataset.tab, open);
+    if (open && TAB_RELOAD[b.dataset.tab]) TAB_RELOAD[b.dataset.tab](current);
   });
 }
 for (const b of document.querySelectorAll(".tabhead .hide")) {

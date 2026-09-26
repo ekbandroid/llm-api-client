@@ -52,7 +52,7 @@ button.ghost, .btn.ghost {
   background: transparent; color: var(--muted); border: 1px solid var(--border); font-weight: 400;
 }
 button.danger { background: var(--danger-soft); color: var(--danger); font-weight: 500; }
-button.small { padding: 5px 12px; font-size: 13px; }
+button.small, .btn.small { padding: 5px 12px; font-size: 13px; }
 
 /* ---------- шапка ---------- */
 header.bar {
@@ -495,3 +495,20 @@ td.actions button { margin-left: 6px; }
 .jobanswer summary { cursor: pointer; color: var(--muted); }
 .jobanswer div { margin-top: 6px; white-space: pre-wrap; line-height: 1.4; }
 .jobactions { display: flex; gap: 8px; margin-top: 10px; }
+
+/* ---------- вкладка «Файлы» ---------- */
+.file {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+}
+.filehead { display: flex; align-items: baseline; gap: 8px; }
+.filename {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  word-break: break-all;
+}
+.filesize { font-size: 11px; color: var(--muted); white-space: nowrap; }
+.file .hint { margin: 4px 0 0; }
+.fileactions { display: flex; gap: 8px; margin-top: 10px; align-items: center; }

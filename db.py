@@ -866,7 +866,8 @@ MCP_URL_LIMIT = 500
 # в .env, без правок кода.
 WEATHER_MCP_URL = os.getenv("WEATHER_MCP_URL", "http://127.0.0.1:8001/mcp")
 SCHEDULER_MCP_URL = os.getenv("SCHEDULER_MCP_URL", "http://127.0.0.1:8002/mcp")
-OWN_MCP_URLS = (WEATHER_MCP_URL, SCHEDULER_MCP_URL)
+RESEARCH_MCP_URL = os.getenv("RESEARCH_MCP_URL", "http://127.0.0.1:8003/mcp")
+OWN_MCP_URLS = (WEATHER_MCP_URL, SCHEDULER_MCP_URL, RESEARCH_MCP_URL)
 
 # Готовые серверы — все проверены живым запросом: отвечают без ключа и
 # регистрации. Включены те, что знают меняющиеся данные: курсы и погоду.
@@ -875,7 +876,7 @@ OWN_MCP_URLS = (WEATHER_MCP_URL, SCHEDULER_MCP_URL)
 # since — версия, в которой сервер появился в списке. Колонка users.mcp_seeded
 # хранит не «да/нет», а номер версии: иначе добавить пресет тем, кто уже вошёл,
 # было бы нечем — сброс флага вернул бы им и удалённые заготовки.
-MCP_PRESETS_VERSION = 3
+MCP_PRESETS_VERSION = 4
 
 MCP_PRESETS = (
     {"title": "Курсы валют", "since": 1,
@@ -890,6 +891,8 @@ MCP_PRESETS = (
      "url": WEATHER_MCP_URL, "enabled": 1},
     {"title": "Планировщик поручений", "since": 3,
      "url": SCHEDULER_MCP_URL, "enabled": 1},
+    {"title": "Поиск, пересказ и файлы", "since": 4,
+     "url": RESEARCH_MCP_URL, "enabled": 1},
 )
 
 
