@@ -6,6 +6,10 @@
 ; сервера он был один. Отсюда ReadWritePaths: ProtectSystem=strict иначе не
 ; даёт писать никуда.
 ;
+; Здесь же живут модели эмбеддингов и поиск по загруженным документам: модели
+; держатся в памяти резидентно (244 МБ во float16), и второй процесс с той же
+; моделью удвоил бы расход.
+;
 ; Установка на сервере:
 ;   sudo cp /opt/llmchat/app/deploy/llmchat-research.service /etc/systemd/system/
 ;   sudo systemctl daemon-reload && sudo systemctl enable --now llmchat-research
@@ -22,6 +26,11 @@ Group=llmchat
 WorkingDirectory=/opt/llmchat/app
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONUNBUFFERED=1
+; Кэш моделей эмбеддингов: по умолчанию HuggingFace кладёт их в домашний
+; каталог, а он этому процессу недоступен — ProtectSystem=strict разрешает
+; запись только в data. Без этой строки первая же индексация упала бы на
+; попытке скачать модель.
+Environment=HF_HOME=/opt/llmchat/data/hf
 ExecStart=/opt/llmchat/venv/bin/uvicorn research_mcp:app --host 127.0.0.1 --port 8003 --workers 1
 Restart=always
 RestartSec=3
