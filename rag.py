@@ -71,6 +71,12 @@ MODELS = {
 }
 DEFAULT_MODEL = os.getenv("RAG_MODEL", "multilingual")
 
+# Куда кладутся модели, переведённые в половинную точность. Это не кэш
+# HuggingFace, а наша собственная копия: грузить её вдвое дешевле и, что
+# важнее, без пика.
+MODELS_DIR = Path(os.getenv("RAG_MODELS_DIR")
+                  or db.DB_PATH.resolve().parent / "models")
+
 # Прежнее имя оставлено для командной строки: индекс репозитория собирается
 # той же многоязычной моделью.
 MODEL_NAME = MODELS[DEFAULT_MODEL]["name"]
@@ -370,20 +376,45 @@ def chunk(doc: Document, strategy: str) -> list[Chunk]:
 _models: dict[str, object] = {}
 
 
+def prepare_model(key: str = DEFAULT_MODEL) -> Path:
+    """Скачивает модель и сохраняет её копию в половинной точности.
+
+    Делается один раз и на машине, где памяти не жалко: сама конвертация
+    пикует под полтора гигабайта. Готовая копия грузится потом раз в десять
+    дешевле — ради этого всё и затевалось.
+    """
+    from model2vec import StaticModel
+    target = MODELS_DIR / key
+    loaded = StaticModel.from_pretrained(MODELS[key]["name"])
+    loaded.embedding = loaded.embedding.astype(np.float16)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    loaded.save_pretrained(target)
+    return target
+
+
 def model(key: str = DEFAULT_MODEL):
     """Модель грузится лениво и остаётся в памяти.
 
-    Половинная точность нужна не ради экономии ради экономии: две модели по
-    489 МБ на сервер с двумя гигабайтами не поставить, а по 244 — можно.
-    Потерь нет, проверено сравнением векторов.
+    Сначала ищем свою копию в половинной точности и грузим её: это вдвое
+    меньше места и, главное, **без пика**. Замер на сервере показал, почему
+    это принципиально: `StaticModel` держит массив видом на отображённый файл,
+    приведение к float16 создаёт вторую копию, а первая остаётся — загрузка
+    выходила в 1196 МБ и сервер поиска убивал OOM-killer.
+
+    Готовой копии нет — грузим из сети и приводим на лету, как раньше. Это
+    рабочий запасной путь, но на машине с двумя гигабайтами так делать нельзя.
     """
     if key not in MODELS:
         key = DEFAULT_MODEL
     if key not in _models:
         from model2vec import StaticModel
-        loaded = StaticModel.from_pretrained(MODELS[key]["name"])
-        loaded.embedding = loaded.embedding.astype(np.float16)
-        _models[key] = loaded
+        local = MODELS_DIR / key
+        if (local / "model.safetensors").exists():
+            _models[key] = StaticModel.from_pretrained(local)
+        else:
+            loaded = StaticModel.from_pretrained(MODELS[key]["name"])
+            loaded.embedding = loaded.embedding.astype(np.float16)
+            _models[key] = loaded
     return _models[key]
 
 
@@ -1031,6 +1062,10 @@ def main() -> None:
                           help="показать каждый вопрос отдельно")
     commands.add_parser("stats", help="что лежит в индексе")
 
+    preparer = commands.add_parser(
+        "prepare", help="сохранить модель в половинной точности")
+    preparer.add_argument("--model", choices=list(MODELS), default=DEFAULT_MODEL)
+
     args = parser.parse_args()
     if args.command == "build":
         _print_build(build(Path(args.path).resolve()))
@@ -1039,6 +1074,11 @@ def main() -> None:
                       else search(args.query, args.strategy, args.limit))
     elif args.command == "compare":
         _print_compare(compare(detail=args.detail))
+    elif args.command == "prepare":
+        path = prepare_model(args.model)
+        size = sum(f.stat().st_size for f in path.iterdir() if f.is_file())
+        print(f"Модель {args.model} сохранена в {path} — "
+              f"{size / 1024 / 1024:.0f} МБ")
     else:
         with connect() as conn:
             meta = {r["key"]: r["value"] for r in conn.execute("SELECT * FROM meta")}

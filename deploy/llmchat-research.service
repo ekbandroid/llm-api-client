@@ -35,6 +35,14 @@ ExecStart=/opt/llmchat/venv/bin/uvicorn research_mcp:app --host 127.0.0.1 --port
 Restart=always
 RestartSec=3
 
+; Предохранитель по памяти. Модель эмбеддингов вместе с токенизатором bge-m3
+; занимает около гигабайта, и один раз она уже утащила сервер поиска под
+; OOM-killer, задев всю машину. MemoryHigh заставляет ядро вытеснять именно
+; этот процесс в подкачку, не трогая чат; MemoryMax — жёсткий потолок, за
+; которым падает только он.
+MemoryHigh=900M
+MemoryMax=1500M
+
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
