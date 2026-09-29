@@ -1039,8 +1039,13 @@ $("ragUpload").addEventListener("click", async () => {
   });
   $("ragUpload").disabled = false;
   if (!res.ok) {
+    // Ошибку может вернуть не приложение, а nginx перед ним — тогда своего
+    // текста в ответе нет вовсе, и без подсказки по коду остаётся
+    // бессмысленное «не удалось загрузить».
     const info = await httpErrorResponse(res);
-    note.textContent = httpDetail(info, "Не удалось загрузить");
+    const hint = httpErrorHint(res.status);
+    note.textContent = httpDetail(
+      info, `Не удалось загрузить: HTTP ${res.status}` + (hint ? ` — ${hint}` : ""));
     return;
   }
   const created = await res.json();
