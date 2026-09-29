@@ -32,6 +32,7 @@ from pydantic import Field
 
 import files_store
 import llm
+import rag
 
 WIKI_URL = "https://ru.wikipedia.org/w/api.php"
 
@@ -269,5 +270,68 @@ async def list_files(chat_id: int = 0) -> str:
         lines.append(f"  {item['name']} — {item['size']} байт, "
                      f"{when:%d.%m %H:%M} UTC")
     return "\n".join(lines)
+
+# ---------- поиск по загруженным документам ----------
+#
+# Индексация и поиск живут здесь, а не в приложении, по одной причине: модели
+# эмбеддингов держатся в памяти резидентно, и два процесса загрузили бы по
+# своей копии. Приложение только принимает файлы и просит этот сервер их
+# проиндексировать.
+
+
+@server.tool()
+async def search_docs(
+    query: Annotated[str, Field(
+        description="Что искать. Своими словами, как спросил пользователь")],
+    limit: Annotated[int, Field(
+        description="Сколько кусков вернуть, 1–8", ge=1, le=8)] = 4,
+    chat_id: int = 0,
+) -> str:
+    """Ищет ответ в документах, подключённых к этому диалогу.
+
+    Документы загружает человек во вкладке RAG и сам решает, какие из них
+    подключить. Если подключённых наборов нет, искать негде — так и будет
+    сказано.
+    """
+    if not chat_id:
+        return "Не указан диалог."
+    try:
+        found = await asyncio.to_thread(rag.search_collections, query, chat_id, limit)
+    except Exception as err:  # noqa: BLE001 — сбой поиска не должен ронять обмен
+        return f"Поиск по документам не удался: {type(err).__name__}: {err}"
+
+    if not found:
+        attached = await asyncio.to_thread(rag.attached_collections, chat_id)
+        if not attached:
+            return ("К этому диалогу документы не подключены. Их загружают и "
+                    "подключают во вкладке RAG.")
+        return "В подключённых документах ничего похожего не нашлось."
+
+    lines = [f"Найдено в документах ({len(found)}):"]
+    for number, hit in enumerate(found, 1):
+        lines.append(
+            f"\n{number}. {hit['collection']} · {hit['source']} · "
+            f"{hit['section']} (близость {hit['score']:.2f})\n{hit['text']}")
+    lines.append("\nЭто выдержки из документов пользователя. Отвечай по ним и "
+                 "указывай, из какого файла взято.")
+    return "\n".join(lines)
+
+
+@server.tool()
+async def _index_collection(collection_id: int = 0) -> str:
+    """Служебный: проиндексировать набор. Вызывает приложение после загрузки."""
+    if not collection_id:
+        return "Не указан набор."
+    try:
+        report = await asyncio.to_thread(rag.index_collection, int(collection_id))
+    except Exception as err:  # noqa: BLE001
+        rag.set_status(int(collection_id), "ошибка", f"{type(err).__name__}: {err}")
+        return f"Индексация не удалась: {type(err).__name__}: {err}"
+    skipped = f", пропущено: {'; '.join(report['skipped'])}" if report.get("skipped") else ""
+    return (f"Проиндексировано: файлов {report.get('files', 0)}, "
+            f"кусков {report['chunks']}, за {report.get('seconds', 0)} с{skipped}")
+
+
+rag.init()
 
 app = server.streamable_http_app(streamable_http_path="/mcp")

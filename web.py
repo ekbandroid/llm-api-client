@@ -11,7 +11,8 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import (Depends, FastAPI, File, Form, HTTPException, Request,
+                     UploadFile)
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -26,6 +27,7 @@ import invariants as invariants_mod
 import llm
 import mcp_tools
 import memory
+import rag
 import reasoning
 import scheduler
 import task
@@ -1655,6 +1657,162 @@ async def conversation_send(
                         yield chunk
 
     return _sse_response(events())
+
+
+# ---------- наборы документов ----------
+#
+# Приложение принимает файлы и хранит их, а режет и считает векторы
+# MCP-сервер поиска: модели эмбеддингов резидентны, и держать их в двух
+# процессах значило бы платить памятью дважды.
+
+# Индексация идёт фоном и может занять минуты на большом наборе — обычного
+# таймаута вызова инструмента тут мало.
+INDEX_TIMEOUT = 900
+
+
+class RagAttach(BaseModel):
+    enabled: bool
+
+
+def _rag_view(collection: dict) -> dict:
+    """Набор для интерфейса: без внутренностей, но со всеми настройками."""
+    return {
+        "id": collection["id"],
+        "title": collection["title"],
+        "model": collection["model"],
+        "model_label": collection.get("model_label")
+                       or rag.MODELS.get(collection["model"], {}).get("label", ""),
+        "strategy": collection["strategy"],
+        "chunk_chars": collection["chunk_chars"],
+        "overlap": collection["overlap"],
+        "files": collection["files"],
+        "chunks": collection["chunks"],
+        "chars": collection["chars"],
+        "status": collection["status"],
+        "error": collection["error"],
+        "seconds": collection["seconds"],
+        "created_at": collection["created_at"],
+        "attached": bool(collection.get("attached")),
+    }
+
+
+async def _index_in_background(collection_id: int) -> None:
+    """Просит сервер поиска проиндексировать набор и запоминает исход."""
+    try:
+        answer = await mcp_tools.call_tool(
+            db.RESEARCH_MCP_URL, "_index_collection",
+            {"collection_id": collection_id}, timeout=INDEX_TIMEOUT)
+        print(f"индексация набора #{collection_id}: {answer}")
+    except mcp_tools.MCPError as err:
+        rag.set_status(collection_id, "ошибка", str(err))
+        print(f"индексация набора #{collection_id} не удалась: {err}")
+
+
+@app.get("/api/rag/settings")
+async def rag_settings(_: dict = Depends(require_approved)) -> dict:
+    """Что предложить в форме загрузки."""
+    return {
+        "models": [{"id": key, **value} for key, value in rag.MODELS.items()],
+        "strategies": [
+            {"id": rag.STRUCTURE, "label": "По структуре (заголовки, функции)"},
+            {"id": rag.FIXED, "label": "По размеру, с перекрытием"},
+            {"id": rag.TITLED, "label": "По структуре, с заголовком в куске"},
+        ],
+        "defaults": {"model": rag.DEFAULT_MODEL, "strategy": rag.STRUCTURE,
+                     "chunk_chars": rag.CHUNK_CHARS, "overlap": rag.OVERLAP_CHARS},
+        "limit_mb": rag.UPLOAD_LIMIT // 1024 // 1024,
+    }
+
+
+@app.get("/api/conversations/{conversation_id}/rag")
+async def rag_list(
+    conversation_id: int, user: dict = Depends(require_approved)
+) -> dict:
+    """Наборы пользователя с отметкой, подключён ли каждый к этому диалогу."""
+    _owned(conversation_id, user)
+    return {"collections": [_rag_view(c) for c in
+                            rag.list_collections(user["id"], conversation_id)]}
+
+
+@app.post("/api/conversations/{conversation_id}/rag")
+async def rag_create(
+    conversation_id: int,
+    files: list[UploadFile] = File(...),
+    title: str = Form(""),
+    model: str = Form(rag.DEFAULT_MODEL),
+    strategy: str = Form(rag.STRUCTURE),
+    chunk_chars: int = Form(rag.CHUNK_CHARS),
+    overlap: int = Form(rag.OVERLAP_CHARS),
+    attach: bool = Form(True),
+    user: dict = Depends(require_approved),
+) -> dict:
+    """Принимает файлы, заводит набор и отправляет его на индексацию.
+
+    Ответ уходит сразу: индексация идёт фоном, а вкладка показывает состояние.
+    Иначе загрузка книги держала бы соединение минуту и выглядела зависшей.
+    """
+    _owned(conversation_id, user)
+    if not files:
+        raise HTTPException(400, "Не выбрано ни одного файла")
+    if not 200 <= chunk_chars <= 8000:
+        raise HTTPException(400, "Размер куска — от 200 до 8000 символов")
+    if not 0 <= overlap < chunk_chars:
+        raise HTTPException(400, "Перекрытие должно быть меньше размера куска")
+
+    try:
+        collection = rag.create_collection(
+            user["id"], title=title or files[0].filename or "Набор",
+            model=model, strategy=strategy,
+            chunk_chars=chunk_chars, overlap=overlap)
+    except ValueError as err:
+        raise HTTPException(400, str(err)) from err
+
+    folder = rag.collection_dir(collection["id"], create=True)
+    saved, total = 0, 0
+    for item in files:
+        body = await item.read()
+        total += len(body)
+        if total > rag.UPLOAD_LIMIT:
+            rag.set_status(collection["id"], "ошибка", "набор больше предела")
+            raise HTTPException(
+                400, f"Всего не больше {rag.UPLOAD_LIMIT // 1024 // 1024} МБ")
+        # Имя приходит из браузера: чистим тем же способом, что имена файлов
+        # от модели, иначе «../» уведёт запись из каталога набора.
+        (folder / files_store.safe_name(item.filename or "файл")).write_bytes(body)
+        saved += 1
+
+    if attach:
+        rag.attach(conversation_id, collection["id"], True)
+    asyncio.create_task(_index_in_background(collection["id"]))
+
+    fresh = rag.get_collection(collection["id"])
+    return {**_rag_view(fresh), "attached": attach, "uploaded": saved}
+
+
+@app.post("/api/conversations/{conversation_id}/rag/{collection_id}/attach")
+async def rag_attach(
+    conversation_id: int, collection_id: int, payload: RagAttach,
+    user: dict = Depends(require_approved),
+) -> dict:
+    """Подключает набор к диалогу или отключает."""
+    _owned(conversation_id, user)
+    if rag.get_collection(collection_id, user["id"]) is None:
+        raise HTTPException(404, "Набор не найден")
+    rag.attach(conversation_id, collection_id, payload.enabled)
+    return {"collections": [_rag_view(c) for c in
+                            rag.list_collections(user["id"], conversation_id)]}
+
+
+@app.delete("/api/conversations/{conversation_id}/rag/{collection_id}")
+async def rag_delete(
+    conversation_id: int, collection_id: int,
+    user: dict = Depends(require_approved),
+) -> dict:
+    _owned(conversation_id, user)
+    if not rag.delete_collection(collection_id, user["id"]):
+        raise HTTPException(404, "Набор не найден")
+    return {"collections": [_rag_view(c) for c in
+                            rag.list_collections(user["id"], conversation_id)]}
 
 
 @app.get("/api/conversations/{conversation_id}/jobs")

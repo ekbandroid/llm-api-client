@@ -6,3 +6,4 @@ uvicorn[standard]>=0.30
 itsdangerous>=2.2
 mcp>=2.2
 model2vec>=0.9
+pypdf>=5.0

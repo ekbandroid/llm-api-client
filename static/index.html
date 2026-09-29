@@ -45,6 +45,9 @@
   <button class="railbtn" data-tab="jobs" title="Расписание заданий" aria-label="Расписание">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 14"/></svg>
   </button>
+  <button class="railbtn" data-tab="rag" title="Документы для поиска" aria-label="RAG">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/><path d="M9 7h7"/></svg>
+  </button>
   <button class="railbtn" data-tab="files" title="Файлы диалога" aria-label="Файлы">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
   </button>
@@ -222,6 +225,30 @@
     <div class="tabbody">
       <div class="hint" style="margin:0 0 10px">Поручения этого диалога. Заводятся словами: «напомни через 15 минут…», «каждый час смотри…». Выполняет их ассистент сам, ответ придёт в эту же переписку.</div>
       <div id="jobsList"></div>
+    </div>
+  </section>
+
+  <section class="tab" data-tab="rag">
+    <div class="tabhead"><span>Документы</span><span class="grow"></span><button class="hide" title="Свернуть панель">‹</button></div>
+    <div class="tabbody">
+      <div class="hint" style="margin:0 0 10px">Загруженные наборы можно подключать к диалогу. Подключённые ищет ассистент, когда сочтёт нужным.</div>
+      <div id="ragList"></div>
+
+      <fieldset style="margin-top:14px">
+        <legend>Новый набор</legend>
+        <label><span>Файлы</span><input type="file" id="ragFiles" multiple></label>
+        <label><span>Название</span><input type="text" id="ragTitle" maxlength="80" placeholder="по имени первого файла"></label>
+        <label><span>Модель эмбеддингов</span><select id="ragModel"></select></label>
+        <div class="hint" id="ragModelNote" style="margin:-6px 0 10px"></div>
+        <label><span>Разбиение</span><select id="ragStrategy"></select></label>
+        <div class="row">
+          <label><span>Размер куска</span><input type="number" id="ragChunk" min="200" max="8000" step="100"></label>
+          <label><span>Перекрытие</span><input type="number" id="ragOverlap" min="0" max="2000" step="50"></label>
+        </div>
+        <label class="check"><input type="checkbox" id="ragAttach" checked> подключить к этому диалогу сразу</label>
+        <button id="ragUpload">Загрузить и проиндексировать</button>
+        <div class="hint" id="ragUploadState"></div>
+      </fieldset>
     </div>
   </section>
 
@@ -587,6 +614,7 @@ function showEmpty() {
   loadInvariants(null);
   loadJobs(null);
   loadFiles(null);
+  loadRag(null);
 }
 
 async function openConversation(id) {
@@ -620,6 +648,7 @@ async function openConversation(id) {
   loadInvariants(current);
   loadJobs(current);
   loadFiles(current);
+  loadRag(current);
   updateTokenStats();
   log.scrollTop = log.scrollHeight;
   renderList();
@@ -861,6 +890,164 @@ setInterval(catchUpMessages, CATCHUP_SECONDS * 1000);
 // Возвращение на вкладку — повод проверить сразу, не дожидаясь таймера.
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") { lastCatchUp = 0; catchUpMessages(); }
+});
+
+// ---------- вкладка «Документы» ----------
+//
+// Наборы загружает человек, индексирует MCP-сервер поиска, а ищет по ним
+// ассистент инструментом — но только по тем, что подключены к этому диалогу.
+
+let ragSettings = null;
+let ragTimer = null;
+
+const RAG_STATUS = {
+  "готов": "готов",
+  "индексируется": "индексируется…",
+  "загружается": "загружается…",
+  "ошибка": "ошибка",
+  "пусто": "пусто",
+};
+
+async function loadRagSettings() {
+  if (ragSettings) return ragSettings;
+  const res = await fetch("/api/rag/settings");
+  if (!res.ok) return null;
+  ragSettings = await res.json();
+
+  const models = $("ragModel");
+  ragSettings.models.forEach(m => models.add(new Option(m.label, m.id)));
+  models.value = ragSettings.defaults.model;
+  models.onchange = showRagModelNote;
+  showRagModelNote();
+
+  const strategies = $("ragStrategy");
+  ragSettings.strategies.forEach(s => strategies.add(new Option(s.label, s.id)));
+  strategies.value = ragSettings.defaults.strategy;
+
+  $("ragChunk").value = ragSettings.defaults.chunk_chars;
+  $("ragOverlap").value = ragSettings.defaults.overlap;
+  return ragSettings;
+}
+
+function showRagModelNote() {
+  const chosen = (ragSettings.models || []).find(m => m.id === $("ragModel").value);
+  $("ragModelNote").textContent = chosen ? chosen.note : "";
+}
+
+async function loadRag(conv) {
+  await loadRagSettings();
+  const list = $("ragList");
+  if (!conv) {
+    list.innerHTML = "";
+    list.appendChild(el("div", "hint", "Диалог не выбран."));
+    return;
+  }
+  const res = await fetch(`/api/conversations/${conv.id}/rag`);
+  if (!res.ok) return;
+  renderRag((await res.json()).collections);
+}
+
+function renderRag(collections) {
+  const list = $("ragList");
+  list.innerHTML = "";
+  if (!collections.length) {
+    list.appendChild(el("div", "hint", "Наборов пока нет."));
+  } else {
+    for (const c of collections) list.appendChild(ragRow(c));
+  }
+  // Пока что-то индексируется, список обновляется сам: работа идёт фоном.
+  const working = collections.some(c => c.status === "индексируется" || c.status === "загружается");
+  if (ragTimer) { clearTimeout(ragTimer); ragTimer = null; }
+  if (working && current) ragTimer = setTimeout(() => loadRag(current), 3000);
+}
+
+function ragRow(c) {
+  const row = el("div", "rag" + (c.attached ? "" : " off"));
+
+  const head = el("div", "raghead");
+  const on = el("label", "check");
+  const box = el("input");
+  box.type = "checkbox";
+  box.checked = c.attached;
+  box.disabled = c.status !== "готов";
+  box.onchange = async () => {
+    const res = await fetch(`/api/conversations/${current.id}/rag/${c.id}/attach`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: box.checked }),
+    });
+    if (res.ok) renderRag((await res.json()).collections);
+  };
+  on.appendChild(box);
+  on.appendChild(document.createTextNode("подключён"));
+  head.appendChild(el("b", "ragtitle", c.title));
+  head.appendChild(el("span", "grow"));
+  head.appendChild(on);
+  row.appendChild(head);
+
+  const state = el("div", c.status === "ошибка" ? "hint violation" : "hint");
+  const parts = [RAG_STATUS[c.status] || c.status];
+  if (c.status === "готов") {
+    parts.push(`файлов ${c.files}`, `кусков ${c.chunks}`,
+               `${(c.chars / 1024).toFixed(0)} КБ текста`, `за ${c.seconds} с`);
+  }
+  state.textContent = parts.join(" · ");
+  row.appendChild(state);
+
+  const how = el("div", "ragsettings");
+  how.textContent = `${c.model_label} · ${c.strategy} · кусок ${c.chunk_chars}` +
+    (c.strategy === "fixed" ? `, перекрытие ${c.overlap}` : "");
+  row.appendChild(how);
+
+  if (c.error) {
+    const note = el("div", "hint violation");
+    note.textContent = c.error;
+    row.appendChild(note);
+  }
+
+  const actions = el("div", "ragactions");
+  const kill = el("button", "small ghost", "Удалить");
+  kill.onclick = async () => {
+    if (!confirm(`Удалить набор «${c.title}»? Файлы и индекс уйдут вместе с ним.`)) return;
+    const res = await fetch(`/api/conversations/${current.id}/rag/${c.id}`, { method: "DELETE" });
+    if (res.ok) renderRag((await res.json()).collections);
+  };
+  actions.appendChild(kill);
+  row.appendChild(actions);
+  return row;
+}
+
+$("ragUpload").addEventListener("click", async () => {
+  const note = $("ragUploadState");
+  if (!current) { note.textContent = "Сначала откройте диалог."; return; }
+  const chosen = $("ragFiles").files;
+  if (!chosen.length) { note.textContent = "Выберите файлы."; return; }
+
+  const form = new FormData();
+  for (const file of chosen) form.append("files", file);
+  form.append("title", $("ragTitle").value.trim());
+  form.append("model", $("ragModel").value);
+  form.append("strategy", $("ragStrategy").value);
+  form.append("chunk_chars", $("ragChunk").value);
+  form.append("overlap", $("ragOverlap").value);
+  form.append("attach", $("ragAttach").checked ? "true" : "false");
+
+  note.textContent = "Загружаю…";
+  $("ragUpload").disabled = true;
+  const res = await fetch(`/api/conversations/${current.id}/rag`, {
+    method: "POST", body: form,
+  });
+  $("ragUpload").disabled = false;
+  if (!res.ok) {
+    const info = await httpErrorResponse(res);
+    note.textContent = httpDetail(info, "Не удалось загрузить");
+    return;
+  }
+  const created = await res.json();
+  note.textContent = `Принято файлов: ${created.uploaded}. Индексация идёт фоном.`;
+  $("ragFiles").value = "";
+  $("ragTitle").value = "";
+  loadRag(current);
 });
 
 // ---------- вкладка «Файлы» ----------
@@ -2240,7 +2427,7 @@ function applyTab(tab, open) {
 
 // Что перечитать при открытии вкладки: её содержимое могло измениться, пока
 // она была свёрнута, — файлы и задания создаются инструментами.
-const TAB_RELOAD = { files: loadFiles, jobs: loadJobs };
+const TAB_RELOAD = { files: loadFiles, jobs: loadJobs, rag: loadRag };
 
 for (const b of document.querySelectorAll(".railbtn")) {
   b.addEventListener("click", () => {

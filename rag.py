@@ -47,8 +47,33 @@ import tokens as tokens_mod
 # агента и очередь заданий: один путь уже отличает машину от сервера.
 DB_PATH = Path(os.getenv("RAG_DB_PATH") or db.DB_PATH.resolve().parent / "rag.db")
 
-# Многоязычная: корпус русский, английская модель на нём бесполезна.
-MODEL_NAME = os.getenv("RAG_MODEL", "minishlab/potion-multilingual-128M")
+# Модели на выбор. Все статические, все от одного семейства — значит
+# одинаково дёшевы. Держим их во float16: проверено, векторы совпадают с
+# float32 до шестого знака (косинус 1.0), а места вдвое меньше. Это решает
+# вопрос «можно ли держать две модели сразу»: 244 + 62 МБ помещаются даже на
+# сервере с двумя гигабайтами.
+MODELS = {
+    "multilingual": {
+        "name": "minishlab/potion-multilingual-128M",
+        "label": "Многоязычная (русский и английский)",
+        "note": "244 МБ в памяти, подходит для русских документов",
+    },
+    "retrieval-en": {
+        "name": "minishlab/potion-retrieval-32M",
+        "label": "Английская, заточена под поиск",
+        "note": "62 МБ, лучше для англоязычных статей",
+    },
+    "code": {
+        "name": "minishlab/potion-code-16M-v2",
+        "label": "Для кода",
+        "note": "16 МБ, обучена на исходниках",
+    },
+}
+DEFAULT_MODEL = os.getenv("RAG_MODEL", "multilingual")
+
+# Прежнее имя оставлено для командной строки: индекс репозитория собирается
+# той же многоязычной моделью.
+MODEL_NAME = MODELS[DEFAULT_MODEL]["name"]
 
 FIXED, STRUCTURE, TITLED = "fixed", "structure", "titled"
 STRATEGIES = (FIXED, STRUCTURE, TITLED)
@@ -342,21 +367,34 @@ def chunk(doc: Document, strategy: str) -> list[Chunk]:
 
 # ---------- эмбеддинги ----------
 
-_model = None
+_models: dict[str, object] = {}
 
 
-def model():
-    """Модель грузится один раз и лениво: 489 МБ читать зря незачем."""
-    global _model
-    if _model is None:
+def model(key: str = DEFAULT_MODEL):
+    """Модель грузится лениво и остаётся в памяти.
+
+    Половинная точность нужна не ради экономии ради экономии: две модели по
+    489 МБ на сервер с двумя гигабайтами не поставить, а по 244 — можно.
+    Потерь нет, проверено сравнением векторов.
+    """
+    if key not in MODELS:
+        key = DEFAULT_MODEL
+    if key not in _models:
         from model2vec import StaticModel
-        _model = StaticModel.from_pretrained(MODEL_NAME)
-    return _model
+        loaded = StaticModel.from_pretrained(MODELS[key]["name"])
+        loaded.embedding = loaded.embedding.astype(np.float16)
+        _models[key] = loaded
+    return _models[key]
 
 
-def embed(texts: list[str]) -> np.ndarray:
+def loaded_models() -> list[str]:
+    """Какие модели сейчас в памяти — для телеметрии и вкладки."""
+    return sorted(_models)
+
+
+def embed(texts: list[str], model_key: str = DEFAULT_MODEL) -> np.ndarray:
     """Векторы, нормированные на единицу: тогда косинус — скалярное произведение."""
-    vectors = np.asarray(model().encode(texts), dtype=np.float32)
+    vectors = np.asarray(model(model_key).encode(texts), dtype=np.float32)
     norms = np.linalg.norm(vectors, axis=1, keepdims=True)
     return vectors / np.maximum(norms, 1e-9)
 
@@ -366,6 +404,9 @@ def embed(texts: list[str]) -> np.ndarray:
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS chunks (
     chunk_id  TEXT PRIMARY KEY,
+    -- Пусто у индекса репозитория из командной строки, заполнено у наборов,
+    -- загруженных через интерфейс.
+    collection_id INTEGER,
     strategy  TEXT    NOT NULL,
     source    TEXT    NOT NULL,
     title     TEXT    NOT NULL,
@@ -381,6 +422,35 @@ CREATE TABLE IF NOT EXISTS chunks (
     vector    BLOB    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_chunks_strategy ON chunks(strategy, source);
+CREATE INDEX IF NOT EXISTS idx_chunks_collection ON chunks(collection_id);
+
+-- Набор документов: файлы, загруженные пользователем, и настройки, с
+-- которыми они проиндексированы. Модель хранится здесь же: векторы разных
+-- моделей несравнимы, и искать по набору можно только его же моделью.
+CREATE TABLE IF NOT EXISTS collections (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER NOT NULL,
+    title       TEXT    NOT NULL,
+    model       TEXT    NOT NULL,
+    strategy    TEXT    NOT NULL,
+    chunk_chars INTEGER NOT NULL,
+    overlap     INTEGER NOT NULL,
+    files       INTEGER NOT NULL DEFAULT 0,
+    chunks      INTEGER NOT NULL DEFAULT 0,
+    chars       INTEGER NOT NULL DEFAULT 0,
+    status      TEXT    NOT NULL DEFAULT 'новый',
+    error       TEXT,
+    seconds     REAL    NOT NULL DEFAULT 0,
+    created_at  TEXT    NOT NULL
+);
+
+-- К каким диалогам набор подключён. Отдельная таблица, а не колонка у
+-- диалога: наборы живут в своей базе, и ссылаться на чужую нечем.
+CREATE TABLE IF NOT EXISTS attachments (
+    chat_id       INTEGER NOT NULL,
+    collection_id INTEGER NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+    PRIMARY KEY (chat_id, collection_id)
+);
 
 -- Поиск словами по тем же кускам. Нужен для сравнения: векторы хорошо
 -- находят прозу и плохо — код, где вопрос содержит точное имя функции.
@@ -407,19 +477,21 @@ def init() -> None:
         conn.executescript(SCHEMA)
 
 
-def save(chunks: list[Chunk], vectors: np.ndarray) -> None:
+def save(chunks: list[Chunk], vectors: np.ndarray,
+         collection_id: int | None = None) -> None:
     with connect() as conn:
         if chunks and chunks[0].strategy == STRUCTURE:
             conn.executemany(
                 "INSERT INTO chunks_fts (text, chunk_id) VALUES (?, ?)",
                 [(f"{c.source} {c.section}\n{c.text}", c.chunk_id) for c in chunks])
         conn.executemany(
-            "INSERT OR REPLACE INTO chunks (chunk_id, strategy, source, title,"
-            " section, ordinal, line_from, line_to, chars, tokens, text, vector)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            [(c.chunk_id, c.strategy, c.source, c.title, c.section, c.ordinal,
-              c.line_from, c.line_to, c.chars, c.tokens, c.text,
-              vectors[i].astype(np.float32).tobytes())
+            "INSERT OR REPLACE INTO chunks (chunk_id, collection_id, strategy,"
+            " source, title, section, ordinal, line_from, line_to, chars,"
+            " tokens, text, vector)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [(c.chunk_id, collection_id, c.strategy, c.source, c.title,
+              c.section, c.ordinal, c.line_from, c.line_to, c.chars, c.tokens,
+              c.text, vectors[i].astype(np.float32).tobytes())
              for i, c in enumerate(chunks)],
         )
 
@@ -517,6 +589,266 @@ def search_lexical(query: str, limit: int = 5) -> list[dict]:
         except sqlite3.OperationalError:
             return []
     return [{**dict(r), "score": -float(r["rank"])} for r in rows]
+
+
+# ---------- наборы документов ----------
+#
+# Набор — это загруженные файлы плюс настройки, с которыми они
+# проиндексированы. Пользователь подключает набор к диалогу, и тогда агент
+# может по нему искать.
+
+# Куда кладутся исходные файлы набора: рядом с базой, каталог на набор.
+SOURCES_DIR = Path(os.getenv("RAG_SOURCES_DIR")
+                   or db.DB_PATH.resolve().parent / "rag-sources")
+
+# Что умеем читать. PDF разбирается pypdf, остальное — обычный текст.
+TEXT_SUFFIXES = {
+    ".md", ".txt", ".rst", ".csv", ".tsv", ".json", ".yaml", ".yml", ".xml",
+    ".html", ".log", ".ini", ".cfg", ".py", ".js", ".ts", ".sql", ".sh",
+    ".css", ".c", ".h", ".java", ".kt", ".go", ".rs", ".service",
+}
+PDF_SUFFIXES = {".pdf"}
+UPLOAD_LIMIT = 20 * 1024 * 1024
+
+
+def collection_dir(collection_id: int, *, create: bool = False) -> Path:
+    path = SOURCES_DIR / f"col-{int(collection_id)}"
+    if create:
+        path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def create_collection(user_id: int, *, title: str, model: str = DEFAULT_MODEL,
+                      strategy: str = STRUCTURE, chunk_chars: int = CHUNK_CHARS,
+                      overlap: int = OVERLAP_CHARS) -> dict:
+    init()
+    if model not in MODELS:
+        raise ValueError(f"неизвестная модель: {model}")
+    if strategy not in STRATEGIES:
+        raise ValueError(f"неизвестная стратегия: {strategy}")
+    with connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO collections (user_id, title, model, strategy,"
+            " chunk_chars, overlap, status, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (user_id, (title or "Без названия")[:80], model, strategy,
+             int(chunk_chars), int(overlap), "загружается",
+             time.strftime("%Y-%m-%d %H:%M:%S")),
+        )
+        row = conn.execute("SELECT * FROM collections WHERE id = ?",
+                           (cur.lastrowid,)).fetchone()
+    return dict(row)
+
+
+def list_collections(user_id: int, chat_id: int | None = None) -> list[dict]:
+    """Наборы пользователя. С chat_id — с отметкой, подключён ли к диалогу."""
+    init()
+    with connect() as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM collections WHERE user_id = ? ORDER BY id DESC",
+            (user_id,))]
+        attached = set()
+        if chat_id is not None:
+            attached = {r[0] for r in conn.execute(
+                "SELECT collection_id FROM attachments WHERE chat_id = ?",
+                (chat_id,))}
+    for row in rows:
+        row["attached"] = row["id"] in attached
+        row["model_label"] = MODELS.get(row["model"], {}).get("label", row["model"])
+    return rows
+
+
+def get_collection(collection_id: int, user_id: int | None = None) -> dict | None:
+    with connect() as conn:
+        where = "id = ?" + (" AND user_id = ?" if user_id is not None else "")
+        args = (collection_id,) if user_id is None else (collection_id, user_id)
+        row = conn.execute(f"SELECT * FROM collections WHERE {where}", args).fetchone()
+    return dict(row) if row else None
+
+
+def set_status(collection_id: int, status: str, error: str = "") -> None:
+    with connect() as conn:
+        conn.execute("UPDATE collections SET status = ?, error = ? WHERE id = ?",
+                     (status, error[:500], collection_id))
+
+
+def attach(chat_id: int, collection_id: int, enabled: bool) -> None:
+    with connect() as conn:
+        if enabled:
+            conn.execute("INSERT OR IGNORE INTO attachments (chat_id, collection_id)"
+                         " VALUES (?, ?)", (chat_id, collection_id))
+        else:
+            conn.execute("DELETE FROM attachments WHERE chat_id = ? AND"
+                         " collection_id = ?", (chat_id, collection_id))
+
+
+def attached_collections(chat_id: int) -> list[dict]:
+    """Наборы, подключённые к диалогу, — по ним и ищет агент."""
+    init()
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT c.* FROM collections c JOIN attachments a"
+            " ON a.collection_id = c.id WHERE a.chat_id = ? AND c.status = 'готов'"
+            " ORDER BY c.id", (chat_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def delete_collection(collection_id: int, user_id: int) -> bool:
+    if get_collection(collection_id, user_id) is None:
+        return False
+    with connect() as conn:
+        ids = [r[0] for r in conn.execute(
+            "SELECT chunk_id FROM chunks WHERE collection_id = ?", (collection_id,))]
+        conn.executemany("DELETE FROM chunks_fts WHERE chunk_id = ?",
+                         [(i,) for i in ids])
+        conn.execute("DELETE FROM chunks WHERE collection_id = ?", (collection_id,))
+        conn.execute("DELETE FROM attachments WHERE collection_id = ?", (collection_id,))
+        conn.execute("DELETE FROM collections WHERE id = ?", (collection_id,))
+    folder = collection_dir(collection_id)
+    if folder.exists():
+        for item in folder.iterdir():
+            item.unlink()
+        folder.rmdir()
+    return True
+
+
+def read_upload(path: Path) -> str:
+    """Текст файла. PDF разбирается постранично, остальное читается как есть."""
+    suffix = path.suffix.lower()
+    if suffix in PDF_SUFFIXES:
+        try:
+            from pypdf import PdfReader
+        except ImportError:
+            raise ValueError("для PDF нужен пакет pypdf") from None
+        try:
+            reader = PdfReader(str(path))
+        except Exception as err:  # noqa: BLE001 — битый PDF не должен ронять всё
+            raise ValueError(f"PDF не разобран: {type(err).__name__}") from err
+        pages = []
+        for number, page in enumerate(reader.pages, 1):
+            text = (page.extract_text() or "").strip()
+            if text:
+                # Номер страницы остаётся в тексте: без него в найденном куске
+                # нельзя понять, откуда он в книге на триста страниц.
+                pages.append(f"[страница {number}]\n{text}")
+        return "\n\n".join(pages)
+    if suffix in TEXT_SUFFIXES or not suffix:
+        return path.read_text(encoding="utf-8", errors="replace")
+    raise ValueError(f"формат {suffix or 'без расширения'} не поддерживается")
+
+
+def index_collection(collection_id: int) -> dict:
+    """Читает файлы набора, режет и считает векторы его настройками."""
+    collection = get_collection(collection_id)
+    if collection is None:
+        raise ValueError("набор не найден")
+
+    folder = collection_dir(collection_id)
+    paths = sorted(p for p in folder.iterdir() if p.is_file()) if folder.exists() else []
+    if not paths:
+        set_status(collection_id, "пусто", "файлов нет")
+        return {"chunks": 0}
+
+    set_status(collection_id, "индексируется")
+    started = time.monotonic()
+    global CHUNK_CHARS, OVERLAP_CHARS
+    before = (CHUNK_CHARS, OVERLAP_CHARS)
+    CHUNK_CHARS, OVERLAP_CHARS = collection["chunk_chars"], collection["overlap"]
+    try:
+        pieces: list[Chunk] = []
+        skipped: list[str] = []
+        for path in paths:
+            try:
+                text = read_upload(path)
+            except (ValueError, OSError) as err:
+                skipped.append(f"{path.name}: {err}")
+                continue
+            if not text.strip():
+                skipped.append(f"{path.name}: пустой текст")
+                continue
+            doc = Document(path=path, source=path.name, text=text)
+            pieces.extend(chunk(doc, collection["strategy"]))
+        for number, piece in enumerate(pieces):
+            piece.ordinal = number
+
+        with connect() as conn:
+            conn.execute("DELETE FROM chunks WHERE collection_id = ?", (collection_id,))
+
+        vectors = embed([c.text for c in pieces], collection["model"]) if pieces \
+            else np.zeros((0, 0), dtype=np.float32)
+        if pieces:
+            save_collection_chunks(collection_id, pieces, vectors)
+    finally:
+        CHUNK_CHARS, OVERLAP_CHARS = before
+
+    spent = time.monotonic() - started
+    with connect() as conn:
+        conn.execute(
+            "UPDATE collections SET files = ?, chunks = ?, chars = ?, status = ?,"
+            " error = ?, seconds = ? WHERE id = ?",
+            (len(paths) - len(skipped), len(pieces),
+             sum(c.chars for c in pieces), "готов",
+             "; ".join(skipped)[:500], round(spent, 2), collection_id))
+    return {"chunks": len(pieces), "files": len(paths) - len(skipped),
+            "skipped": skipped, "seconds": round(spent, 2)}
+
+
+def save_collection_chunks(collection_id: int, pieces: list[Chunk],
+                           vectors: np.ndarray) -> None:
+    """Пишет куски набора: идентификатор с номером набора, плюс поиск словами."""
+    with connect() as conn:
+        conn.executemany(
+            "INSERT OR REPLACE INTO chunks (chunk_id, collection_id, strategy,"
+            " source, title, section, ordinal, line_from, line_to, chars,"
+            " tokens, text, vector)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [(f"col{collection_id}:{c.source}#{c.ordinal}", collection_id,
+              c.strategy, c.source, c.title, c.section, c.ordinal,
+              c.line_from, c.line_to, c.chars, c.tokens, c.text,
+              vectors[i].astype(np.float32).tobytes())
+             for i, c in enumerate(pieces)],
+        )
+        conn.executemany(
+            "INSERT INTO chunks_fts (text, chunk_id) VALUES (?, ?)",
+            [(f"{c.source} {c.section}\n{c.text}",
+              f"col{collection_id}:{c.source}#{c.ordinal}") for c in pieces])
+
+
+def search_collections(query: str, chat_id: int, limit: int = 5) -> list[dict]:
+    """Поиск по наборам, подключённым к диалогу.
+
+    Наборы с разными моделями считаются отдельно: их векторы несравнимы между
+    собой, и класть их в одну матрицу значило бы сравнивать метры с секундами.
+    Сводим по косинусу внутри модели — шкала у всех одинаковая, от нуля до
+    единицы.
+    """
+    collections = attached_collections(chat_id)
+    if not collections:
+        return []
+
+    by_model: dict[str, list[int]] = {}
+    for item in collections:
+        by_model.setdefault(item["model"], []).append(item["id"])
+
+    titles = {c["id"]: c["title"] for c in collections}
+    results: list[dict] = []
+    for model_key, ids in by_model.items():
+        marks = ",".join("?" * len(ids))
+        with connect() as conn:
+            rows = [dict(r) for r in conn.execute(
+                f"SELECT * FROM chunks WHERE collection_id IN ({marks})", ids)]
+        if not rows:
+            continue
+        matrix = np.vstack([np.frombuffer(r.pop("vector"), dtype=np.float32)
+                            for r in rows])
+        vector = embed([query], model_key)[0]
+        scores = matrix @ vector
+        for position in np.argsort(-scores)[:limit]:
+            row = rows[position]
+            results.append({**row, "score": float(scores[position]),
+                            "collection": titles.get(row["collection_id"], "")})
+    results.sort(key=lambda r: -r["score"])
+    return results[:limit]
 
 
 # ---------- сравнение стратегий ----------
