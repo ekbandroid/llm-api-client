@@ -231,7 +231,9 @@
   <section class="tab" data-tab="rag">
     <div class="tabhead"><span>Документы</span><span class="grow"></span><button class="hide" title="Свернуть панель">‹</button></div>
     <div class="tabbody">
-      <div class="hint" style="margin:0 0 10px">Загруженные наборы можно подключать к диалогу. Подключённые ищет ассистент, когда сочтёт нужным.</div>
+      <div class="hint" style="margin:0 0 10px">Загруженные наборы можно подключать к диалогу. Что с ними делать дальше, решает режим.</div>
+      <label><span>Режим</span><select id="ragMode"></select></label>
+      <div class="hint" id="ragModeNote" style="margin:-6px 0 12px"></div>
       <div id="ragList"></div>
 
       <fieldset style="margin-top:14px">
@@ -944,7 +946,31 @@ async function loadRag(conv) {
   }
   const res = await fetch(`/api/conversations/${conv.id}/rag`);
   if (!res.ok) return;
-  renderRag((await res.json()).collections);
+  const data = await res.json();
+  renderRagMode(data.mode, data.modes || []);
+  renderRag(data.collections);
+}
+
+/** Переключатель режима: искать нечем / решает модель / ищем всегда. */
+function renderRagMode(mode, modes) {
+  const select = $("ragMode");
+  const note = $("ragModeNote");
+  select.innerHTML = "";
+  for (const m of modes) {
+    const option = el("option", "", m.label);
+    option.value = m.id;
+    select.appendChild(option);
+  }
+  select.value = mode;
+  const show = () => {
+    const chosen = modes.find(m => m.id === select.value);
+    note.textContent = chosen ? chosen.hint : "";
+  };
+  show();
+  select.onchange = async () => {
+    show();
+    await patchCurrent({ rag_mode: select.value });
+  };
 }
 
 function renderRag(collections) {
@@ -1899,10 +1925,17 @@ function serviceNote(info, { undo = false } = {}) {
 
 /** Строка о том, сколько памяти ушло в этот запрос. */
 function memoryLine(mem) {
-  if (!mem || (!mem.profile && !mem.project && !mem.task && !mem.invariants && !mem.mcp)) return null;
+  if (!mem || (!mem.profile && !mem.project && !mem.task && !mem.invariants && !mem.mcp
+               && !mem.rag)) return null;
   const parts = [];
   if (mem.mcp) {
     parts.push(`инструменты MCP: ${mem.mcp.tools} с ${mem.mcp.servers} серверов ~${mem.mcp.tokens} токенов`);
+  }
+  if (mem.rag) {
+    parts.push(mem.rag.error
+      ? `документы: поиск не удался (${mem.rag.error})`
+      : `документы: ${mem.rag.chunks} кусков из ${mem.rag.collections} наборов ` +
+        `~${mem.rag.tokens} токенов`);
   }
   if (mem.invariants) {
     parts.push(`инварианты: ${mem.invariants.codes.join(", ")} ~${mem.invariants.tokens} токенов`);

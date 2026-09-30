@@ -228,6 +228,9 @@ MIGRATIONS = {
         "guard_plan_approved": "INTEGER NOT NULL DEFAULT 0",
         "guard_result_ready": "INTEGER NOT NULL DEFAULT 0",
         "guard_validation_passed": "INTEGER NOT NULL DEFAULT 0",
+        # Как диалог обращается с подключёнными документами. По умолчанию
+        # прежнее поведение: инструмент есть, решает модель.
+        "rag_mode": "TEXT NOT NULL DEFAULT 'auto'",
     },
 }
 
@@ -1011,6 +1014,18 @@ TITLE_LIMIT = 60
 # Способы собрать запрос из переписки.
 FULL, WINDOW, FACTS, SUMMARY = "full", "window", "facts", "summary"
 STRATEGIES = (FULL, WINDOW, FACTS, SUMMARY)
+
+# Как диалог работает с подключёнными наборами документов.
+#
+# RAG_OFF — инструмента поиска в запросе нет вовсе. Именно нет, а не «просьба
+# не искать»: сравнивать ответы с поиском и без имеет смысл, только когда во
+# втором случае искать физически нечем.
+# RAG_AUTO — инструмент есть, зовёт его модель, когда сочтёт нужным.
+# RAG_ALWAYS — приложение ищет само перед каждым вопросом и кладёт найденное
+# в запрос. Решение о поиске перестаёт быть решением модели — а она его
+# однажды не приняла, отвечая по устаревшей карточке фактов.
+RAG_OFF, RAG_AUTO, RAG_ALWAYS = "off", "auto", "always"
+RAG_MODES = (RAG_OFF, RAG_AUTO, RAG_ALWAYS)
 DEFAULT_CONTEXT_N = 10
 
 # Новые диалоги начинают с фактов: карточка ключ-значение переживает обрезку
@@ -1079,6 +1094,7 @@ def update_conversation(
     context_n: int | None = None,
     use_profile: bool | None = None, use_project: bool | None = None,
     profile_id: int | None = None, clear_profile: bool = False,
+    rag_mode: str | None = None,
 ) -> dict | None:
     """Меняет название или настройки. Возвращает None, если диалог чужой или его нет."""
     sets, values = [], []
@@ -1104,6 +1120,11 @@ def update_conversation(
     if context_n is not None:
         sets.append("context_n = ?")
         values.append(max(1, min(context_n, 200)))
+    if rag_mode is not None:
+        if rag_mode not in RAG_MODES:
+            raise ValueError(f"Неизвестный режим RAG: {rag_mode}")
+        sets.append("rag_mode = ?")
+        values.append(rag_mode)
     if use_profile is not None:
         sets.append("use_profile = ?")
         values.append(int(use_profile))
