@@ -40,6 +40,27 @@ fi
 echo "· отправляю master на $HOST:$APP"
 git archive master | ssh "$HOST" "sudo -u llmchat tar -x -C $APP"
 
+# tar только добавляет и перезаписывает: файл, удалённый из репозитория,
+# остаётся на сервере навсегда. Однажды так пережила выкатку страница из
+# старой версии — она лежала там полмесяца и открывалась из интернета.
+# Сами ничего не удаляем: решать, что на проде лишнее, — не дело скрипта.
+echo "· сверяю состав каталога с git"
+WANT=$(mktemp); HAVE=$(mktemp)
+git ls-files | sort > "$WANT"
+# find запускаем из самого каталога: у llmchat нет доступа к домашнему
+# каталогу того, кто вошёл по ssh, и вернуться туда в конце обхода он не смог бы.
+LOOK="cd $APP && find . -type f ! -name .env ! -name '*.pyc' \
+      ! -path '*/__pycache__/*' -printf '%P\n'"
+ssh "$HOST" "sudo -u llmchat sh -c \"$LOOK\"" | sort > "$HAVE"
+EXTRA=$(comm -13 "$WANT" "$HAVE")
+rm -f "$WANT" "$HAVE"
+if [ -n "$EXTRA" ]; then
+    echo "  на сервере есть файлы, которых нет в git:"
+    echo "$EXTRA" | sed 's/^/    /'
+    echo "  убрать при необходимости:"
+    echo "$EXTRA" | sed "s|^|    ssh $HOST 'sudo -u llmchat rm $APP/|;s|\$|'|"
+fi
+
 if [ "${1:-}" = "--no-restart" ]; then
     echo "· службы не трогаю (--no-restart)"
     exit 0
