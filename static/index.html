@@ -2356,12 +2356,36 @@ async function send(text) {
   busy = true;
   setSendMode("busy");
 
-  await ensureConversation();
-  addMessage("user", "Вы").querySelector(".body").textContent = text;
-  loadedTexts.push(text);
-  updateTokenStats();
+  // Всё до потока — под присмотром. Замок busy снимает finally внутри
+  // streamInto, так что сбой на этом участке оставлял бы чат запертым до
+  // перезагрузки страницы, и молча: кнопка просто перестаёт отвечать.
+  // Проверено дорого — одна опечатка в common.js (две строки подряд без «+»)
+  // уронила разбор всего файла, updateTokenStats упал на пропавшей функции, и
+  // ни один диалог не отправлял запрос вовсе.
+  let turn, userBox = null, pushed = false;
+  try {
+    await ensureConversation();
+    userBox = addMessage("user", "Вы");
+    userBox.querySelector(".body").textContent = text;
+    loadedTexts.push(text);
+    pushed = true;
+    updateTokenStats();
+    turn = newTurn();
+  } catch (err) {
+    busy = false;
+    setSendMode("idle");
+    // Убираем свою же реплику: она никуда не ушла, и оставлять её на экране
+    // значило бы показывать отправленным то, чего сервер не видел.
+    if (userBox) userBox.remove();
+    if (pushed) loadedTexts.pop();
+    // alert, а не блок на странице: сюда попадают в том числе сбои самой
+    // отрисовки, и полагаться на неё же было бы неразумно.
+    alert("Сбой перед отправкой: " + err.message);
+    console.error(err);
+    return;
+  }
 
-  await streamInto(`/api/conversations/${current.id}/messages`, { content: text }, newTurn());
+  await streamInto(`/api/conversations/${current.id}/messages`, { content: text }, turn);
 }
 
 /** Запускает автопилот без новой реплики: после паузы или сверх лимита. */
