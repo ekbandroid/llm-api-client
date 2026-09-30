@@ -25,6 +25,7 @@ import json
 import re
 import sys
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 from mcp import Client
@@ -262,6 +263,48 @@ def cached_tools(server: dict) -> list[dict]:
     except json.JSONDecodeError:
         return []
     return value if isinstance(value, list) else []
+
+
+# Время запуска процесса. Нужно, чтобы отличить кэш, набранный в этот раз, от
+# кэша, пережившего выкатку.
+LOADED_AT = datetime.now(timezone.utc)
+
+# Серверы, за схемами которых в этом процессе уже ходили — хоть удачно, хоть
+# нет. Неудачный поход прежний кэш не стирает и `checked_at` не двигает (см.
+# db.set_mcp_tools), так что без этой отметки отвалившийся сервер проверялся
+# бы заново на каждом сообщении, добавляя к каждому ответу свой таймаут.
+_CHECKED: set[int] = set()
+
+
+def mark_checked(server: dict) -> None:
+    """Отметить, что за схемами этого сервера в этом процессе уже ходили."""
+    if (server_id := server.get("id")) is not None:
+        _CHECKED.add(server_id)
+
+
+def is_stale(server: dict) -> bool:
+    """Стоит ли сходить за схемами заново?
+
+    Схемы лежат в базе и переживают перезапуск, а инструменты на своих
+    серверах меняются ровно с выкаткой. Один раз это уже вышло боком:
+    `search_docs` появился на сервере поиска, а у пользователя в кэше остался
+    список, снятый до выкатки, — и модель полтора дня не видела поиска по
+    загруженным документам, отвечая про них по памяти. Поэтому перезапуск
+    службы кэш обесценивает: одна проверка на включённый сервер, зато схемы
+    всегда те, что сервер отдаёт сейчас.
+    """
+    if server.get("id") in _CHECKED:
+        return False
+    checked = server.get("checked_at")
+    if not checked:
+        return True
+    try:
+        when = datetime.fromisoformat(checked)
+    except ValueError:
+        return True
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return when < LOADED_AT
 
 
 def describe_tool(tool: dict, server: dict) -> str:

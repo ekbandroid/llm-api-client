@@ -747,6 +747,7 @@ def _mcp_view(server: dict) -> dict:
 
 async def _refresh_mcp(server: dict, user: dict) -> dict:
     """Сходить на сервер и обновить кэш схем. Ошибку не прячем, а показываем."""
+    mcp_tools.mark_checked(server)
     try:
         found = await mcp_tools.list_tools(server["url"])
     except mcp_tools.MCPError as err:
@@ -793,7 +794,8 @@ async def mcp_enable(
     server = _owned_mcp(server_id, user)
     db.set_mcp_enabled(server_id, user["id"], payload.enabled)
     server = db.get_mcp_server(server_id, user["id"])
-    if payload.enabled and not mcp_tools.cached_tools(server):
+    if payload.enabled and (not mcp_tools.cached_tools(server)
+                            or mcp_tools.is_stale(server)):
         return await _refresh_mcp(server, user)
     return _mcp_view(server)
 
@@ -1108,10 +1110,13 @@ async def _exchange(
     if state := task.describe(conversation):
         described["task"] = state
     # Инструменты подключённых серверов MCP. Схемы берутся из кэша; если
-    # сервер включили, а за схемами ещё не ходили, сходим один раз здесь.
+    # сервер включили, а за схемами ещё не ходили — или кэш снят до
+    # перезапуска службы, — сходим один раз здесь. Про устаревание см.
+    # mcp_tools.is_stale: свои серверы меняются с выкаткой, а кэш её
+    # переживал, и новый инструмент до модели не доходил.
     servers = db.list_mcp_servers(user["id"], only_enabled=True)
     for server in servers:
-        if not mcp_tools.cached_tools(server):
+        if not mcp_tools.cached_tools(server) or mcp_tools.is_stale(server):
             await _refresh_mcp(server, user)
     servers = db.list_mcp_servers(user["id"], only_enabled=True)
     tool_schemas, tool_routes = mcp_tools.request_tools(servers)
