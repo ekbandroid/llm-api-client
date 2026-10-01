@@ -1762,9 +1762,14 @@ FOUND_COUNT = re.compile(r"\((\d+)\)")
 
 def _rag_values(conversation: dict) -> dict:
     """Настройки поиска по документам, как их ждёт инструмент search_docs."""
+    выдержек = conversation.get("rag_chunks") or RAG_CHUNKS
     return {
         "chat_id": conversation["id"],
-        "limit": conversation.get("rag_chunks") or RAG_CHUNKS,
+        # limit — то, что просит зовущий; rag_chunks — потолок от человека.
+        # В режиме «всегда» зовёт приложение, и значения совпадают; когда
+        # зовёт модель, она выбирает сама, но не больше этого потолка.
+        "limit": выдержек,
+        "rag_chunks": выдержек,
         "rag_pool": conversation.get("rag_pool") or RAG_POOL,
         "rag_rewrite": int(conversation.get("rag_rewrite", 1)),
         "rag_filter": int(conversation.get("rag_filter", 1)),
