@@ -233,7 +233,17 @@
     <div class="tabbody">
       <div class="hint" style="margin:0 0 10px">Загруженные наборы можно подключать к диалогу. Что с ними делать дальше, решает режим.</div>
       <label><span>Режим</span><select id="ragMode"></select></label>
-      <div class="hint" id="ragModeNote" style="margin:-6px 0 12px"></div>
+      <div class="hint" id="ragModeNote" style="margin:-6px 0 10px"></div>
+      <div id="ragTuning">
+        <label class="check"><input type="checkbox" id="ragRewrite"> переписывать вопрос перед поиском</label>
+        <label class="check"><input type="checkbox" id="ragFilter"> отбирать выдержки судьёй</label>
+        <div class="row">
+          <label><span>Набрать до отбора</span><input type="number" id="ragPool" min="8" max="200" step="2"></label>
+          <label><span>Оставить после</span><input type="number" id="ragChunks" min="1" max="8"></label>
+        </div>
+        <div class="hint" style="margin:-4px 0 12px">Флажки можно выключать по одному — так видно,
+          что даёт каждый слой. Выключены оба — поиск как был: один запрос, без отбора.</div>
+      </div>
       <div id="ragList"></div>
 
       <fieldset style="margin-top:14px">
@@ -948,7 +958,26 @@ async function loadRag(conv) {
   if (!res.ok) return;
   const data = await res.json();
   renderRagMode(data.mode, data.modes || []);
+  renderRagTuning(data);
   renderRag(data.collections);
+}
+
+/** Настройки двух этапов поиска. Прячутся, когда режим «выкл»: настраивать
+ *  там нечего, а лишние поля только сбивают. */
+function renderRagTuning(data) {
+  $("ragTuning").hidden = data.mode === "off";
+  const поля = [
+    ["ragRewrite", "checked", data.rewrite, v => ({ rag_rewrite: v })],
+    ["ragFilter", "checked", data.filter, v => ({ rag_filter: v })],
+    ["ragPool", "value", data.pool, v => ({ rag_pool: Number(v) })],
+    ["ragChunks", "value", data.chunks, v => ({ rag_chunks: Number(v) })],
+  ];
+  for (const [id, prop, значение, payload] of поля) {
+    const поле = $(id);
+    поле[prop] = значение;
+    поле.onchange = () => patchCurrent(payload(поле[prop]));
+  }
+  $("ragChunks").max = data.chunks_max || 8;
 }
 
 /** Переключатель режима: искать нечем / решает модель / ищем всегда. */
@@ -969,6 +998,7 @@ function renderRagMode(mode, modes) {
   show();
   select.onchange = async () => {
     show();
+    $("ragTuning").hidden = select.value === "off";
     await patchCurrent({ rag_mode: select.value });
   };
 }

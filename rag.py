@@ -599,24 +599,35 @@ def search(query: str, strategy: str = STRUCTURE, limit: int = 5) -> list[dict]:
     return [{**rows[i], "score": float(scores[i])} for i in best]
 
 
-def search_lexical(query: str, limit: int = 5) -> list[dict]:
-    """Поиск словами по структурным кускам, ранжирование bm25.
+def search_lexical(query: str, limit: int = 5,
+                   collection_ids: list[int] | None = None) -> list[dict]:
+    """Поиск словами по кускам, ранжирование bm25.
 
     Стеммера для русского в FTS5 нет, так что совпадают только точные формы
     слов. Именно поэтому он силён там, где вектор слаб: в вопросе про
-    `safe_name` имя написано ровно так же, как в коде.
+    `safe_name` имя написано ровно так же, как в коде. На прозе бывает то же
+    самое — «универсальный штамп» из «Золотого телёнка» вектор ставит на
+    230-е место из 656, а поиск словами на первое.
+
+    collection_ids сужает поиск до наборов, подключённых к диалогу. Без него
+    функция ищет по всей базе — так её звал только `compare`, которому
+    принадлежит вся база сразу.
     """
     words = [w for w in re.findall(r"[\w_]+", query.lower()) if len(w) > 2]
     if not words:
         return []
     match = " OR ".join(f'"{w}"' for w in words)
+    where, params = "chunks_fts MATCH ?", [match]
+    if collection_ids:
+        where += f" AND c.collection_id IN ({','.join('?' * len(collection_ids))})"
+        params += list(collection_ids)
     with connect() as conn:
         try:
             rows = conn.execute(
                 "SELECT c.*, bm25(chunks_fts) AS rank FROM chunks_fts"
                 " JOIN chunks c ON c.chunk_id = chunks_fts.chunk_id"
-                " WHERE chunks_fts MATCH ? ORDER BY rank LIMIT ?",
-                (match, limit)).fetchall()
+                f" WHERE {where} ORDER BY rank LIMIT ?",
+                (*params, limit)).fetchall()
         except sqlite3.OperationalError:
             return []
     return [{**dict(r), "score": -float(r["rank"])} for r in rows]
@@ -845,24 +856,67 @@ def save_collection_chunks(collection_id: int, pieces: list[Chunk],
               f"col{collection_id}:{c.source}#{c.ordinal}") for c in pieces])
 
 
-def search_collections(query: str, chat_id: int, limit: int = 5) -> list[dict]:
-    """Поиск по наборам, подключённым к диалогу.
+# Доля от лучшей близости, ниже которой кусок в пул не берём. Ноль — порога нет.
+#
+# Выключен по замеру, а не по лени. Восемь вопросов с известным эталонным
+# куском, пул 30, книга в 656 кусков:
+#
+#   порог 0,9  — эталон дошёл в 5 случаях из 8, кусков судье 19,1
+#   порог 0,85 — 6 из 8, кусков 18,8
+#   порог 0,8  — 6 из 8, кусков 19,0
+#   без порога — 8 из 8, кусков 18,8
+#
+# То есть порог не экономит ничего и теряет ответы: сужает пул не он, а
+# эвристики ниже. Причина видна в распределении — лучший кусок набирает
+# 0,45–0,55, случайный 0,27–0,35, и провести между ними черту нечем. Параметр
+# оставлен настраиваемым: на другой базе с другим разбросом он может пригодиться.
+RELATIVE_FLOOR = 0.0
+
+# Прибавка к месту при слиянии выдач (reciprocal rank fusion). Шестьдесят —
+# обычное значение: оно делает разницу между первым и вторым местом заметной,
+# а между двадцатым и двадцать первым — почти никакой.
+FUSION_K = 60
+
+
+def fuse(runs: list[list[dict]], limit: int) -> list[dict]:
+    """Сливает несколько выдач по местам, а не по оценкам.
+
+    Складывать косинус с bm25 нельзя: у одного шкала от нуля до единицы, у
+    другого — безразмерная величина, зависящая от длины куска и частоты слов.
+    Сопоставимы у них только места, поэтому каждый кусок получает сумму
+    1/(K + место) по всем выдачам, где он встретился. Кусок, попавший в обе
+    ноги поиска, обгоняет того, кто хорош только в одной, — ровно то, что нужно.
+    """
+    собрано: dict[int, dict] = {}
+    for run in runs:
+        for место, hit in enumerate(run):
+            key = hit["chunk_id"]
+            свой = собрано.setdefault(key, {**hit, "fusion": 0.0, "legs": 0})
+            свой["fusion"] += 1.0 / (FUSION_K + место + 1)
+            свой["legs"] += 1
+            # Косинус показываем человеку, поэтому держим лучший из виденных.
+            if hit.get("score", 0) > свой.get("score", 0) and "rank" not in hit:
+                свой["score"] = hit["score"]
+    итог = sorted(собрано.values(), key=lambda h: -h["fusion"])
+    return итог[:limit]
+
+
+def vector_hits(queries: list[str], collections: list[dict], limit: int,
+                floor: float | None = None) -> list[list[dict]]:
+    """Векторная нога поиска: по выдаче на каждую формулировку вопроса.
 
     Наборы с разными моделями считаются отдельно: их векторы несравнимы между
     собой, и класть их в одну матрицу значило бы сравнивать метры с секундами.
-    Сводим по косинусу внутри модели — шкала у всех одинаковая, от нуля до
-    единицы.
     """
-    collections = attached_collections(chat_id)
-    if not collections:
-        return []
-
+    # Порог читаем в момент вызова, а не в значении по умолчанию: иначе он
+    # замораживается при импорте, и подмена константы в замере ничего не меняет
+    # — на этом я уже один раз получил четыре одинаковые строки в таблице.
+    floor = RELATIVE_FLOOR if floor is None else floor
     by_model: dict[str, list[int]] = {}
     for item in collections:
         by_model.setdefault(item["model"], []).append(item["id"])
 
-    titles = {c["id"]: c["title"] for c in collections}
-    results: list[dict] = []
+    runs: list[list[dict]] = []
     for model_key, ids in by_model.items():
         marks = ",".join("?" * len(ids))
         with connect() as conn:
@@ -872,14 +926,128 @@ def search_collections(query: str, chat_id: int, limit: int = 5) -> list[dict]:
             continue
         matrix = np.vstack([np.frombuffer(r.pop("vector"), dtype=np.float32)
                             for r in rows])
-        vector = embed([query], model_key)[0]
-        scores = matrix @ vector
-        for position in np.argsort(-scores)[:limit]:
-            row = rows[position]
-            results.append({**row, "score": float(scores[position]),
-                            "collection": titles.get(row["collection_id"], "")})
-    results.sort(key=lambda r: -r["score"])
-    return results[:limit]
+        for vector in embed(queries, model_key):
+            scores = matrix @ vector
+            порог = floor * float(scores.max())
+            run = []
+            for position in np.argsort(-scores)[:limit]:
+                if float(scores[position]) < порог:
+                    break
+                run.append({**rows[position], "score": float(scores[position])})
+            runs.append(run)
+    return runs
+
+
+def search_collections(query: str | list[str], chat_id: int, limit: int = 5, *,
+                       lexical: bool = True, floor: float | None = None) -> list[dict]:
+    """Поиск по наборам, подключённым к диалогу.
+
+    query — вопрос или несколько его формулировок: переписанный вопрос ищет
+    заметно лучше исходного, и вместо выбора «какая формулировка правильная»
+    мы ищем по всем и сливаем выдачи.
+
+    Две ноги поиска, векторная и словесная, нужны потому, что промахиваются
+    они по-разному. Вектор берёт смысл и теряет точные имена: «универсальный
+    штамп» он ставит на 230-е место из 656, хотя фраза в книге дословно есть.
+    bm25 берёт эту фразу первой, но беспомощен, когда вопрос задан другими
+    словами.
+    """
+    queries = [query] if isinstance(query, str) else list(query)
+    queries = [q.strip() for q in queries if q and q.strip()]
+    collections = attached_collections(chat_id)
+    if not collections or not queries:
+        return []
+
+    titles = {c["id"]: c["title"] for c in collections}
+    ids = [c["id"] for c in collections]
+    runs = vector_hits(queries, collections, limit, floor)
+    if lexical:
+        runs += [search_lexical(q, limit, ids) for q in queries]
+
+    найдено = fuse([r for r in runs if r], limit)
+    for hit in найдено:
+        hit["collection"] = titles.get(hit["collection_id"], "")
+        hit.pop("vector", None)
+        hit.pop("rank", None)
+    return найдено
+
+
+# ---------- отбор найденного ----------
+#
+# Поиск отдаёт куски по близости, и этого мало: в выдаче оказываются почти
+# дубли от перекрытия и куски, похожие на вопрос «вообще», без единого слова
+# из него. Правила ниже дёшевы и проверены на книге; тяжёлую работу —
+# отличить «здесь есть ответ» от «здесь про то же, но ответа нет» — делает
+# судья в research_mcp, потому что для неё нужно куски прочитать.
+
+# Сколько символов максимум ищем как перекрытие соседних кусков.
+MAX_OVERLAP = 600
+
+# Длина слова, с которой оно считается значимым, и длина основы. Морфологии у
+# нас нет, и «Ивановича» с «Иванович» сравниваются по первым пяти буквам —
+# грубо, но для отсева достаточно: проверено на восьми вопросах, эталонный
+# кусок уцелел во всех восьми.
+WORD_MIN = 5
+STEM = 5
+
+
+def stems(text: str) -> set[str]:
+    """Основы значимых слов: первые буквы слов не короче WORD_MIN."""
+    return {w[:STEM] for w in re.findall(r"[^\W\d_]{%d,}" % WORD_MIN, text.lower())}
+
+
+def _overlap(first: str, second: str) -> int:
+    """Длина общего хвоста первого куска и начала второго."""
+    for size in range(min(MAX_OVERLAP, len(first), len(second)), 0, -1):
+        if first[-size:] == second[:size]:
+            return size
+    return 0
+
+
+def merge_neighbours(hits: list[dict]) -> list[dict]:
+    """Склеивает куски, идущие в документе подряд.
+
+    Куски режутся внахлёст, и соседи несут общий текст: в топ-8 по книге
+    попадало от одной до трёх таких пар, то есть до трёх мест из восьми
+    уходило на повторы. Склеенный кусок занимает одно место и читается
+    подряд, без обрыва на полуслове между двумя выдержками.
+    """
+    по_порядку = sorted(hits, key=lambda h: (h["collection_id"], h["source"],
+                                             h["ordinal"]))
+    склеено: list[dict] = []
+    for hit in по_порядку:
+        сосед = склеено[-1] if склеено else None
+        подряд = (сосед and сосед["collection_id"] == hit["collection_id"]
+                  and сосед["source"] == hit["source"]
+                  and hit["ordinal"] - сосед["ordinal"] == 1)
+        if not подряд:
+            склеено.append(dict(hit))
+            continue
+        общее = _overlap(сосед["text"], hit["text"])
+        сосед["text"] += hit["text"][общее:]
+        сосед["ordinal"] = hit["ordinal"]
+        сосед["section"] = f"{сосед['section']} + {hit['section']}"
+        сосед["chars"] = len(сосед["text"])
+        # Оценка склейки — лучшая из двух: кусок стал не хуже любой половины.
+        сосед["score"] = max(сосед.get("score", 0), hit.get("score", 0))
+        сосед["fusion"] = max(сосед.get("fusion", 0), hit.get("fusion", 0))
+    return sorted(склеено, key=lambda h: -h.get("fusion", h.get("score", 0)))
+
+
+def keep_wordy(hits: list[dict], queries: list[str]) -> list[dict]:
+    """Выбрасывает куски, где нет ни одной основы слова из вопроса.
+
+    Если правило выбросило всё, оно не применяется: вопрос мог быть задан
+    синонимами, и тогда отсутствие общих слов ничего не значит. Лучше отдать
+    судье лишнее, чем не отдать ничего.
+    """
+    нужные = set()
+    for q in queries:
+        нужные |= stems(q)
+    if not нужные:
+        return hits
+    оставили = [h for h in hits if stems(h["text"]) & нужные]
+    return оставили or hits
 
 
 # ---------- сравнение стратегий ----------

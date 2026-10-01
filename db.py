@@ -231,6 +231,13 @@ MIGRATIONS = {
         # Как диалог обращается с подключёнными документами. По умолчанию
         # прежнее поведение: инструмент есть, решает модель.
         "rag_mode": "TEXT NOT NULL DEFAULT 'auto'",
+        # Два этапа поиска по документам и их размеры. Флажки нужны не только
+        # ради настройки: с ними можно сравнить качество ответов с отбором и
+        # без, не трогая код.
+        "rag_rewrite": "INTEGER NOT NULL DEFAULT 1",
+        "rag_filter": "INTEGER NOT NULL DEFAULT 1",
+        "rag_pool": "INTEGER NOT NULL DEFAULT 30",
+        "rag_chunks": "INTEGER NOT NULL DEFAULT 6",
     },
 }
 
@@ -1026,6 +1033,10 @@ STRATEGIES = (FULL, WINDOW, FACTS, SUMMARY)
 # однажды не приняла, отвечая по устаревшей карточке фактов.
 RAG_OFF, RAG_AUTO, RAG_ALWAYS = "off", "auto", "always"
 RAG_MODES = (RAG_OFF, RAG_AUTO, RAG_ALWAYS)
+
+# Предел на число выдержек в ответе инструмента. Он же верхняя граница в схеме
+# search_docs: больше модель и не попросит.
+RAG_CHUNKS_MAX = 8
 DEFAULT_CONTEXT_N = 10
 
 # Новые диалоги начинают с фактов: карточка ключ-значение переживает обрезку
@@ -1094,7 +1105,9 @@ def update_conversation(
     context_n: int | None = None,
     use_profile: bool | None = None, use_project: bool | None = None,
     profile_id: int | None = None, clear_profile: bool = False,
-    rag_mode: str | None = None,
+    rag_mode: str | None = None, rag_rewrite: bool | None = None,
+    rag_filter: bool | None = None, rag_pool: int | None = None,
+    rag_chunks: int | None = None,
 ) -> dict | None:
     """Меняет название или настройки. Возвращает None, если диалог чужой или его нет."""
     sets, values = [], []
@@ -1125,6 +1138,18 @@ def update_conversation(
             raise ValueError(f"Неизвестный режим RAG: {rag_mode}")
         sets.append("rag_mode = ?")
         values.append(rag_mode)
+    if rag_rewrite is not None:
+        sets.append("rag_rewrite = ?")
+        values.append(int(rag_rewrite))
+    if rag_filter is not None:
+        sets.append("rag_filter = ?")
+        values.append(int(rag_filter))
+    if rag_pool is not None:
+        sets.append("rag_pool = ?")
+        values.append(max(RAG_CHUNKS_MAX, min(rag_pool, 200)))
+    if rag_chunks is not None:
+        sets.append("rag_chunks = ?")
+        values.append(max(1, min(rag_chunks, RAG_CHUNKS_MAX)))
     if use_profile is not None:
         sets.append("use_profile = ?")
         values.append(int(use_profile))
