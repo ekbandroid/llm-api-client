@@ -1987,6 +1987,28 @@ function memoryLine(mem) {
   return line;
 }
 
+/** Опора ответа на документы: сколько цитат сверено с выдержками.
+ *
+ *  Промах выделяется: цитата, которой нет в документе, — это не стилистика,
+ *  а выдумка в кавычках, и выглядеть она должна тревожно. */
+function groundingLine(g) {
+  if (!g || !g.sources) return null;
+  const промах = (g.quotes || 0) - (g.verified || 0);
+  const части = [];
+  части.push(g.quotes
+    ? (промах ? `цитат ${g.quotes}, не нашлось в документах ${промах}`
+              : `цитат ${g.quotes}, все сверены с документами`)
+    : "цитат в ответе нет");
+  части.push(`источников названо ${g.named} из ${g.sources}`);
+  const line = el("div", промах ? "truncated" : "hint",
+                  "Опора на документы: " + части.join(", ") + ".");
+  line.style.marginTop = "8px";
+  if (промах && (g.missing || []).length) {
+    line.title = "Не найдено дословно: " + g.missing.join(" | ");
+  }
+  return line;
+}
+
 /** Показывает расход диалога и оценку следующего запроса. */
 function updateTokenStats() {
   const box = $("tokenStats");
@@ -2101,6 +2123,8 @@ function renderStored(m) {
   box.appendChild(statsLine(m));
   const mem = memoryLine(meta.memory);
   if (mem) box.appendChild(mem);
+  const опора = groundingLine(meta.grounding);
+  if (опора) box.appendChild(опора);
   for (const info of meta.service || []) box.appendChild(serviceNote(info));
   addBranchButton(box, m.id);
   if (meta.finish_reason === "length") {
@@ -2364,6 +2388,9 @@ async function streamInto(url, payload, turn) {
           turn.answerFormat = ((ev.memory || {}).profile || {}).format || "text";
           const line = memoryLine(ev.memory);
           if (line) box.appendChild(line);
+        } else if (ev.type === "grounding") {
+          const опора = groundingLine(ev);
+          if (опора) box.appendChild(опора);
         } else if (ev.type === "task_state") {
           box.appendChild(serviceNote(ev, { undo: true }));
           loadTask(current);
