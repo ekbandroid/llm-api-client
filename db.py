@@ -213,6 +213,12 @@ MIGRATIONS = {
         # Состояние задачи: этап, текущий шаг, ожидаемое действие и чей ход.
         # Пауза — отдельный флаг, а не этап: приостановить можно на любом.
         "task_mode": "TEXT NOT NULL DEFAULT 'chat'",
+        # Цель диалога. Отдельной графой, а не в карточке фактов: карточку
+        # модель пересобирает каждый ход и держит в ней не больше 25 записей,
+        # так что на длинном разговоре цель оттуда вытесняется или незаметно
+        # переписывается. Цель переживает смену этапов и меняется только
+        # тогда, когда её меняет человек.
+        "task_goal": "TEXT",
         "task_stage": "TEXT NOT NULL DEFAULT 'planning'",
         "task_step": "TEXT",
         "task_expected": "TEXT",
@@ -1253,6 +1259,7 @@ def _add_task_event(conn, conversation_id: int, kind: str, stage: str, *,
 def update_task(
     conversation_id: int, user_id: int, *, mode: str | None = None,
     step: str | None = None, expected: str | None = None, actor: str | None = None,
+    goal: str | None = None,
     auto: bool | None = None, autopilot: bool | None = None, max_turns: int | None = None,
 ) -> dict | None:
     """Меняет настройки задачи. Этап и пауза идут отдельными функциями —
@@ -1263,7 +1270,8 @@ def update_task(
             raise ValueError(f"Неизвестный режим диалога: {mode}")
         sets.append("task_mode = ?")
         values.append(mode)
-    for name, value in (("task_step", step), ("task_expected", expected)):
+    for name, value in (("task_step", step), ("task_expected", expected),
+                        ("task_goal", goal)):
         if value is not None:
             sets.append(f"{name} = ?")
             values.append(value.strip()[:STEP_LIMIT])

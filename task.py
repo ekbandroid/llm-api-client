@@ -250,7 +250,14 @@ def blocked(conversation: dict, target: str) -> str | None:
 def state_text(conversation: dict) -> str:
     """Текст блока состояния для запроса."""
     stage = stage_of(conversation)
-    parts = [
+    parts = []
+    # Цель — до этапа. Этапы сменяются, разговор уходит в детали, а цель
+    # должна оставаться видимой: иначе на пятнадцатом сообщении ассистент
+    # аккуратно отвечает на последний вопрос, забыв, ради чего всё затевалось.
+    if goal := (conversation.get("task_goal") or "").strip():
+        parts.append(f"Цель диалога: {goal}. Она не меняется от того, что "
+                     "разговор ушёл в частности; возвращайся к ней.")
+    parts += [
         f"Состояние задачи. Этап: {LABELS[stage]} ({CHAIN}).",
         # В истории остаются реплики, сказанные на прежнем этапе. Одной
         # оговорки мало — проверено: модель повторяла «сейчас этап
@@ -323,7 +330,8 @@ SWITCH_SYSTEM = (
     "Ты следишь за состоянием задачи и не участвуешь в разговоре. Тебе дают "
     "текущее состояние, известные факты и последний обмен репликами. Верни "
     "ТОЛЬКО json-объект вида "
-    '{"stage": "<этап или null>", "step": "<текущий шаг>", '
+    '{"stage": "<этап или null>", "goal": "<цель диалога или null>", '
+    '"step": "<текущий шаг>", '
     '"expected": "<ожидаемое действие>", "actor": "user|assistant", '
     '"guard_met": true|false, "reason": "<коротко, почему переход>"}.\n'
     "Этапы: planning → execution → validation → done.\n"
@@ -343,6 +351,10 @@ SWITCH_SYSTEM = (
     "рассуждению ассистента.\n"
     "Поля step, expected и actor заполняй всегда по последнему обмену, даже "
     "когда этап не меняется. Без непустого reason переход не будет принят.\n"
+    "Поле goal — наоборот, трогай как можно реже. Заполни его, если цель ещё "
+    "не задана, и перепиши, только если пользователь прямо поставил другую "
+    "цель. Во всех прочих случаях возвращай goal: null. Цель — то, ради чего "
+    "затеян весь разговор, а не то, о чём спросили в последней реплике.\n"
     "У перехода вперёд есть условие входа — оно названо во входных данных. "
     "Ставь \"guard_met\": true, только если условие действительно выполнено по "
     "переписке, и назови признак в reason. Если признака нет — верни "
@@ -383,6 +395,7 @@ def refresh(conversation: dict, exchange: list[dict], *, model: str | None = Non
     transcript = "\n".join(history.transcript_line(m) for m in exchange)
     facts = conversation.get("facts") or ""
     user_part = (
+        f"Цель диалога: {conversation.get('task_goal') or '(не задана)'}\n"
         f"Этап: {stage}\n"
         f"Текущий шаг: {conversation.get('task_step') or '(не задан)'}\n"
         f"Ожидается: {conversation.get('task_expected') or '(не задано)'}\n"
@@ -430,12 +443,19 @@ def refresh(conversation: dict, exchange: list[dict], *, model: str | None = Non
     step = (parsed.get("step") or "").strip()
     expected = (parsed.get("expected") or "").strip()
     actor = parsed.get("actor") if parsed.get("actor") in db.ACTORS else None
-    if step or expected or actor:
+    # Цель — особый случай: её обновляем только когда переключатель её назвал,
+    # а он просил называть её редко. Пустая строка здесь значит «не трогай»,
+    # и это намеренно: стереть цель можно руками во вкладке «Задача».
+    goal = (parsed.get("goal") or "").strip()
+    if step or expected or actor or goal:
         db.update_task(
             conversation["id"], conversation["user_id"],
             step=step or None, expected=expected or None, actor=actor,
+            goal=goal or None,
         )
         info.update(step=step, expected=expected, actor=actor)
+        if goal:
+            info["goal"] = goal
 
     proposed = parsed.get("stage")
     if not proposed or proposed == stage:

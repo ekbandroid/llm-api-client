@@ -310,7 +310,13 @@ REWRITE_SYSTEM = (
     "поэтому заменяй вопросительные обороты на утвердительные, спрашиваемое "
     "называй теми словами, какими его называют в текстах такого рода, и "
     "сохраняй имена собственные без изменений. Не отвечай на вопрос и ничего "
-    "не придумывай сверх него."
+    "не придумывай сверх него.\n"
+    "Если перед вопросом даны последние реплики разговора, вопрос может быть "
+    "продолжением: «а сколько ему лет?» вместо «сколько лет Козлевичу». Такой "
+    "вопрос раскрывай — подставляй вместо «он», «это», «там» то, о чём "
+    "шла речь. Поиск истории не видит и по местоимениям не находит ничего. "
+    "Реплики нужны только для раскрытия вопроса; искать ответы на прежние "
+    "вопросы не надо."
 )
 
 JUDGE_SYSTEM = (
@@ -340,7 +346,7 @@ JUDGE_SYSTEM = (
 JUDGE_BUDGET = 30_000
 
 
-async def rewrite_query(question: str) -> list[str]:
+async def rewrite_query(question: str, context: str = "") -> list[str]:
     """Пара-тройка формулировок вопроса словами документа плюс исходная.
 
     Зачем: вопрос человека и текст документа написаны по-разному, и это стоит
@@ -348,12 +354,19 @@ async def rewrite_query(question: str) -> list[str]:
     ставит нужный кусок на 8-е место, «сколько получал Корейко в Геркулесе» —
     на 2-е. Ищем по всем формулировкам сразу, а не выбираем лучшую: выбрать
     её заранее всё равно нельзя.
+
+    context — последние реплики разговора. Без них вопрос-продолжение ищет
+    впустую: «а сколько ему лет?» не находит ничего, потому что «ему» нет ни
+    в одном документе. Замер на книге, место эталонного куска: вопрос целиком
+    6, он же продолжением — не нашёлся вовсе.
     """
+    спрашиваем = (f"Последние реплики разговора:\n{context}\n\nВопрос: {question}"
+                  if context.strip() else question)
     try:
         result = await asyncio.to_thread(
             llm.complete,
             [{"role": "system", "content": REWRITE_SYSTEM},
-             {"role": "user", "content": question}],
+             {"role": "user", "content": спрашиваем}],
             thinking=False, max_tokens=300, temperature=0,
             response_format={"type": "json_object"}, keep_text=True,
         )
@@ -420,6 +433,7 @@ async def search_docs(
     rag_rewrite: int = 1,
     rag_filter: int = 1,
     rag_chunks: int = 0,
+    context: str = "",
 ) -> str:
     """Ищет ответ в документах, подключённых к этому диалогу.
 
@@ -445,7 +459,7 @@ async def search_docs(
     запросы = [query]
     try:
         if rag_rewrite:
-            запросы = await rewrite_query(query)
+            запросы = await rewrite_query(query, context)
         found = await asyncio.to_thread(
             rag.search_collections, запросы, chat_id, pool)
         found = await asyncio.to_thread(rag.keep_wordy, found, запросы)

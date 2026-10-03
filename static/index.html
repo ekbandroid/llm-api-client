@@ -188,7 +188,10 @@
         </fieldset>
 
         <fieldset>
-          <legend>Шаг и ожидание</legend>
+          <legend>Цель, шаг и ожидание</legend>
+          <label><span>Цель диалога</span><input type="text" id="taskGoal" maxlength="500" placeholder="ради чего весь разговор"></label>
+          <div class="hint" style="margin:-6px 0 10px">Цель уходит в каждый запрос первой строкой и
+            переживает смену этапов. Переключатель этапов сам её не меняет — только дописывает, если пусто.</div>
           <label><span>Текущий шаг</span><input type="text" id="taskStep" maxlength="500" placeholder="что делаем прямо сейчас"></label>
           <label><span>Ожидается</span><input type="text" id="taskExpected" maxlength="500" placeholder="какое действие закроет этот шаг"></label>
           <label><span>Чей ход</span><select id="taskActor">
@@ -1459,7 +1462,7 @@ async function patchTask(payload) {
 function renderTask() {
   const box = $("taskBox");
   const badge = $("taskBadge");
-  const controls = ["taskMode", "taskAuto", "taskMaxTurns", "taskStep", "taskExpected",
+  const controls = ["taskMode", "taskAuto", "taskMaxTurns", "taskGoal", "taskStep", "taskExpected",
                     "taskActor", "taskBack", "taskNext", "taskPause"];
   for (const id of controls) $(id).disabled = !taskState;
 
@@ -1523,6 +1526,7 @@ function renderTask() {
     ? blocked[0].toUpperCase() + blocked.slice(1) + "."
     : `Отсюда можно: ${taskState.allowed.map(st => STAGE_LABELS[st]).join(", ") || "никуда"}.`;
 
+  $("taskGoal").value = taskState.goal || "";
   $("taskStep").value = taskState.step;
   $("taskExpected").value = taskState.expected;
   $("taskActor").value = taskState.actor;
@@ -1610,6 +1614,7 @@ $("taskPause").addEventListener("click", async () => {
     runAutopilot();
   }
 });
+$("taskGoal").addEventListener("change", () => patchTask({ goal: $("taskGoal").value }));
 $("taskStep").addEventListener("change", () => patchTask({ step: $("taskStep").value }));
 $("taskExpected").addEventListener("change", () => patchTask({ expected: $("taskExpected").value }));
 $("taskActor").addEventListener("change", () => patchTask({ actor: $("taskActor").value }));

@@ -1780,6 +1780,29 @@ RAG_POOL = 30
 FOUND_COUNT = re.compile(r"\((\d+)\)")
 
 
+# Сколько последних реплик берём в контекст запроса и сколько символов на
+# каждую. Два обмена: дальше местоимение почти не указывает, а запрос к
+# переписывателю растёт.
+CONTEXT_TURNS = 4
+CONTEXT_CHARS = 300
+
+
+def _recent(conversation_id: int, skip_last: int = 1) -> str:
+    """Последние реплики диалога — чтобы раскрыть вопрос-продолжение.
+
+    Последнее сообщение пропускаем: это и есть текущий вопрос, он передаётся
+    отдельно. Реплики режем по длине — для раскрытия «ему» нужен референт, а
+    не весь прошлый ответ со всеми цитатами.
+    """
+    rows = db.list_messages(conversation_id)
+    прежние = rows[:-skip_last] if skip_last else rows
+    куски = []
+    for m in прежние[-CONTEXT_TURNS:]:
+        кто = "Пользователь" if m["role"] == "user" else "Ассистент"
+        куски.append(f"{кто}: {(m['content'] or '')[:CONTEXT_CHARS]}")
+    return "\n".join(куски)
+
+
 def _rag_values(conversation: dict) -> dict:
     """Настройки поиска по документам, как их ждёт инструмент search_docs."""
     выдержек = conversation.get("rag_chunks") or RAG_CHUNKS
@@ -1812,6 +1835,7 @@ async def _rag_context(conversation: dict, question: str,
         return [], {}
 
     настройки = _rag_values(conversation)
+    настройки["context"] = await asyncio.to_thread(_recent, conversation_id)
     try:
         found = await mcp_tools.call_tool(
             db.RESEARCH_MCP_URL, "search_docs", {"query": question, **настройки},
@@ -2085,6 +2109,7 @@ class TaskPatch(BaseModel):
     auto: bool | None = None
     autopilot: bool | None = None
     max_turns: int | None = Field(default=None, ge=1, le=db.MAX_TURNS_LIMIT)
+    goal: str | None = None
     step: str | None = None
     expected: str | None = None
     actor: str | None = None
@@ -2098,6 +2123,7 @@ def _task_view(conversation: dict) -> dict:
         "mode": conversation["task_mode"] or db.CHAT_MODE,
         "stage": stage,
         "label": task.LABELS[stage],
+        "goal": conversation["task_goal"] or "",
         "step": conversation["task_step"] or "",
         "expected": conversation["task_expected"] or "",
         "actor": conversation["task_actor"] or db.USER_ACTOR,
@@ -2138,12 +2164,13 @@ async def task_set(
                     conversation_id, user["id"], task.stage_of(conversation),
                     note="задача заведена",
                 )
-        if any(v is not None for v in (payload.step, payload.expected, payload.actor,
-                                       payload.auto, payload.autopilot, payload.max_turns)):
+        if any(v is not None for v in (payload.goal, payload.step, payload.expected,
+                                       payload.actor, payload.auto, payload.autopilot,
+                                       payload.max_turns)):
             conversation = db.update_task(
-                conversation_id, user["id"], step=payload.step, expected=payload.expected,
-                actor=payload.actor, auto=payload.auto, autopilot=payload.autopilot,
-                max_turns=payload.max_turns,
+                conversation_id, user["id"], goal=payload.goal, step=payload.step,
+                expected=payload.expected, actor=payload.actor, auto=payload.auto,
+                autopilot=payload.autopilot, max_turns=payload.max_turns,
             )
     except ValueError as err:
         raise HTTPException(400, str(err)) from err
