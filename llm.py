@@ -7,6 +7,8 @@ import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 
+from urllib.parse import urlparse
+
 import httpx
 import requests
 from dotenv import load_dotenv
@@ -16,6 +18,17 @@ load_dotenv()
 API_KEY = os.getenv("LLM_API_KEY")
 BASE_URL = os.getenv("LLM_BASE_URL", "https://api.deepseek.com")
 MODEL = os.getenv("LLM_MODEL", "deepseek-flash")
+
+# Адреса, по которым модель считается запущенной на этой же машине.
+LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1", "0.0.0.0", "[::1]")
+
+# Диалект API. Формат запроса у всех общий — openai, — но у DeepSeek поверх
+# него есть свои поля: thinking и reasoning_effort. Чужому серверу они не
+# нужны, а некоторые на незнакомое поле отвечают ошибкой 400, и запрос
+# ломается целиком. Определяем по адресу, переопределяется переменной.
+DIALECT = (os.getenv("LLM_DIALECT")
+           or ("deepseek" if "deepseek" in (urlparse(BASE_URL).hostname or "")
+               else "openai")).lower()
 THINKING = os.getenv("LLM_THINKING", "true").lower() == "true"
 REASONING_EFFORT = os.getenv("LLM_REASONING_EFFORT", "high")
 SYSTEM_PROMPT = os.getenv("LLM_SYSTEM_PROMPT", "You are a helpful assistant.")
@@ -144,13 +157,17 @@ def build_payload(
     """Собирает тело запроса к /chat/completions."""
     use_thinking = THINKING if thinking is None else thinking
     payload: dict = {"model": model or MODEL, "messages": messages}
-    if use_thinking:
-        payload["thinking"] = {"type": "enabled"}
-        payload["reasoning_effort"] = REASONING_EFFORT
-    else:
-        # Модели DeepSeek v4 рассуждают по умолчанию: пропущенное поле
-        # их не выключает, а reasoning-токены расходуют бюджет max_tokens.
-        payload["thinking"] = {"type": "disabled"}
+    # Поля рассуждений — диалект DeepSeek, и уходят только к нему. Локальной
+    # модели они не нужны, а строгий сервер на незнакомое поле отвечает 400 и
+    # роняет весь запрос.
+    if DIALECT == "deepseek":
+        if use_thinking:
+            payload["thinking"] = {"type": "enabled"}
+            payload["reasoning_effort"] = REASONING_EFFORT
+        else:
+            # Модели DeepSeek v4 рассуждают по умолчанию: пропущенное поле
+            # их не выключает, а reasoning-токены расходуют бюджет max_tokens.
+            payload["thinking"] = {"type": "disabled"}
     if max_tokens is not None:
         payload["max_tokens"] = max_tokens
     if stop:
@@ -251,10 +268,26 @@ def assemble_stream(
     }
 
 
-def _headers() -> dict:
-    if not API_KEY:
-        raise LLMError("Не задан LLM_API_KEY. Скопируйте .env.example в .env и впишите ключ.")
-    return {"Authorization": f"Bearer {API_KEY}"}
+def is_local(url: str) -> bool:
+    """Модель крутится на этой же машине?
+
+    Отличать нужно ради ключа: Ollama и LM Studio его не спрашивают вовсе, а
+    у облака без ключа запрос не имеет смысла. Проверяем по адресу, а не по
+    настройке: настройку можно забыть переключить, адрес — нет.
+    """
+    host = (urlparse(url or "").hostname or "").lower()
+    return host in LOCAL_HOSTS or host.endswith(".local")
+
+
+def headers() -> dict:
+    """Заголовок авторизации — или ничего, если сервер его не ждёт."""
+    if API_KEY:
+        return {"Authorization": f"Bearer {API_KEY}"}
+    if is_local(BASE_URL):
+        # Локальный сервер ключа не ждёт. Присылать «Bearer None» ему можно,
+        # но это ложь в заголовке: лучше не присылать ничего.
+        return {}
+    raise LLMError("Не задан LLM_API_KEY. Скопируйте .env.example в .env и впишите ключ.")
 
 
 def complete(
@@ -270,7 +303,7 @@ def complete(
     started = time.monotonic()
     try:
         response = requests.post(
-            f"{BASE_URL}/chat/completions", headers=_headers(), json=payload,
+            f"{BASE_URL}/chat/completions", headers=headers(), json=payload,
             timeout=(CONNECT_TIMEOUT, timeout),
         )
         response.raise_for_status()
@@ -341,7 +374,7 @@ async def stream(
         limits = httpx.Timeout(timeout, connect=CONNECT_TIMEOUT, read=STALL_TIMEOUT)
         async with httpx.AsyncClient(timeout=limits) as client:
             async with client.stream(
-                "POST", f"{BASE_URL}/chat/completions", headers=_headers(), json=payload
+                "POST", f"{BASE_URL}/chat/completions", headers=headers(), json=payload
             ) as response:
                 if response.status_code != 200:
                     detail = (await response.aread()).decode("utf-8", "replace")

@@ -198,9 +198,9 @@ async def config(_: dict = Depends(require_approved)) -> dict:
     models = FALLBACK_MODELS
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            response = await client.get(
-                f"{llm.BASE_URL}/models", headers={"Authorization": f"Bearer {llm.API_KEY}"}
-            )
+            # Заголовки те же, что у запроса к модели: локальному серверу
+            # ключ не нужен, и слать ему «Bearer None» незачем.
+            response = await client.get(f"{llm.BASE_URL}/models", headers=llm.headers())
         if response.status_code == 200:
             models = [m["id"] for m in response.json().get("data", [])] or FALLBACK_MODELS
     except httpx.HTTPError:
