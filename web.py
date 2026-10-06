@@ -194,21 +194,41 @@ def sse(event: dict) -> str:
 
 @app.get("/api/config")
 async def config(_: dict = Depends(require_approved)) -> dict:
-    """Отдаёт интерфейсу список моделей и пресетов формата."""
-    models = FALLBACK_MODELS
+    """Отдаёт интерфейсу список моделей, сведения о провайдере и пресеты."""
+    # Запасной список нужен (без него интерфейс остался бы с пустым выбором),
+    # но выдавать его за настоящий нельзя. Раньше причина терялась в
+    # `except: pass`, и «вижу модели DeepSeek» означало сразу три разных
+    # положения: провайдер и правда DeepSeek; провайдер локальный, но не
+    # отвечает; провайдер ответил не то. На этом уже потерян вечер.
+    models, ok, reason = FALLBACK_MODELS, False, ""
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             # Заголовки те же, что у запроса к модели: локальному серверу
             # ключ не нужен, и слать ему «Bearer None» незачем.
             response = await client.get(f"{llm.BASE_URL}/models", headers=llm.headers())
         if response.status_code == 200:
-            models = [m["id"] for m in response.json().get("data", [])] or FALLBACK_MODELS
-    except httpx.HTTPError:
-        pass  # список моделей не критичен — отдаём запасной
+            найдено = [m["id"] for m in response.json().get("data", [])]
+            models, ok = найдено or FALLBACK_MODELS, bool(найдено)
+            reason = "" if найдено else "список моделей пуст"
+        else:
+            reason = f"ответил {response.status_code}"
+    except llm.LLMError as err:
+        reason = str(err)
+    except (httpx.HTTPError, ValueError, KeyError) as err:
+        reason = f"{type(err).__name__}: {err}"
 
     return {
         "models": models,
         "default_model": llm.MODEL,
+        # Адрес — не секрет, в отличие от ключа: ключ наружу не уходит никогда.
+        "provider": {
+            "url": llm.BASE_URL,
+            "local": llm.is_local(llm.BASE_URL),
+            "dialect": llm.DIALECT,
+            "ok": ok,
+            "reason": reason,
+            "fallback": not ok,
+        },
         "formats": [{"id": k, "label": v["label"]} for k, v in FORMAT_PRESETS.items()],
         "prices": benchmark.DEFAULT_PRICES,
         "price_note": "USD за 1 млн токенов, пиковые ставки без попадания в кэш",

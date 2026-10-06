@@ -71,6 +71,29 @@ fi
 
 # ---------- запуск ----------
 
+# Спрашиваем у самого приложения, а не разбираем .env: видно именно то, что
+# оно прочитало, со всеми правилами про переменные окружения. Правка, ушедшая
+# не в тот файл, становится заметна сразу — на этом уже потерян вечер.
+step "провайдер"
+"$VENV/bin/python" - <<'PYEOF' | sed 's/^/  /'
+import json, urllib.error, urllib.request
+import llm
+
+где = "локальный" if llm.is_local(llm.BASE_URL) else "внешний"
+строка = f"{llm.BASE_URL} · {где} · диалект {llm.DIALECT}"
+try:
+    запрос = urllib.request.Request(f"{llm.BASE_URL}/models", headers=llm.headers())
+    with urllib.request.urlopen(запрос, timeout=5) as ответ:
+        сколько = len(json.load(ответ).get("data", []))
+    print(f"{строка} · отвечает, моделей {сколько}")
+except llm.LLMError as err:
+    print(f"{строка}\n  НЕ ПРОВЕРЕН: {err}")
+except (urllib.error.URLError, OSError, ValueError) as err:
+    # Не повод валить проверку: приложение поднимается и без модели, а
+    # скрипт проверяет именно подъём.
+    print(f"{строка}\n  НЕ ОТВЕЧАЕТ: {type(err).__name__}: {err}")
+PYEOF
+
 step "свободен ли порт $PORT"
 if curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$PORT/"; then
     fail "порт $PORT уже занят — укажите другой через PORT=..."

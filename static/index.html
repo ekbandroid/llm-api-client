@@ -342,6 +342,9 @@ fetch("/api/me").then(r => r.json()).then(me => {
 // брался дубликат «(нет в списке)» рядом с настоящим пунктом.
 const modelsReady = fetch("/api/config").then(r => r.json()).then(cfg => {
   cfg.models.forEach(m => $("model").add(new Option(m, m)));
+  // Кто отвечает — видно сразу, не дожидаясь нажатия «↻». Этого и не хватало,
+  // когда переключённый на локальную модель чат показывал модели облака.
+  showProvider(cfg.provider, cfg.models.length, "");
   return cfg;
 }).catch(() => {
   $("model").add(new Option("(список недоступен)", ""));
@@ -399,15 +402,39 @@ async function reloadModels() {
 
     const added = cfg.models.filter(m => !before.includes(m));
     const gone = before.filter(m => !cfg.models.includes(m));
-    note.textContent = added.length || gone.length
-      ? `Список изменился: ${[added.length ? "добавлены " + added.join(", ") : null,
-                              gone.length ? "исчезли " + gone.join(", ") : null]
-                             .filter(Boolean).join("; ")}.`
-      : `Список не изменился, моделей ${cfg.models.length}.`;
+    const изменения = added.length || gone.length
+      ? ` Список изменился: ${[added.length ? "добавлены " + added.join(", ") : null,
+                               gone.length ? "исчезли " + gone.join(", ") : null]
+                              .filter(Boolean).join("; ")}.`
+      : "";
+    showProvider(cfg.provider, cfg.models.length, изменения);
   } catch (err) {
     note.textContent = "Не удалось обновить список: " + err.message;
+    note.className = "hint violation";
   } finally {
     btn.disabled = false;
+  }
+}
+
+/** Кто отвечает на запросы. Показывается всегда, а не только после «↻».
+ *
+ *  Запасной список выделяется тревожно: именно он однажды выдал себя за
+ *  настоящий — провайдер был переключён на локальный, а в выборе остались
+ *  модели облака, и понять это по интерфейсу было нельзя. */
+function showProvider(p, сколько, хвост) {
+  const note = $("modelsState");
+  if (!p) { note.textContent = ""; return; }
+  const где = p.local ? "локальный" : "внешний";
+  if (p.ok) {
+    note.className = "hint";
+    note.textContent = `Провайдер ${p.url} · ${где} · диалект ${p.dialect}` +
+                       ` · моделей ${сколько}.${хвост || ""}`;
+  } else {
+    note.className = "hint violation";
+    note.textContent = `Провайдер ${p.url} · ${где} · список получить не удалось` +
+                       `${p.reason ? " (" + p.reason + ")" : ""}.` +
+                       " Ниже — запасной список, он может не совпадать с тем," +
+                       " что у провайдера есть на самом деле.";
   }
 }
 
