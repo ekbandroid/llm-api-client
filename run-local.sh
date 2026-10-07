@@ -1,9 +1,10 @@
 #!/bin/sh
 # Проверка, что приложение поднимается на этой машине и отвечает.
 #
-#     ./run-local.sh            # поднять, проверить, погасить
-#     ./run-local.sh --keep     # оставить работать для ручных опытов
-#     PORT=9000 ./run-local.sh  # другой порт
+#     ./run-local.sh                   # поднять, проверить, погасить
+#     ./run-local.sh --keep            # оставить работать для ручных опытов
+#     ./run-local.sh --with-rag        # и сервер поиска по документам
+#     PORT=9000 ./run-local.sh         # другой порт
 #
 # Модель не нужна: ключ проверяется только в момент запроса, а до запроса мы
 # не доходим. Проверяется ровно то, что ломается при переносе на новую
@@ -16,16 +17,35 @@
 set -eu
 
 PORT=${PORT:-8765}
+RAG_PORT=${RAG_PORT:-8763}
 VENV=.venv
 KEEP=
-[ "${1:-}" = "--keep" ] && KEEP=1
+WITH_RAG=
+for arg in "$@"; do
+    case "$arg" in
+        --keep) KEEP=1 ;;
+        --with-rag) WITH_RAG=1 ;;
+        *) echo "Неизвестный ключ: $arg" >&2; exit 1 ;;
+    esac
+done
 
 [ -f web.py ] || { echo "Запускать из корня проекта" >&2; exit 1; }
 
 DATA=$(mktemp -d "${TMPDIR:-/tmp}/llmchat-test.XXXXXX")
 SERVER=
+RAGSERVER=
+
+# Переписка — во временную базу, а индекс документов — настоящий. Разводим
+# намеренно: проверять поиск по пустому индексу бессмысленно, а писать
+# проверочные диалоги в рабочую переписку незачем. Поиск индекс только читает.
+export RAG_DB_PATH="$PWD/rag.db"
+export RAG_SOURCES_DIR="$PWD/rag-sources"
+# Адрес сервера поиска нужен обоим: чат по нему ходит, и он же попадает в
+# список MCP-серверов при заведении учётки.
+export RESEARCH_MCP_URL="http://127.0.0.1:$RAG_PORT/mcp"
 
 cleanup() {
+    [ -n "$RAGSERVER" ] && kill "$RAGSERVER" 2>/dev/null || true
     [ -n "$SERVER" ] && kill "$SERVER" 2>/dev/null || true
     [ -n "$KEEP" ] || rm -rf "$DATA"
 }
@@ -93,6 +113,41 @@ except (urllib.error.URLError, OSError, ValueError) as err:
     # скрипт проверяет именно подъём.
     print(f"{строка}\n  НЕ ОТВЕЧАЕТ: {type(err).__name__}: {err}")
 PYEOF
+
+if [ -n "$WITH_RAG" ]; then
+    # Сервер поиска — отдельный процесс не для красоты: модель эмбеддингов
+    # держится в памяти резидентно, около гигабайта, и второй её экземпляр
+    # рядом с приложением удвоил бы расход. Поэтому и флагом, а не всегда.
+    step "сервер поиска по документам"
+    if curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$RAG_PORT/"; then
+        fail "порт $RAG_PORT занят — укажите другой через RAG_PORT=..."
+    fi
+    DB_PATH="$DATA/app.db" \
+        "$VENV/bin/uvicorn" research_mcp:app --host 127.0.0.1 --port "$RAG_PORT" \
+        --log-level warning > "$DATA/research.log" 2>&1 &
+    RAGSERVER=$!
+    WAITED=0
+    until curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$RAG_PORT/mcp"; do
+        kill -0 "$RAGSERVER" 2>/dev/null || { sed 's/^/  /' "$DATA/research.log"; fail "сервер поиска не поднялся"; }
+        WAITED=$((WAITED + 1))
+        [ "$WAITED" -gt 60 ] && fail "сервер поиска не ответил за 60 с"
+        sleep 1
+    done
+    printf '  поднялся за %s с на порту %s\n' "$WAITED" "$RAG_PORT"
+    "$VENV/bin/python" - <<'PYEOF' | sed 's/^/  /'
+import asyncio, os
+import mcp_tools, rag
+
+сервер = asyncio.run(mcp_tools.list_tools(os.environ["RESEARCH_MCP_URL"]))
+имена = [t.name for t in сервер.tools]
+print("инструменты:", ", ".join(имена))
+print("search_docs на месте:", "search_docs" in имена)
+with rag.connect() as c:
+    наборы = c.execute("SELECT count(*), coalesce(sum(chunks), 0) FROM collections"
+                       " WHERE status = 'готов'").fetchone()
+print(f"индекс: наборов {наборы[0]}, кусков {наборы[1]} ({rag.DB_PATH})")
+PYEOF
+fi
 
 step "свободен ли порт $PORT"
 if curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$PORT/"; then
