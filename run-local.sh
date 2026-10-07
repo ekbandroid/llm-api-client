@@ -52,6 +52,30 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 step() { printf '· %s\n' "$1"; }
+
+# Кто держит порт и чем его погасить. Советовать «возьмите другой порт»
+# почти всегда мимо: в девяти случаях из десяти порт занят нашим же
+# процессом от прошлого запуска с --keep.
+busy() {   # порт, имя переменной для подмены
+    OWNERS=$(lsof -ti:"$1" 2>/dev/null | tr '\n' ' ' | sed 's/ *$//')
+    if [ -z "$OWNERS" ]; then
+        fail "порт $1 занят, но кем — выяснить не удалось (нет lsof?). Укажите другой через $2=..."
+    fi
+    printf '  порт %s занят:\n' "$1" >&2
+    for PID in $OWNERS; do
+        # Длинный путь к интерпретатору съедает всю строку, а узнать процесс
+        # можно только по тому, что идёт после него. Путь сокращаем.
+        # От пути к исполняемому файлу оставляем только имя: длинный путь к
+        # интерпретатору съедает строку, а узнаётся процесс по тому, что идёт
+        # после него — «-m http.server 8763» или «uvicorn research_mcp:app».
+        ps -o pid=,etime=,command= -p "$PID" 2>/dev/null \
+            | sed -E 's#^( *[0-9]+ +[0-9:.-]+ +)[^ ]*/#\1#' \
+            | cut -c1-120 | sed 's/^/    /' >&2
+    done
+    printf '  погасить:  kill %s\n' "$OWNERS" >&2
+    printf '  или взять другой порт:  %s=<номер> %s\n' "$2" "$0" >&2
+    exit 1
+}
 fail() { printf '  ПЛОХО: %s\n' "$1" >&2; exit 1; }
 
 # ---------- окружение ----------
@@ -120,7 +144,7 @@ if [ -n "$WITH_RAG" ]; then
     # рядом с приложением удвоил бы расход. Поэтому и флагом, а не всегда.
     step "сервер поиска по документам"
     if curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$RAG_PORT/"; then
-        fail "порт $RAG_PORT занят — укажите другой через RAG_PORT=..."
+        busy "$RAG_PORT" RAG_PORT
     fi
     DB_PATH="$DATA/app.db" \
         "$VENV/bin/uvicorn" research_mcp:app --host 127.0.0.1 --port "$RAG_PORT" \
@@ -151,7 +175,7 @@ fi
 
 step "свободен ли порт $PORT"
 if curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$PORT/"; then
-    fail "порт $PORT уже занят — укажите другой через PORT=..."
+    busy "$PORT" PORT
 fi
 
 step "поднимаю приложение на временной базе"
@@ -221,7 +245,12 @@ if [ -n "$KEEP" ]; then
     echo "Приложение работает: http://127.0.0.1:$PORT"
     echo "  данные:    $DATA"
     echo "  учётка:    DB_PATH=$DATA/app.db $VENV/bin/python manage.py create-admin ivan"
-    echo "  погасить:  kill $SERVER && rm -rf $DATA"
+    if [ -n "$RAGSERVER" ]; then
+        echo "  поиск:     http://127.0.0.1:$RAG_PORT/mcp (процесс $RAGSERVER)"
+        echo "  погасить:  kill $SERVER $RAGSERVER && rm -rf $DATA"
+    else
+        echo "  погасить:  kill $SERVER && rm -rf $DATA"
+    fi
     trap - EXIT INT TERM
 else
     echo "Локальный запуск работает. Чтобы поиграть руками: ./run-local.sh --keep"
