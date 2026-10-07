@@ -22,6 +22,18 @@ MODEL = os.getenv("LLM_MODEL", "deepseek-flash")
 # Адреса, по которым модель считается запущенной на этой же машине.
 LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1", "0.0.0.0", "[::1]")
 
+def is_local(url: str) -> bool:
+    """Модель крутится на этой же машине?
+
+    Отличать нужно ради двух вещей: ключа (Ollama и LM Studio его не
+    спрашивают вовсе, а у облака без ключа запрос не имеет смысла) и
+    терпения — пределы ожидания ниже. Проверяем по адресу, а не по настройке:
+    настройку можно забыть переключить, адрес — нет.
+    """
+    host = (urlparse(url or "").hostname or "").lower()
+    return host in LOCAL_HOSTS or host.endswith(".local")
+
+
 # Диалект API. Формат запроса у всех общий — openai, — но у DeepSeek поверх
 # него есть свои поля: thinking и reasoning_effort. Чужому серверу они не
 # нужны, а некоторые на незнакомое поле отвечают ошибкой 400, и запрос
@@ -38,17 +50,34 @@ SYSTEM_PROMPT = os.getenv("LLM_SYSTEM_PROMPT", "You are a helpful assistant.")
 # который не отвечает вовсе, должен отваливаться быстро.
 CONNECT_TIMEOUT = 10
 
+# Во сколько раз терпеливее мы к модели на своей машине.
+#
+# Она думает дольше облачной и не параллелится: Ollama обслуживает запросы к
+# одной модели по очереди, так что пока сервер поиска считает своё, ответ
+# стоит и кусков не шлёт. Замер на qwen2.5:3b, время до первого куска: 6,4 с
+# на 616 токенов, 13,8 с на 1823, 23,6 с на 3625 — около 6,5 с на каждую
+# тысячу. Настоящий запрос приложения со схемами инструментов и выдержками
+# вдвое больше, да ещё может ждать очереди; шестидесяти секунд ему мало, и
+# пользователь получал ReadTimeout вместо ответа.
+LOCAL_PATIENCE = 5 if is_local(BASE_URL) else 1
+
 # Допустимая пауза между кусками потокового ответа. Это не лимит на всю
 # генерацию: отсчёт начинается заново с каждым полученным куском. Нужен,
 # чтобы зависшая модель не держала пользователя перед пустым экраном
 # до самого общего таймаута.
-STALL_TIMEOUT = 60
+STALL_TIMEOUT = 60 * LOCAL_PATIENCE
 
 # Сколько ждём ПЕРВОГО куска текста. Отдельный предел нужен потому, что
 # сервер может держать соединение живым служебными пакетами «: keep-alive»
 # и при этом не начать отвечать вовсе: данные формально идут, таймаут чтения
 # не срабатывает, и пользователь сидит перед пустым экраном до общего лимита.
-FIRST_TOKEN_TIMEOUT = 60
+FIRST_TOKEN_TIMEOUT = 60 * LOCAL_PATIENCE
+
+# Пределы на весь вызов — тем же множителем. Служебные вызовы (переписывание
+# запроса, судья, карточка фактов) идут через complete, и на местной модели
+# каждый занимает десятки секунд; поток отвечает дольше, и ему дано больше.
+COMPLETE_TIMEOUT = 120 * LOCAL_PATIENCE
+STREAM_TIMEOUT = 300 * LOCAL_PATIENCE
 
 
 # API отклоняет запрос целиком, если выбран формат json_object, а слова «json»
@@ -268,17 +297,6 @@ def assemble_stream(
     }
 
 
-def is_local(url: str) -> bool:
-    """Модель крутится на этой же машине?
-
-    Отличать нужно ради ключа: Ollama и LM Studio его не спрашивают вовсе, а
-    у облака без ключа запрос не имеет смысла. Проверяем по адресу, а не по
-    настройке: настройку можно забыть переключить, адрес — нет.
-    """
-    host = (urlparse(url or "").hostname or "").lower()
-    return host in LOCAL_HOSTS or host.endswith(".local")
-
-
 def headers() -> dict:
     """Заголовок авторизации — или ничего, если сервер его не ждёт."""
     if API_KEY:
@@ -291,7 +309,7 @@ def headers() -> dict:
 
 
 def complete(
-    messages: list[dict], *, timeout: int = 120, keep_text: bool = False, **options
+    messages: list[dict], *, timeout: int | None = None, keep_text: bool = False, **options
 ) -> Completion:
     """Синхронный вызов: ждёт ответ целиком и возвращает его с телеметрией.
 
@@ -299,6 +317,7 @@ def complete(
     служебные обращения, у которых этот текст нигде больше не показан.
     """
     payload = build_payload(messages, **options)
+    timeout = COMPLETE_TIMEOUT if timeout is None else timeout
 
     started = time.monotonic()
     try:
@@ -338,7 +357,7 @@ def complete(
 
 
 async def stream(
-    messages: list[dict], *, timeout: int = 300, **options
+    messages: list[dict], *, timeout: int | None = None, **options
 ) -> AsyncIterator[dict]:
     """Потоковый вызов: отдаёт куски ответа по мере генерации.
 
@@ -352,6 +371,7 @@ async def stream(
        "tool_calls": [...]} — вызовы инструментов, если модель их запросила.
     """
     payload = build_payload(messages, **options)
+    timeout = STREAM_TIMEOUT if timeout is None else timeout
     payload["stream"] = True
     payload["stream_options"] = {"include_usage": True}
 
