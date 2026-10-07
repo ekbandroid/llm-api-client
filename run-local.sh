@@ -31,7 +31,17 @@ done
 
 [ -f web.py ] || { echo "Запускать из корня проекта" >&2; exit 1; }
 
-DATA=$(mktemp -d "${TMPDIR:-/tmp}/llmchat-test.XXXXXX")
+# Где лежат данные. Для проверки — временный каталог: она не должна писать в
+# ту же app.db, где настоящая переписка. Для --keep наоборот нужен постоянный:
+# иначе каждый перезапуск давал бы пустое приложение — ни учётки, ни диалогов,
+# ни настроек, — а rag.db при этом переживает перезапуск, и подключённый набор
+# оставался за прежним номером пользователя и пропадал из списка. Так и вышло.
+if [ -n "$KEEP" ]; then
+    DATA=$PWD/local-data
+    mkdir -p "$DATA"
+else
+    DATA=$(mktemp -d "${TMPDIR:-/tmp}/llmchat-test.XXXXXX")
+fi
 SERVER=
 RAGSERVER=
 
@@ -47,6 +57,7 @@ export RESEARCH_MCP_URL="http://127.0.0.1:$RAG_PORT/mcp"
 cleanup() {
     [ -n "$RAGSERVER" ] && kill "$RAGSERVER" 2>/dev/null || true
     [ -n "$SERVER" ] && kill "$SERVER" 2>/dev/null || true
+    # Временный каталог убираем, постоянный — никогда: в нём переписка.
     [ -n "$KEEP" ] || rm -rf "$DATA"
 }
 trap cleanup EXIT INT TERM
@@ -243,13 +254,13 @@ printf '  чисто\n'
 echo
 if [ -n "$KEEP" ]; then
     echo "Приложение работает: http://127.0.0.1:$PORT"
-    echo "  данные:    $DATA"
+    echo "  данные:    $DATA (постоянные, переживают перезапуск)"
     echo "  учётка:    DB_PATH=$DATA/app.db $VENV/bin/python manage.py create-admin ivan"
     if [ -n "$RAGSERVER" ]; then
         echo "  поиск:     http://127.0.0.1:$RAG_PORT/mcp (процесс $RAGSERVER)"
-        echo "  погасить:  kill $SERVER $RAGSERVER && rm -rf $DATA"
+        echo "  погасить:  kill $SERVER $RAGSERVER"
     else
-        echo "  погасить:  kill $SERVER && rm -rf $DATA"
+        echo "  погасить:  kill $SERVER"
     fi
     trap - EXIT INT TERM
 else
