@@ -106,7 +106,43 @@ def _plain(html: str) -> str:
     return re.sub(r"<[^>]+>", "", html or "").replace("&quot;", '"').strip()
 
 
-@server.tool()
+def _wiki_enabled() -> bool:
+    """Показывать ли модели поиск по Википедии.
+
+    На местной модели — нет, и это не вкусовщина. Проверено: на вопрос по
+    подключённому документу qwen2.5:3b уходила именно в Википедию, причём
+    выдержки лежали в том же запросе. Запретить словами не вышло — с прямым
+    запретом в промпте модель звала поиск 2 раза из 2. Небольшая модель
+    выбирает инструмент по названию, а не по смыслу задачи, и единственный
+    надёжный способ не дать ей уйти — не класть этот инструмент в запрос.
+
+    Облаку инструмент оставляем: там он работает как задумано, а цепочка
+    «найти — прочитать — пересказать — сохранить» на нём и держится.
+    Переопределяется переменной RESEARCH_WIKI=on/off.
+    """
+    явно = os.getenv("RESEARCH_WIKI", "").strip().lower()
+    if явно in ("0", "off", "false", "no"):
+        return False
+    if явно in ("1", "on", "true", "yes"):
+        return True
+    return not llm.is_local(llm.BASE_URL)
+
+
+WIKI = _wiki_enabled()
+
+
+def wiki_tool():
+    """Регистрирует инструмент, только если Википедия включена.
+
+    Функция остаётся на месте и вызывается из кода как обычно — скрывается
+    она только от модели.
+    """
+    def обёртка(fn):
+        return server.tool()(fn) if WIKI else fn
+    return обёртка
+
+
+@wiki_tool()
 async def search(
     query: Annotated[str, Field(
         description="Что искать: тема, название, имя. Обычными словами")],
@@ -145,7 +181,7 @@ async def search(
     return "\n".join(lines)
 
 
-@server.tool()
+@wiki_tool()
 async def article(
     title: Annotated[str, Field(
         description="Точный заголовок статьи, как его вернул search")],
