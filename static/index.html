@@ -2019,6 +2019,20 @@ function memoryLine(mem) {
   return line;
 }
 
+/** Провайдер принял меньше, чем мы отправили, — значит обрезал.
+ *
+ *  Без этой строки обрезка выглядит как глупость модели: она отвечает «в
+ *  тексте нет такой информации», не увидев текста. У локальных серверов
+ *  причина почти всегда одна — окно контекста. */
+function truncatedLine(t) {
+  const line = el("div", "truncated",
+    `Провайдер принял ${t.accepted} токенов из примерно ${t.sent} — остальное ` +
+    "обрезано, и до модели дошла только часть запроса. У локальных серверов это " +
+    "окно контекста: OLLAMA_CONTEXT_LENGTH=8192 ollama serve.");
+  line.style.marginTop = "8px";
+  return line;
+}
+
 /** Опора ответа на документы: сколько цитат сверено с выдержками.
  *
  *  Промах выделяется: цитата, которой нет в документе, — это не стилистика,
@@ -2155,6 +2169,7 @@ function renderStored(m) {
   box.appendChild(statsLine(m));
   const mem = memoryLine(meta.memory);
   if (mem) box.appendChild(mem);
+  if (meta.truncated) box.appendChild(truncatedLine(meta.truncated));
   const опора = groundingLine(meta.grounding);
   if (опора) box.appendChild(опора);
   for (const info of meta.service || []) box.appendChild(serviceNote(info));
@@ -2420,6 +2435,8 @@ async function streamInto(url, payload, turn) {
           turn.answerFormat = ((ev.memory || {}).profile || {}).format || "text";
           const line = memoryLine(ev.memory);
           if (line) box.appendChild(line);
+        } else if (ev.type === "truncated") {
+          box.appendChild(truncatedLine(ev));
         } else if (ev.type === "grounding") {
           const опора = groundingLine(ev);
           if (опора) box.appendChild(опора);
