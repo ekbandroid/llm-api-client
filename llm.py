@@ -43,7 +43,49 @@ DIALECT = (os.getenv("LLM_DIALECT")
                else "openai")).lower()
 THINKING = os.getenv("LLM_THINKING", "true").lower() == "true"
 REASONING_EFFORT = os.getenv("LLM_REASONING_EFFORT", "high")
-SYSTEM_PROMPT = os.getenv("LLM_SYSTEM_PROMPT", "You are a helpful assistant.")
+
+# Системный промпт по умолчанию — разный у облака и у своей машины.
+#
+# «You are a helpful assistant» написано ни о чём, и большой модели этого
+# хватает: задачу она понимает из самого запроса. Модель на три миллиарда
+# параметров так не умеет — ей нужно сказать, что делать, коротко и прямо.
+# Здесь сказано ровно то, чем эта модель занята в приложении: отвечает по
+# выдержкам из документов пользователя. Оговорка «если в запросе есть
+# выдержки» оставляет обычную беседу обычной.
+LOCAL_SYSTEM_PROMPT = (
+    "Отвечай по-русски, коротко и по делу. Если в запросе есть выдержки из "
+    "документов — отвечай только по ним: приведи дословную цитату и назови "
+    "файл. Чего в выдержках нет, того нет и в документах: не добавляй по "
+    "памяти и не угадывай, а скажи, что не нашлось."
+)
+
+SYSTEM_PROMPT = os.getenv("LLM_SYSTEM_PROMPT") or (
+    LOCAL_SYSTEM_PROMPT if is_local(BASE_URL) else "You are a helpful assistant.")
+
+
+def _temperature() -> float | None:
+    """Температура по умолчанию: своя для местной модели, никакой для облака.
+
+    Ollama без этого поля берёт 0,8 — в самый раз для беседы и слишком много
+    для задачи «ответь по выдержке и приведи из неё цитату»: модель
+    пересказывает выдержку своими словами, и дословная цитата не сходится.
+    Облаку значение не навязываем: его ответы устраивают, а менять поведение
+    всех диалогов заодно с локальной настройкой значило бы протащить одно под
+    видом другого.
+    """
+    задано = os.getenv("LLM_TEMPERATURE", "").strip().replace(",", ".")
+    if not задано:
+        return 0.2 if is_local(BASE_URL) else None
+    try:
+        # Границы те же, что у лаборатории температуры в интерфейсе: за ними
+        # ответы перестают быть ответами, и молча пропускать такое незачем.
+        return min(2.0, max(0.0, float(задано)))
+    except ValueError:
+        print(f"LLM_TEMPERATURE={задано!r} — не число, беру значение по умолчанию")
+        return 0.2 if is_local(BASE_URL) else None
+
+
+TEMPERATURE = _temperature()
 
 
 # Сколько ждём установки соединения. Отдельно от ожидания ответа: сервер,
@@ -180,11 +222,17 @@ def build_payload(
     stop: list[str] | None = None,
     thinking: bool | None = None,
     temperature: float | None = None,
+    seed: int | None = None,
     response_format: dict | None = None,
     tools: list[dict] | None = None,
 ) -> dict:
     """Собирает тело запроса к /chat/completions."""
     use_thinking = THINKING if thinking is None else thinking
+    # Служебные вызовы задают температуру сами (судья — 0, переписывание
+    # вопроса — 0,3), и подставлять им общее значение нельзя. Подставляем
+    # только там, где его не задали вовсе, — то есть в обычном разговоре.
+    if temperature is None:
+        temperature = TEMPERATURE
     payload: dict = {"model": model or MODEL, "messages": messages}
     # Поля рассуждений — диалект DeepSeek, и уходят только к нему. Локальной
     # модели они не нужны, а строгий сервер на незнакомое поле отвечает 400 и
@@ -203,6 +251,12 @@ def build_payload(
         payload["stop"] = stop
     if temperature is not None:
         payload["temperature"] = temperature
+    # Зерно генератора. Приложению не нужно, нужно замеру: без него два
+    # прогона одной и той же настройки расходятся сами по себе, и разницу
+    # в десять процентов не отличить от шума. Поддерживают и Ollama, и
+    # OpenAI-совместимые серверы; кто не поддерживает — поле проигнорирует.
+    if seed is not None:
+        payload["seed"] = seed
     # Схемы инструментов MCP. Решает по ним модель: приложение лишь выполняет
     # то, что она запросила, и возвращает результат следующим запросом.
     if tools:
