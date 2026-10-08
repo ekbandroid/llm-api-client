@@ -1990,7 +1990,13 @@ function memoryLine(mem) {
   if (!mem || (!mem.profile && !mem.project && !mem.task && !mem.invariants && !mem.mcp
                && !mem.rag)) return null;
   const parts = [];
-  if (mem.mcp) {
+  if (mem.mcp && mem.mcp.dropped) {
+    // Снятые инструменты называем прямо. Иначе через неделю не вспомнить,
+    // почему в этом диалоге не работает погода.
+    parts.push(`инструменты MCP сняты (${mem.mcp.dropped} с ${mem.mcp.servers} ` +
+               "серверов): местная модель в режиме «всегда искать» уходит в них " +
+               "вместо выдержек — вернуть их можно режимом «по решению модели»");
+  } else if (mem.mcp) {
     parts.push(`инструменты MCP: ${mem.mcp.tools} с ${mem.mcp.servers} серверов ~${mem.mcp.tokens} токенов`);
   }
   if (mem.rag) {
