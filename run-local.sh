@@ -147,6 +147,33 @@ except (urllib.error.URLError, OSError, ValueError) as err:
     # Не повод валить проверку: приложение поднимается и без модели, а
     # скрипт проверяет именно подъём.
     print(f"{строка}\n  НЕ ОТВЕЧАЕТ: {type(err).__name__}: {err}")
+
+# Окно контекста. Спрашиваем только у местной модели и только потому, что
+# задать его в запросе нельзя: OpenAI-совместимый /v1 такого поля не знает, и
+# окно берётся либо из параметров модели, либо из OLLAMA_CONTEXT_LENGTH у
+# сервера. Маленькое окно не ошибка, а молчаливая обрезка: запрос с выдержками
+# не доезжает, и со стороны это выглядит как глупость модели. Один раз на это
+# уже ушёл день.
+if llm.is_local(llm.BASE_URL):
+    корень = llm.BASE_URL.rsplit("/v1", 1)[0]
+    try:
+        запрос = urllib.request.Request(
+            f"{корень}/api/show", data=json.dumps({"model": llm.MODEL}).encode(),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(запрос, timeout=5) as ответ:
+            параметры = json.load(ответ).get("parameters") or ""
+        окно = next((s.split()[-1] for s in параметры.splitlines()
+                     if s.startswith("num_ctx")), "")
+        if окно:
+            print(f"окно контекста {окно} — своё, из Modelfile")
+        else:
+            print("окно контекста НЕ ЗАДАНО у модели: возьмётся из "
+                  "OLLAMA_CONTEXT_LENGTH или по умолчанию, а маленькое молча "
+                  "обрежет запрос с выдержками")
+            print("  соберите свою: ollama create llmchat-rag:3b -f local/Modelfile")
+    except (urllib.error.URLError, OSError, ValueError, KeyError):
+        # Не Ollama, модели нет или сервер молчит — проверке это не мешает.
+        pass
 PYEOF
 
 if [ -n "$WITH_RAG" ]; then
