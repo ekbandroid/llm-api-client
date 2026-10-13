@@ -4,6 +4,7 @@
 #     ./run-local.sh                   # поднять, проверить, погасить
 #     ./run-local.sh --keep            # оставить работать для ручных опытов
 #     ./run-local.sh --with-rag        # и сервер поиска по документам
+#     ./run-local.sh --with-project    # и сервер про git проекта (и поиск)
 #     ./run-local.sh --keep --lan      # и открыть его устройствам в этом Wi-Fi
 #     LAN_PORT=9100 ./run-local.sh --lan   # другой порт для сети
 #     PORT=9000 ./run-local.sh         # другой порт
@@ -20,9 +21,11 @@ set -eu
 
 PORT=${PORT:-8765}
 RAG_PORT=${RAG_PORT:-8763}
+PROJECT_PORT=${PROJECT_PORT:-8764}
 VENV=.venv
 KEEP=
 WITH_RAG=
+WITH_PROJECT=
 
 # Приложение всегда слушает только петлю. Устройствам в сети его отдаёт
 # отдельный процесс на системном питоне — почему именно так, подробно в
@@ -34,6 +37,9 @@ for arg in "$@"; do
     case "$arg" in
         --keep) KEEP=1 ;;
         --with-rag) WITH_RAG=1 ;;
+        # Сервер проекта без поиска бесполезен: /help достаёт выдержки через
+        # research-сервер, и без него ассистент знает только про git.
+        --with-project) WITH_PROJECT=1; WITH_RAG=1 ;;
         --lan) LAN=1 ;;
         *) echo "Неизвестный ключ: $arg" >&2; exit 1 ;;
     esac
@@ -70,6 +76,7 @@ fi
 SERVER=
 RAGSERVER=
 LANPROXY=
+PROJECTSERVER=
 
 # Переписка — во временную базу, а индекс документов — настоящий. Разводим
 # намеренно: проверять поиск по пустому индексу бессмысленно, а писать
@@ -79,8 +86,10 @@ export RAG_SOURCES_DIR="$PWD/rag-sources"
 # Адрес сервера поиска нужен обоим: чат по нему ходит, и он же попадает в
 # список MCP-серверов при заведении учётки.
 export RESEARCH_MCP_URL="http://127.0.0.1:$RAG_PORT/mcp"
+export PROJECT_MCP_URL="http://127.0.0.1:$PROJECT_PORT/mcp"
 
 cleanup() {
+    [ -n "$PROJECTSERVER" ] && kill "$PROJECTSERVER" 2>/dev/null || true
     [ -n "$LANPROXY" ] && kill "$LANPROXY" 2>/dev/null || true
     [ -n "$RAGSERVER" ] && kill "$RAGSERVER" 2>/dev/null || true
     [ -n "$SERVER" ] && kill "$SERVER" 2>/dev/null || true
@@ -243,6 +252,41 @@ print(f"индекс: наборов {наборы[0]}, кусков {набор
 PYEOF
 fi
 
+if [ -n "$WITH_PROJECT" ]; then
+    # Сервер про git. Отдельным процессом по той же причине, что остальные
+    # свои серверы: инструменты у него свои, и падение одного не должно
+    # уносить приложение. Модель эмбеддингов он не держит — только git.
+    step "сервер проекта"
+    if curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$PROJECT_PORT/"; then
+        busy "$PROJECT_PORT" PROJECT_PORT
+    fi
+    "$VENV/bin/uvicorn" project_mcp:app --host 127.0.0.1 --port "$PROJECT_PORT" \
+        --log-level warning > "$DATA/project.log" 2>&1 &
+    PROJECTSERVER=$!
+    WAITED=0
+    until curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$PROJECT_PORT/mcp"; do
+        kill -0 "$PROJECTSERVER" 2>/dev/null \
+            || { sed 's/^/  /' "$DATA/project.log"; fail "сервер проекта не поднялся"; }
+        WAITED=$((WAITED + 1))
+        [ "$WAITED" -gt 30 ] && fail "сервер проекта не ответил за 30 с"
+        sleep 1
+    done
+    printf '  поднялся за %s с на порту %s\n' "$WAITED" "$PROJECT_PORT"
+    "$VENV/bin/python" - <<'PYEOF' | sed 's/^/  /'
+import asyncio, os
+import codebase, mcp_tools
+
+сервер = asyncio.run(mcp_tools.list_tools(os.environ["PROJECT_MCP_URL"]))
+print("инструменты:", ", ".join(t.name for t in сервер.tools))
+print(f"репозиторий: {codebase.ROOT}")
+if codebase.is_repo():
+    состояние = codebase.state()
+    print(f"ветка {состояние['branch']}, изменено файлов {состояние['changed']}")
+else:
+    print("НЕ РЕПОЗИТОРИЙ — инструменты скажут об этом словами, но пользы нет")
+PYEOF
+fi
+
 step "свободен ли порт $PORT"
 if curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$PORT/"; then
     busy "$PORT" PORT
@@ -375,9 +419,14 @@ if [ -n "$KEEP" ]; then
     if [ -n "$RAGSERVER" ]; then
         echo "  поиск:     http://127.0.0.1:$RAG_PORT/mcp (процесс $RAGSERVER)"
     fi
+    if [ -n "$PROJECTSERVER" ]; then
+        echo "  проект:    http://127.0.0.1:$PROJECT_PORT/mcp (процесс $PROJECTSERVER)"
+        echo "             включите его во вкладке «MCP», потом спрашивайте /help"
+    fi
     # Пробелы схлопываем: без --with-rag и без --lan переменные пусты, и в
     # строке, которую человек копирует, оставались бы дыры.
-    STOP=$(printf '%s %s %s' "$SERVER" "$RAGSERVER" "$LANPROXY" | tr -s ' ' | sed 's/ *$//')
+    STOP=$(printf '%s %s %s %s' "$SERVER" "$RAGSERVER" "$LANPROXY" \
+                 "$PROJECTSERVER" | tr -s ' ' | sed 's/ *$//')
     echo "  погасить:  kill $STOP"
     trap - EXIT INT TERM
 else

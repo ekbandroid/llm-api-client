@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 from starlette.middleware.sessions import SessionMiddleware
 
 import auth
+import commands
 import db
 import benchmark
 import files_store
@@ -1137,6 +1138,7 @@ async def _run_tool(call: dict, routes: dict, *, app_values: dict) -> dict:
 async def _exchange(
     conversation_id: int, user: dict, content: str | None, *,
     outcome: dict, simulated: dict | None = None,
+    command: "commands.Условия | None" = None,
 ) -> AsyncIterator[str]:
     """Один обмен: сохранить реплику, собрать запрос, стримить ответ, обслужить.
 
@@ -1227,6 +1229,13 @@ async def _exchange(
     # в «по решению модели»: в «выкл» искать нечем намеренно, в «всегда»
     # приложение уже нашло само, и второй поиск только сбивал бы.
     rag_mode = conversation.get("rag_mode") or db.RAG_AUTO
+    # Команда задаёт условия на один ход: режим поиска и ширину пула. Настройки
+    # самого диалога при этом не меняются — следующий вопрос без слеша пойдёт
+    # обычным путём.
+    rag_pool = 0
+    if command:
+        rag_mode = command.rag_mode or rag_mode
+        rag_pool = command.rag_pool
     rag_blocks: list[dict] = []
     # Выдержки, попавшие в этот ход, — по ним потом проверяются цитаты в
     # ответе. Копятся из обоих режимов: и когда ищет приложение, и когда
@@ -1247,10 +1256,18 @@ async def _exchange(
     # Заодно уходит и блок правил про инструменты: правила без инструментов —
     # это просто текст, за который платят разбором.
     снято = 0
-    if rag_mode == db.RAG_ALWAYS and tool_schemas and llm.is_local(llm.BASE_URL):
+    if command and command.tools_allowed:
+        # Щель в правиле ровно на ширину команды: она принесла список того, что
+        # ей нужно, и остальное снимается независимо от провайдера.
+        снято = len(tool_schemas)
+        tool_schemas = mcp_tools.only_tools(tool_schemas, tool_routes,
+                                            command.tools_allowed)
+        снято -= len(tool_schemas)
+    elif rag_mode == db.RAG_ALWAYS and tool_schemas and llm.is_local(llm.BASE_URL):
         снято, tool_schemas, tool_routes = len(tool_schemas), [], {}
     if rag_mode == db.RAG_ALWAYS and content:
-        rag_blocks, found = await _rag_context(conversation, content, excerpts)
+        rag_blocks, found = await _rag_context(conversation, content, excerpts,
+                                               pool=rag_pool)
         if found:
             described["rag"] = found
 
@@ -1269,7 +1286,9 @@ async def _exchange(
     plan = history.plan_request(
         _owned(conversation_id, user), system_prompt,
         memory_blocks=(memory.blocks(layers) + invariants_mod.blocks(project, rules)
-                       + task.blocks(conversation) + mcp_tools.blocks(tool_schemas)),
+                       + task.blocks(conversation) + mcp_tools.blocks(tool_schemas)
+                       + ([{"role": "system", "content": command.system}]
+                          if command and command.system else [])),
         memory_info=described,
     )
     # Выдержки ставим вплотную к вопросу, а не в начало запроса вместе со
@@ -1791,6 +1810,28 @@ def _sse_response(events: AsyncIterator[str]) -> StreamingResponse:
     )
 
 
+async def _canned(conversation_id: int, user: dict, asked: str,
+                  answer: str) -> AsyncIterator[str]:
+    """Готовый ответ без обращения к модели — потоком, как обычный ход.
+
+    Страница рисует ответ по событиям, а не по коду ответа, поэтому команда,
+    которой модель не нужна, всё равно отвечает потоком. Набор событий
+    минимальный: текст, итог хода и отметка о сохранении. Расход нулевой, и
+    это видно в строке под ответом — отличить такой ход от обычного можно, не
+    заглядывая в код.
+    """
+    db.add_message(conversation_id, "user", asked)
+    if _owned(conversation_id, user)["title"] == db.NEW_TITLE:
+        db.update_conversation(conversation_id, user["id"], title=asked)
+    saved = db.add_message(
+        conversation_id, "assistant", answer,
+        meta=json.dumps({"command": True}, ensure_ascii=False))
+    yield sse({"type": "content", "text": answer})
+    yield sse({"type": "done", "finish_reason": "stop", "usage": {}, "elapsed": 0.0})
+    yield sse({"type": "saved", "message_id": saved["id"],
+               "title": _owned(conversation_id, user)["title"]})
+
+
 @app.post("/api/conversations/{conversation_id}/messages")
 async def conversation_send(
     conversation_id: int, payload: NewMessage, request: Request,
@@ -1808,12 +1849,32 @@ async def conversation_send(
     if not content:
         raise HTTPException(400, "Пустое сообщение")
 
+    # Команда со слеша меняет условия этого хода: что подключено, в каком
+    # режиме идёт поиск, какие инструменты лежат в запросе. Разбор здесь, до
+    # замка и до _exchange, потому что ответ на «/help» без вопроса готов
+    # сразу и обращаться к модели незачем.
+    приказ = commands.parse(content)
+    пропали: list[str] = []
+    if приказ and приказ.attach_titles:
+        пропали = commands.attach_collections(
+            conversation_id, user["id"], приказ.attach_titles)
+    if приказ and приказ.answer:
+        return _sse_response(_canned(conversation_id, user, content, приказ.answer))
+    if приказ and пропали:
+        беда = ("Наборы проекта не собраны: " + ", ".join(пропали)
+                + ". Соберите их командой `python manage.py index-project "
+                + f"{user['login']}` — и спросите снова.")
+        return _sse_response(_canned(conversation_id, user, content, беда))
+
     async def events() -> AsyncIterator[str]:
         # Замок держится весь обмен: пока человек разговаривает, исполнитель
         # заданий в этот диалог не пишет.
         async with _chat_lock(conversation_id):
             outcome: dict = {}
-            async for chunk in _exchange(conversation_id, user, content, outcome=outcome):
+            async for chunk in _exchange(
+                    conversation_id, user,
+                    приказ.question if приказ else content,
+                    outcome=outcome, command=приказ):
                 yield chunk
             # На паузе ни автопилот, ни самостоятельные ходы не стартуют: пауза —
             # тормоз человека над автоматом.
@@ -1969,7 +2030,8 @@ def _rag_values(conversation: dict) -> dict:
 
 
 async def _rag_context(conversation: dict, question: str,
-                       excerpts: list[dict]) -> tuple[list[dict], dict]:
+                       excerpts: list[dict], *,
+                       pool: int = 0) -> tuple[list[dict], dict]:
     """Ищет по подключённым документам и готовит блок для запроса.
 
     Это и есть прямой конвейер: вопрос — поиск — склейка — модель, без участия
@@ -1984,6 +2046,10 @@ async def _rag_context(conversation: dict, question: str,
         return [], {}
 
     настройки = _rag_values(conversation)
+    # Пул от команды сильнее настройки диалога: /help спрашивает о коде, а для
+    # кода узкий пул измеримо лучше широкого — обоснование в commands.HELP_POOL.
+    if pool:
+        настройки["rag_pool"] = pool
     настройки["context"] = await asyncio.to_thread(_recent, conversation_id)
     try:
         found = await mcp_tools.call_tool(

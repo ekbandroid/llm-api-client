@@ -291,7 +291,9 @@
   </div>
   <div id="log"><div class="empty">Создайте диалог или напишите сообщение — диалог заведётся сам.</div></div>
   <form id="form" class="composer">
-    <textarea id="prompt" placeholder="Ваш вопрос…  (Enter — отправить, Shift+Enter — перенос строки)"></textarea>
+    <!-- Про /help сказано в подсказке поля, а не в отдельной справке: команду,
+         о которой негде прочитать, никто не наберёт. -->
+    <textarea id="prompt" placeholder="Ваш вопрос…  (Enter — отправить, Shift+Enter — перенос строки, /help — о проекте)"></textarea>
     <button id="send" type="submit">Отправить</button>
   </form>
 </main>

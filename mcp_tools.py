@@ -399,6 +399,20 @@ def without_tool(
             if routes.get(s["function"]["name"], (None, ""))[1] != tool]
 
 
+def only_tools(
+    schemas: list[dict], routes: dict[str, tuple[dict, str]], allowed: tuple[str, ...]
+) -> list[dict]:
+    """Оставляет только названные инструменты — по имени на сервере.
+
+    Обратная сторона without_tool и нужна командам чата: команда приносит не
+    «включить всё», а список того, что ей нужно. Иначе ход по команде либо
+    тащил бы в запрос все схемы пользователя, либо попадал под правило,
+    снимающее их целиком на местной модели.
+    """
+    return [s for s in schemas
+            if routes.get(s["function"]["name"], (None, ""))[1] in allowed]
+
+
 def blocks(schemas: list[dict]) -> list[dict]:
     """System-сообщение с правилами — только если инструменты и правда есть.
 
