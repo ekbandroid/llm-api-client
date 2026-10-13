@@ -15,9 +15,26 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-API_KEY = os.getenv("LLM_API_KEY")
-BASE_URL = os.getenv("LLM_BASE_URL", "https://api.deepseek.com")
-MODEL = os.getenv("LLM_MODEL", "deepseek-flash")
+# Какой набор переменных взять. Пусто — LLM_*, как было всегда; «cloud» —
+# CLOUD_*, тот же набор, которым пользуется rag_compare.py.
+#
+# Зачем отдельный набор, а не правка LLM_*: переключение между своей моделью и
+# облачной должно быть обратимым одной буквой в команде запуска, не переписывая
+# .env и не забыв вернуть его назад.
+#
+# Зачем выбирает llm.py, а не скрипт запуска: .env разбирает python-dotenv, и
+# шеллу он не виден вовсе. Скрипт мог бы спросить значения у Python и
+# экспортировать их, но тогда ключ прошёл бы через переменные шелла по пути к
+# процессу — незачем. Скрипт экспортирует только отметку о выборе, а секрет
+# читает тот, кому он нужен.
+PROVIDER = os.getenv("LLM_PROVIDER", "").strip().lower()
+_CLOUD = PROVIDER in ("cloud", "облако")
+
+API_KEY = os.getenv("CLOUD_API_KEY") if _CLOUD else os.getenv("LLM_API_KEY")
+BASE_URL = (os.getenv("CLOUD_BASE_URL", "https://api.deepseek.com") if _CLOUD
+            else os.getenv("LLM_BASE_URL", "https://api.deepseek.com"))
+MODEL = (os.getenv("CLOUD_MODEL", "deepseek-flash") if _CLOUD
+         else os.getenv("LLM_MODEL", "deepseek-flash"))
 
 # Адреса, по которым модель считается запущенной на этой же машине.
 LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1", "0.0.0.0", "[::1]")
@@ -353,13 +370,25 @@ def assemble_stream(
 
 def headers() -> dict:
     """Заголовок авторизации — или ничего, если сервер его не ждёт."""
+    # Имя переменной называем то, которое и правда читается: при
+    # LLM_PROVIDER=cloud ключ берётся из CLOUD_API_KEY, и совет вписать его в
+    # LLM_API_KEY увёл бы человека не туда.
+    имя = "CLOUD_API_KEY" if _CLOUD else "LLM_API_KEY"
     if API_KEY:
+        # Заголовки HTTP — latin-1, и ключ с кириллицей или «умной» кавычкой
+        # роняет запрос UnicodeEncodeError'ом из глубины httpx, где про ключ не
+        # сказано ни слова. Настоящий ключ весь в ASCII; если это не так, он
+        # скопирован с лишним символом, и сказать об этом надо здесь.
+        if not API_KEY.isascii():
+            raise LLMError(
+                f"В {имя} есть символы вне ASCII — такой ключ не отправить "
+                f"заголовком. Похоже, он скопирован с лишним символом.")
         return {"Authorization": f"Bearer {API_KEY}"}
     if is_local(BASE_URL):
         # Локальный сервер ключа не ждёт. Присылать «Bearer None» ему можно,
         # но это ложь в заголовке: лучше не присылать ничего.
         return {}
-    raise LLMError("Не задан LLM_API_KEY. Скопируйте .env.example в .env и впишите ключ.")
+    raise LLMError(f"Не задан {имя}. Скопируйте .env.example в .env и впишите ключ.")
 
 
 def complete(
