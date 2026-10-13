@@ -96,7 +96,16 @@ MAX_CHUNK_CHARS = 2400
 MIN_CHUNK_CHARS = 200
 
 # Что индексируем. Каталоги с чужим кодом и данными не трогаем вовсе.
-INCLUDE = ("README.md", "*.py", "static/*.js", "deploy/*.service")
+# Что берём в корпус проекта. Скрипты входят намеренно: run-local.sh — это
+# четыре сотни строк логики запуска и проверок, а deploy.sh — вся выкатка, и
+# ассистенту, который должен понимать проект, без них видна только половина.
+#
+# Оговорка про шаблоны: read_corpus применяет их через Path.glob (от корня, «*»
+# не переходит в подкаталоги), а codebase.tracked_files — через Path.match (от
+# конца пути, переходит). Разница сегодня ни на чём не видна, но знать о ней
+# стоит: второй способ включает `*.py` на любой глубине, и для ассистента это
+# скорее желаемое.
+INCLUDE = ("README.md", "*.py", "*.sh", "static/*.js", "deploy/*.service")
 EXCLUDE_NAMES = {".env", ".env.example", "DEPLOY.local.md"}
 EXCLUDE_DIRS = {".venv", ".git", "files", "__pycache__", ".claude"}
 
@@ -714,6 +723,21 @@ def set_status(collection_id: int, status: str, error: str = "") -> None:
                      (status, error[:500], collection_id))
 
 
+def set_shape(collection_id: int, *, strategy: str) -> None:
+    """Меняет стратегию нарезки готового набора.
+
+    Нужно пересборке: набор по коду проекта живёт долго, а какая нарезка для
+    него лучше — вопрос замера, и менять ответ не должно означать «удали и
+    завези заново», потеряв подключения к диалогам. Куски после этого
+    обязательно пересобрать: сами они не меняются от записи в настройке.
+    """
+    if strategy not in STRATEGIES:
+        raise ValueError(f"неизвестная стратегия: {strategy}")
+    with connect() as conn:
+        conn.execute("UPDATE collections SET strategy = ? WHERE id = ?",
+                     (strategy, collection_id))
+
+
 def attach(chat_id: int, collection_id: int, enabled: bool) -> None:
     with connect() as conn:
         if enabled:
@@ -814,6 +838,16 @@ def index_collection(collection_id: int) -> dict:
             piece.ordinal = number
 
         with connect() as conn:
+            # Куски прошлого прогона убираем вместе с их строками в поиске
+            # словами. chunks_fts — отдельная таблица, каскада между ними нет,
+            # и без этой чистки пересборка набора оставила бы в словесном
+            # поиске полный дубль: сами куски заменились бы по chunk_id, а
+            # строки fts легли бы рядом со старыми. Пока набор индексировали
+            # ровно один раз, это не всплывало; с пересборкой — всплывёт.
+            ids = [r[0] for r in conn.execute(
+                "SELECT chunk_id FROM chunks WHERE collection_id = ?", (collection_id,))]
+            conn.executemany("DELETE FROM chunks_fts WHERE chunk_id = ?",
+                             [(i,) for i in ids])
             conn.execute("DELETE FROM chunks WHERE collection_id = ?", (collection_id,))
 
         vectors = embed([c.text for c in pieces], collection["model"]) if pieces \

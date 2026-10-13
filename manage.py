@@ -4,6 +4,7 @@
     python manage.py set-password <логин>
     python manage.py approve <логин>
     python manage.py list
+    python manage.py index-project <логин>
 """
 
 import getpass
@@ -60,11 +61,43 @@ def list_users() -> None:
         print(f"{u['id']:>3}  {u['login']:<20} {u['status']:<12} {'да' if u['is_admin'] else 'нет':<6} {way}")
 
 
+def index_project(login: str) -> None:
+    """Собирает два набора по файлам репозитория: документация и код.
+
+    Синхронно, в отличие от загрузки через интерфейс: там индексация уходит в
+    фон, чтобы страница не ждала, а здесь человек стоит перед командной
+    строкой и ему нужен отчёт, а не «начато».
+
+    Индекс — снимок. После заметных правок команду надо повторить; она
+    пересобирает те же наборы на месте, подключения к диалогам не теряются.
+    """
+    import codebase
+
+    user = db.get_by_login(login)
+    if user is None:
+        sys.exit(f"Пользователь {login} не найден.")
+    try:
+        отчёт = codebase.build_collections(user["id"])
+    except codebase.GitError as err:
+        sys.exit(f"Не вышло: {err}")
+
+    print(f"Репозиторий: {отчёт['root']}")
+    for набор in отчёт["collections"]:
+        пропуски = f", пропущено {len(набор['skipped'])}" if набор["skipped"] else ""
+        print(f"  {набор['title']:<22} id {набор['id']:<3} {набор['strategy']:<10} "
+              f"файлов {набор['files']:<3} кусков {набор['chunks']:<5} "
+              f"{набор['seconds']} с{пропуски}")
+        for причина in набор["skipped"][:3]:
+            print(f"      пропущен {причина}")
+    print("Подключить к диалогу — во вкладке «Документы», или командой /help.")
+
+
 COMMANDS = {
     "create-admin": (create_admin, True),
     "set-password": (set_password, True),
     "approve": (approve, True),
     "list": (list_users, False),
+    "index-project": (index_project, True),
 }
 
 
