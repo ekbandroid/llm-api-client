@@ -1992,7 +1992,11 @@ function memoryLine(mem) {
   if (!mem || (!mem.profile && !mem.project && !mem.task && !mem.invariants && !mem.mcp
                && !mem.rag)) return null;
   const parts = [];
-  if (mem.mcp && mem.mcp.dropped) {
+  if (mem.mcp && mem.mcp.missing) {
+    // Не «инструментов нет», а «нужные не доехали»: разница в том, что делать.
+    parts.push(`инструменты команды недоступны (${mem.mcp.missing.join(", ")}): ` +
+               "их сервер выключен или не отвечает — включите его во вкладке «MCP»");
+  } else if (mem.mcp && mem.mcp.dropped) {
     // Снятые инструменты называем прямо. Иначе через неделю не вспомнить,
     // почему в этом диалоге не работает погода.
     parts.push(`инструменты MCP сняты (${mem.mcp.dropped} с ${mem.mcp.servers} ` +

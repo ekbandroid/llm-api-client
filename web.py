@@ -1256,6 +1256,7 @@ async def _exchange(
     # Заодно уходит и блок правил про инструменты: правила без инструментов —
     # это просто текст, за который платят разбором.
     снято = 0
+    нет_инструментов = ()
     if command and command.tools_allowed:
         # Щель в правиле ровно на ширину команды: она принесла список того, что
         # ей нужно, и остальное снимается независимо от провайдера.
@@ -1263,6 +1264,18 @@ async def _exchange(
         tool_schemas = mcp_tools.only_tools(tool_schemas, tool_routes,
                                             command.tools_allowed)
         снято -= len(tool_schemas)
+        if not tool_schemas:
+            # Команде нужны инструменты, а в запрос не попало ни одного: сервер
+            # выключен во вкладке «MCP» или не отвечает.
+            #
+            # Молчать об этом нельзя, и это та же беда, для которой в дне 28
+            # появился блок про неудавшийся поиск. Без него модель отвечает
+            # тем, что есть под рукой, — а под рукой выдержки, и среди них
+            # вполне может оказаться исходный код самих инструментов. Тогда на
+            # вопрос «какая сейчас ветка» приходит пересказ project_mcp.py с
+            # цитатой из докстринга git_branch: ответ уверенный, похожий на
+            # дело и ни о чём. Проверено живым разговором.
+            нет_инструментов = command.tools_allowed
     elif rag_mode == db.RAG_ALWAYS and tool_schemas and llm.is_local(llm.BASE_URL):
         снято, tool_schemas, tool_routes = len(tool_schemas), [], {}
     if rag_mode == db.RAG_ALWAYS and content:
@@ -1278,6 +1291,9 @@ async def _exchange(
             "tokens": tokens_mod.estimate_tokens(
                 json.dumps(tool_schemas, ensure_ascii=False)),
         }
+    elif нет_инструментов:
+        described["mcp"] = {"servers": len(servers), "tools": 0, "tokens": 0,
+                            "missing": list(нет_инструментов)}
     elif снято:
         # Молча снимать нельзя: иначе потом не вспомнить, почему погода в этом
         # диалоге не работает. Причина и способ вернуть — в строке под ответом.
@@ -1288,7 +1304,10 @@ async def _exchange(
         memory_blocks=(memory.blocks(layers) + invariants_mod.blocks(project, rules)
                        + task.blocks(conversation) + mcp_tools.blocks(tool_schemas)
                        + ([{"role": "system", "content": command.system}]
-                          if command and command.system else [])),
+                          if command and command.system else [])
+                       + ([{"role": "system", "content": commands.NO_TOOLS.format(
+                               tools=", ".join(нет_инструментов))}]
+                          if нет_инструментов else [])),
         memory_info=described,
     )
     # Выдержки ставим вплотную к вопросу, а не в начало запроса вместе со
