@@ -38,7 +38,7 @@ DOCS_SUFFIXES = {".md", ".rst", ".txt"}
 # Подкоманды git, которые нам разрешены. Список, а не «любой git, который
 # попросят»: инструментом распоряжается модель, и `git push --force` в нём
 # быть не должно даже теоретически.
-ALLOWED = ("rev-parse", "status", "diff", "log", "ls-files", "rev-list")
+ALLOWED = ("rev-parse", "status", "diff", "log", "ls-files", "rev-list", "show")
 
 # Сколько ждём git. Секунды хватает всему, кроме diff на огромном дереве.
 TIMEOUT = 20
