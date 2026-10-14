@@ -35,28 +35,33 @@ jobs:
       # Ключа нет — не падаем, а громко предупреждаем и выходим. Падение здесь
       # означало бы красный крест на каждом PR из чужой копии репозитория:
       # таким PR секреты не выдаются по устройству GitHub, и это не их вина.
+      # Идентификаторы здесь только латиницей: id шага и имена выходов
+      # GitHub разбирает как имена, а не как текст, и кириллица в них
+      # ломает весь файл — в списке заданий вместо имени появляется путь
+      # к нему, и каждый прогон падает. Русский остаётся в name и в
+      # сообщениях. Та же ловушка, что с именами переменных в sh.
       - name: Проверить ключ
-        id: ключ
+        id: key
         env:
           CLOUD_API_KEY: ${{ secrets.CLOUD_API_KEY }}
         run: |
           if [ -z "$CLOUD_API_KEY" ]; then
             echo "::warning::Секрет CLOUD_API_KEY не задан — ревью пропущено. Добавьте его в настройках репозитория."
             echo "Ревью пропущено: секрет \`CLOUD_API_KEY\` не задан." >> "$GITHUB_STEP_SUMMARY"
-            echo "есть=нет" >> "$GITHUB_OUTPUT"
+            echo "present=no" >> "$GITHUB_OUTPUT"
           else
-            echo "есть=да" >> "$GITHUB_OUTPUT"
+            echo "present=yes" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Поставить зависимости
-        if: steps.ключ.outputs.есть == 'да'
+        if: steps.key.outputs.present == 'yes'
         run: pip install -r requirements.txt
 
       # Модель эмбеддингов качается из HuggingFace: в репозиторий она не
       # положена (357 МБ, models/ в .gitignore). Кэш по имени модели, а не по
       # requirements.txt: меняется она отдельно от зависимостей.
       - name: Кэш модели эмбеддингов
-        if: steps.ключ.outputs.есть == 'да'
+        if: steps.key.outputs.present == 'yes'
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface
@@ -67,7 +72,7 @@ jobs:
       # Пользователь с номером 1 — условность: наборы живут в rag.db и о
       # переписке ничего не знают, app.db для этого не нужна.
       - name: Собрать индекс проекта
-        if: steps.ключ.outputs.есть == 'да'
+        if: steps.key.outputs.present == 'yes'
         env:
           RAG_DB_PATH: ${{ github.workspace }}/rag.db
           RAG_SOURCES_DIR: ${{ github.workspace }}/rag-sources
@@ -80,7 +85,7 @@ jobs:
           "
 
       - name: Ревью
-        if: steps.ключ.outputs.есть == 'да'
+        if: steps.key.outputs.present == 'yes'
         env:
           LLM_PROVIDER: cloud
           CLOUD_API_KEY: ${{ secrets.CLOUD_API_KEY }}
@@ -94,14 +99,14 @@ jobs:
           fi
 
       - name: В сводку сборки
-        if: steps.ключ.outputs.есть == 'да'
+        if: steps.key.outputs.present == 'yes'
         run: cat review.md >> "$GITHUB_STEP_SUMMARY"
 
       # Комментарий обновляется, а не плодится: ищем свой прежний по скрытой
       # метке в теле. Иначе каждый push в ветку добавлял бы ещё один, и к
       # пятому обсуждение читать было бы нечем.
       - name: Комментарий в PR
-        if: steps.ключ.outputs.есть == 'да' && github.event_name == 'pull_request'
+        if: steps.key.outputs.present == 'yes' && github.event_name == 'pull_request'
         uses: actions/github-script@v7
         with:
           script: |
