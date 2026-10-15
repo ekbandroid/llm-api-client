@@ -356,16 +356,22 @@ if [ -n "$WITH_SUPPORT" ]; then
     done
     printf '  поднялся за %s с на порту %s\n' "$WAITED" "$SUPPORT_PORT"
     "$VENV/bin/python" - <<'PYEOF' | sed 's/^/  /'
-import asyncio, os
-import mcp_tools, support_mcp
+import asyncio, json, os
+from pathlib import Path
+
+import mcp_tools
 
 сервер = asyncio.run(mcp_tools.list_tools(os.environ["SUPPORT_MCP_URL"]))
 print("инструменты:", ", ".join(t.name for t in сервер.tools))
+# Файл читаем сами, а не через support_mcp: импорт сервера поднимает его
+# журналирование, и в отчёт лезут строки «HTTP Request», которых у соседних
+# шагов нет. Проверка должна быть тихой.
+путь = Path(os.getenv("SUPPORT_DATA") or "support/tickets.json")
 try:
-    данные = support_mcp._прочитать()
+    данные = json.loads(путь.read_text(encoding="utf-8"))
     print(f"очередь: {len(данные.get('tickets', []))} тикетов, "
-          f"{len(данные.get('users', []))} пользователей ({support_mcp.ДАННЫЕ})")
-except LookupError as err:
+          f"{len(данные.get('users', []))} пользователей ({путь})")
+except (OSError, json.JSONDecodeError) as err:
     print(f"ОЧЕРЕДЬ НЕ ЧИТАЕТСЯ: {err}")
 PYEOF
 fi
