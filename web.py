@@ -1305,7 +1305,9 @@ async def _exchange(
                        + task.blocks(conversation) + mcp_tools.blocks(tool_schemas)
                        + ([{"role": "system", "content": command.system}]
                           if command and command.system else [])
-                       + ([{"role": "system", "content": commands.NO_TOOLS.format(
+                       + ([{"role": "system", "content": (
+                               commands.NO_TOOLS_NOT_FOUND if снято
+                               else commands.NO_TOOLS_SERVER_OFF).format(
                                tools=", ".join(нет_инструментов))}]
                           if нет_инструментов else [])),
         memory_info=described,
