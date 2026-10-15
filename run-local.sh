@@ -5,6 +5,7 @@
 #     ./run-local.sh --keep            # оставить работать для ручных опытов
 #     ./run-local.sh --with-rag        # и сервер поиска по документам
 #     ./run-local.sh --with-project    # и сервер про git проекта (и поиск)
+#     ./run-local.sh --with-support    # и очередь поддержки (и поиск)
 #     ./run-local.sh --cloud           # не своя модель, а облачная по ключу
 #     ./run-local.sh --keep --lan      # и открыть его устройствам в этом Wi-Fi
 #     LAN_PORT=9100 ./run-local.sh --lan   # другой порт для сети
@@ -23,10 +24,12 @@ set -eu
 PORT=${PORT:-8765}
 RAG_PORT=${RAG_PORT:-8763}
 PROJECT_PORT=${PROJECT_PORT:-8764}
+SUPPORT_PORT=${SUPPORT_PORT:-8767}
 VENV=.venv
 KEEP=
 WITH_RAG=
 WITH_PROJECT=
+WITH_SUPPORT=
 CLOUD=
 
 # Приложение всегда слушает только петлю. Устройствам в сети его отдаёт
@@ -42,6 +45,9 @@ for arg in "$@"; do
         # Сервер проекта без поиска бесполезен: /help достаёт выдержки через
         # research-сервер, и без него ассистент знает только про git.
         --with-project) WITH_PROJECT=1; WITH_RAG=1 ;;
+        # Поддержке тоже нужен поиск: без выдержек из вопросов-ответов
+        # ассистент знает только то, что написано в тикете.
+        --with-support) WITH_SUPPORT=1; WITH_RAG=1 ;;
         --cloud) CLOUD=1 ;;
         --lan) LAN=1 ;;
         *) echo "Неизвестный ключ: $arg" >&2; exit 1 ;;
@@ -80,6 +86,7 @@ SERVER=
 RAGSERVER=
 LANPROXY=
 PROJECTSERVER=
+SUPPORTSERVER=
 
 # Переписка — во временную базу, а индекс документов — настоящий. Разводим
 # намеренно: проверять поиск по пустому индексу бессмысленно, а писать
@@ -101,8 +108,10 @@ if [ -n "$CLOUD" ]; then
     export LLM_PROVIDER=cloud
 fi
 export PROJECT_MCP_URL="http://127.0.0.1:$PROJECT_PORT/mcp"
+export SUPPORT_MCP_URL="http://127.0.0.1:$SUPPORT_PORT/mcp"
 
 cleanup() {
+    [ -n "$SUPPORTSERVER" ] && kill "$SUPPORTSERVER" 2>/dev/null || true
     [ -n "$PROJECTSERVER" ] && kill "$PROJECTSERVER" 2>/dev/null || true
     [ -n "$LANPROXY" ] && kill "$LANPROXY" 2>/dev/null || true
     [ -n "$RAGSERVER" ] && kill "$RAGSERVER" 2>/dev/null || true
@@ -326,6 +335,41 @@ else:
 PYEOF
 fi
 
+if [ -n "$WITH_SUPPORT" ]; then
+    # Очередь поддержки. Отдельный процесс по той же причине, что остальные
+    # свои серверы: инструменты у него свои, и падение одного не должно
+    # уносить приложение. Модель эмбеддингов он не держит — только json.
+    step "сервер поддержки"
+    if curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$SUPPORT_PORT/"; then
+        busy "$SUPPORT_PORT" SUPPORT_PORT
+    fi
+    "$VENV/bin/uvicorn" support_mcp:app --host 127.0.0.1 --port "$SUPPORT_PORT" \
+        --log-level warning > "$DATA/support.log" 2>&1 &
+    SUPPORTSERVER=$!
+    WAITED=0
+    until curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$SUPPORT_PORT/mcp"; do
+        kill -0 "$SUPPORTSERVER" 2>/dev/null \
+            || { sed 's/^/  /' "$DATA/support.log"; fail "сервер поддержки не поднялся"; }
+        WAITED=$((WAITED + 1))
+        [ "$WAITED" -gt 30 ] && fail "сервер поддержки не ответил за 30 с"
+        sleep 1
+    done
+    printf '  поднялся за %s с на порту %s\n' "$WAITED" "$SUPPORT_PORT"
+    "$VENV/bin/python" - <<'PYEOF' | sed 's/^/  /'
+import asyncio, os
+import mcp_tools, support_mcp
+
+сервер = asyncio.run(mcp_tools.list_tools(os.environ["SUPPORT_MCP_URL"]))
+print("инструменты:", ", ".join(t.name for t in сервер.tools))
+try:
+    данные = support_mcp._прочитать()
+    print(f"очередь: {len(данные.get('tickets', []))} тикетов, "
+          f"{len(данные.get('users', []))} пользователей ({support_mcp.ДАННЫЕ})")
+except LookupError as err:
+    print(f"ОЧЕРЕДЬ НЕ ЧИТАЕТСЯ: {err}")
+PYEOF
+fi
+
 step "свободен ли порт $PORT"
 if curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$PORT/"; then
     busy "$PORT" PORT
@@ -462,10 +506,14 @@ if [ -n "$KEEP" ]; then
         echo "  проект:    http://127.0.0.1:$PROJECT_PORT/mcp (процесс $PROJECTSERVER)"
         echo "             включите его во вкладке «MCP», потом спрашивайте /help"
     fi
+    if [ -n "$SUPPORTSERVER" ]; then
+        echo "  поддержка: http://127.0.0.1:$SUPPORT_PORT/mcp (процесс $SUPPORTSERVER)"
+        echo "             включите его во вкладке «MCP», потом /support <номер> <вопрос>"
+    fi
     # Пробелы схлопываем: без --with-rag и без --lan переменные пусты, и в
     # строке, которую человек копирует, оставались бы дыры.
-    STOP=$(printf '%s %s %s %s' "$SERVER" "$RAGSERVER" "$LANPROXY" \
-                 "$PROJECTSERVER" | tr -s ' ' | sed 's/ *$//')
+    STOP=$(printf '%s %s %s %s %s' "$SERVER" "$RAGSERVER" "$LANPROXY" \
+                 "$PROJECTSERVER" "$SUPPORTSERVER" | tr -s ' ' | sed 's/ *$//')
     echo "  погасить:  kill $STOP"
     trap - EXIT INT TERM
 else

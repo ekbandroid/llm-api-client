@@ -1990,7 +1990,7 @@ function serviceNote(info, { undo = false } = {}) {
 /** Строка о том, сколько памяти ушло в этот запрос. */
 function memoryLine(mem) {
   if (!mem || (!mem.profile && !mem.project && !mem.task && !mem.invariants && !mem.mcp
-               && !mem.rag)) return null;
+               && !mem.rag && !mem.ticket)) return null;
   const parts = [];
   if (mem.mcp && mem.mcp.missing) {
     // Не «инструментов нет», а «нужные не доехали»: разница в том, что делать.
@@ -2004,6 +2004,12 @@ function memoryLine(mem) {
                "вместо выдержек — вернуть их можно режимом «по решению модели»");
   } else if (mem.mcp) {
     parts.push(`инструменты MCP: ${mem.mcp.tools} с ${mem.mcp.servers} серверов ~${mem.mcp.tokens} токенов`);
+  }
+  if (mem.ticket) {
+    // Видно, что ответ опирался на обращение, а не на общие соображения.
+    parts.push(mem.ticket.error
+      ? `тикет #${mem.ticket.number}: не получен (${mem.ticket.error})`
+      : `тикет #${mem.ticket.number} ~${mem.ticket.tokens} токенов`);
   }
   if (mem.rag) {
     parts.push(mem.rag.error

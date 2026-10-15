@@ -886,8 +886,11 @@ RESEARCH_MCP_URL = os.getenv("RESEARCH_MCP_URL", "http://127.0.0.1:8003/mcp")
 # Сервер проекта — только на машине разработчика: он говорит про git, а на
 # сервере приложения истории нет вовсе, код кладётся git archive'ом.
 PROJECT_MCP_URL = os.getenv("PROJECT_MCP_URL", "http://127.0.0.1:8004/mcp")
+# Очередь поддержки. Приложение ходит к нему и напрямую — подставить тикет в
+# запрос, — и через список инструментов, когда модели нужны доборы.
+SUPPORT_MCP_URL = os.getenv("SUPPORT_MCP_URL", "http://127.0.0.1:8005/mcp")
 OWN_MCP_URLS = (WEATHER_MCP_URL, SCHEDULER_MCP_URL, RESEARCH_MCP_URL,
-                PROJECT_MCP_URL)
+                PROJECT_MCP_URL, SUPPORT_MCP_URL)
 
 # Готовые серверы — все проверены живым запросом: отвечают без ключа и
 # регистрации. Включены те, что знают меняющиеся данные: курсы и погоду.
@@ -896,7 +899,7 @@ OWN_MCP_URLS = (WEATHER_MCP_URL, SCHEDULER_MCP_URL, RESEARCH_MCP_URL,
 # since — версия, в которой сервер появился в списке. Колонка users.mcp_seeded
 # хранит не «да/нет», а номер версии: иначе добавить пресет тем, кто уже вошёл,
 # было бы нечем — сброс флага вернул бы им и удалённые заготовки.
-MCP_PRESETS_VERSION = 5
+MCP_PRESETS_VERSION = 6
 
 MCP_PRESETS = (
     {"title": "Курсы валют", "since": 1,
@@ -915,6 +918,9 @@ MCP_PRESETS = (
     # репозиторий, а у остальных отвечал бы «репозитория не вижу».
     {"title": "Проект: git и состояние репозитория", "since": 5,
      "url": PROJECT_MCP_URL, "enabled": 0},
+    # Тоже выключен: очередь поддержки нужна тому, кто её ведёт.
+    {"title": "Поддержка: тикеты и пользователи", "since": 6,
+     "url": SUPPORT_MCP_URL, "enabled": 0},
     {"title": "Поиск, пересказ и файлы", "since": 4,
      "url": RESEARCH_MCP_URL, "enabled": 1},
 )
