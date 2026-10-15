@@ -368,6 +368,25 @@ def assemble_stream(
     }
 
 
+def _api_message(status: int, detail: str, model: str) -> str:
+    """Текст ошибки API — и объяснение, если причина известна наперёд.
+
+    404 на имя модели почти всегда означает одно: диалог помнит модель, с
+    которой его завели, а провайдера с тех пор переключили. Имя модели значит
+    что-то только у того, кто её отдаёт; у соседнего провайдера такого имени
+    нет. Сам по себе ответ «model not found» этого не говорит, и человек идёт
+    искать беду в ключе или в сети.
+    """
+    общий = f"Ошибка API {status}: {detail[:300]}"
+    if status == 404 and model and model in detail:
+        return (f"{общий}\n\nУ провайдера {BASE_URL} модели «{model}» нет. "
+                f"Так бывает, когда диалог помнит модель, с которой его "
+                f"завели, а провайдера с тех пор переключили: выберите модель "
+                f"во вкладке «Модель» или запустите приложение с тем "
+                f"провайдером, у которого она есть.")
+    return общий
+
+
 def headers() -> dict:
     """Заголовок авторизации — или ничего, если сервер его не ждёт."""
     # Имя переменной называем то, которое и правда читается: при
@@ -411,7 +430,8 @@ def complete(
         response.raise_for_status()
     except requests.HTTPError as err:
         raise LLMError(
-            f"Ошибка API {err.response.status_code}: {err.response.text[:300]}",
+            _api_message(err.response.status_code, err.response.text,
+                         payload.get("model", "")),
             status=err.response.status_code,
             body=_parse_body(err.response.text),
         ) from err
@@ -482,7 +502,8 @@ async def stream(
                 if response.status_code != 200:
                     detail = (await response.aread()).decode("utf-8", "replace")
                     raise LLMError(
-                        f"Ошибка API {response.status_code}: {detail[:300]}",
+                        _api_message(response.status_code, detail,
+                                     payload.get("model", "")),
                         status=response.status_code,
                         body=_parse_body(detail),
                     )
