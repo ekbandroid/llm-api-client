@@ -31,6 +31,12 @@ ROOT = Path(os.getenv("PROJECT_ROOT") or Path(__file__).resolve().parent).resolv
 # поэтому менять их нельзя без переиндексации.
 DOCS_TITLE = "Документация проекта"
 CODE_TITLE = "Код проекта"
+# Вопросы и ответы поддержки — отдельным набором, а не внутри документации.
+# Причина из дня 31: на ранжирование разделение не влияет, но в заголовке
+# выдержки видно, откуда пришёл ответ — из коротких вопросов-ответов или из
+# README на двести килобайт. Поддержке это важнее, чем разработчику.
+SUPPORT_TITLE = "Поддержка: вопросы и ответы"
+SUPPORT_GLOB = "support/*.md"
 
 # Что считаем документацией. Остальное из отобранного — код.
 DOCS_SUFFIXES = {".md", ".rst", ".txt"}
@@ -122,11 +128,13 @@ def tracked_files() -> list[str]:
     return sorted(отобранные)
 
 
-def split_files(paths: list[str]) -> tuple[list[str], list[str]]:
-    """Делит отобранное на документацию и код."""
-    docs = [p for p in paths if Path(p).suffix.lower() in DOCS_SUFFIXES]
-    code = [p for p in paths if p not in set(docs)]
-    return docs, code
+def split_files(paths: list[str]) -> dict[str, list[str]]:
+    """Раскладывает отобранное по наборам: поддержка, документация, код."""
+    поддержка = [p for p in paths if Path(p).match(SUPPORT_GLOB)]
+    осталось = [p for p in paths if p not in set(поддержка)]
+    docs = [p for p in осталось if Path(p).suffix.lower() in DOCS_SUFFIXES]
+    code = [p for p in осталось if p not in set(docs)]
+    return {DOCS_TITLE: docs, CODE_TITLE: code, SUPPORT_TITLE: поддержка}
 
 
 def flat_name(path: str) -> str:
@@ -153,14 +161,18 @@ def build_collections(user_id: int, *, model: str | None = None,
     if not is_repo():
         raise GitError(f"{ROOT} — не git-репозиторий, брать список файлов негде")
 
-    docs, code = split_files(tracked_files())
-    if not docs and not code:
+    по_наборам = split_files(tracked_files())
+    if not any(по_наборам.values()):
         raise GitError("под правила rag.INCLUDE не подошёл ни один файл репозитория")
 
     отчёт = {"root": str(ROOT), "collections": []}
-    for title, пути, стратегия in (
-            (DOCS_TITLE, docs, docs_strategy or rag.TITLED),
-            (CODE_TITLE, code, code_strategy or rag.STRUCTURE)):
+    стратегии = {DOCS_TITLE: docs_strategy or rag.TITLED,
+                 CODE_TITLE: code_strategy or rag.STRUCTURE,
+                 # Вопросы и ответы размечены заголовками, и заголовок внутри
+                 # куска здесь важен: без него «Что проверить» теряет вопрос.
+                 SUPPORT_TITLE: rag.TITLED}
+    for title, пути in по_наборам.items():
+        стратегия = стратегии[title]
         if not пути:
             continue
         набор = _collection_by_title(user_id, title)
@@ -315,9 +327,10 @@ def main() -> None:
         print("не git-репозиторий")
         raise SystemExit(1)
     пути = tracked_files()
-    docs, code = split_files(пути)
-    print(f"отобрано файлов: {len(пути)} — документация {len(docs)}, код {len(code)}")
-    for подпись, набор in (("документация", docs), ("код", code)):
+    по_наборам = split_files(пути)
+    print(f"отобрано файлов: {len(пути)} — "
+          + ", ".join(f"{имя.lower()} {len(с)}" for имя, с in по_наборам.items()))
+    for подпись, набор in по_наборам.items():
         всего = sum((ROOT / p).stat().st_size for p in набор)
         print(f"  {подпись}: {len(набор)} файлов, {всего // 1024} КБ")
         for путь in набор[:4]:

@@ -105,7 +105,8 @@ MIN_CHUNK_CHARS = 200
 # конца пути, переходит). Разница сегодня ни на чём не видна, но знать о ней
 # стоит: второй способ включает `*.py` на любой глубине, и для ассистента это
 # скорее желаемое.
-INCLUDE = ("README.md", "*.py", "*.sh", "static/*.js", "deploy/*.service")
+INCLUDE = ("README.md", "*.py", "*.sh", "static/*.js", "deploy/*.service",
+           "support/*.md")
 EXCLUDE_NAMES = {".env", ".env.example", "DEPLOY.local.md"}
 EXCLUDE_DIRS = {".venv", ".git", "files", "__pycache__", ".claude"}
 
