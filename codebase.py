@@ -44,7 +44,8 @@ DOCS_SUFFIXES = {".md", ".rst", ".txt"}
 # Подкоманды git, которые нам разрешены. Список, а не «любой git, который
 # попросят»: инструментом распоряжается модель, и `git push --force` в нём
 # быть не должно даже теоретически.
-ALLOWED = ("rev-parse", "status", "diff", "log", "ls-files", "rev-list", "show")
+ALLOWED = ("rev-parse", "status", "diff", "log", "ls-files", "rev-list", "show",
+           "check-ignore")
 
 # Сколько ждём git. Секунды хватает всему, кроме diff на огромном дереве.
 TIMEOUT = 20
@@ -88,18 +89,51 @@ def is_repo() -> bool:
         return False
 
 
-def inside(path: str) -> Path:
+def inside(path: str, *, must_exist: bool = True) -> Path:
     """Путь от модели — внутрь корня, и никуда больше.
 
     Проверяем после resolve(), а не поиском «..» в строке: ссылка на каталог
     выше не содержит «..» вовсе, а уводит так же.
+
+    must_exist=False — для создания нового файла: его ещё нет, но граница та
+    же. Каталог .git закрыт отдельной строкой: он внутри корня, но хозяйство
+    там не наше.
     """
     цель = (ROOT / path).resolve()
     if цель != ROOT and ROOT not in цель.parents:
         raise GitError(f"путь {path} вне проекта")
-    if not цель.exists():
+    if ".git" in цель.relative_to(ROOT).parts:
+        raise GitError(f"путь {path} внутри .git — это хозяйство git, не наше")
+    if must_exist and not цель.exists():
         raise GitError(f"пути {path} в проекте нет")
     return цель
+
+
+def ignored(path: str) -> bool:
+    """Велено ли git игнорировать этот путь?
+
+    Одна проверка закрывает разом .env, local-data/, rag.db и models/ — всё,
+    что в .gitignore. Этим и держится граница: ассистент работает с тем, что
+    видит git, и никогда с тем, что git велено не видеть.
+    """
+    try:
+        git("check-ignore", "-q", "--", path, timeout=5)
+        return True
+    except GitError:
+        # check-ignore отвечает ненулевым кодом и когда путь не игнорируется,
+        # и когда его нет вовсе. Оба случая для нас одинаковы: не игнорируется.
+        return False
+
+
+def project_files() -> list[str]:
+    """Файлы проекта: отслеживаемые плюс те, что git не игнорирует.
+
+    Не просто `ls-files`: ассистент создаёт файлы, и он должен видеть то, что
+    сам же создал, иначе собственный поиск его не находит. Флаги дают ровно
+    ту же границу, что и всё остальное — внутри репозитория и не в игноре.
+    """
+    вывод = git("ls-files", "--cached", "--others", "--exclude-standard", "-z")
+    return sorted({с for с in вывод.split("\0") if с})
 
 
 def tracked_files() -> list[str]:

@@ -1374,6 +1374,8 @@ async def _exchange(
         # его выполняет и спрашивает снова. Текст всех кругов — один ответ:
         # пользователь видит его сплошным потоком, как обычно.
         rounds = 0
+        предел_кругов = (command.rounds if command and command.rounds
+                         else MCP_ROUNDS_LIMIT)
         while True:
             calls: list[dict] = []
             said = ""
@@ -1403,7 +1405,7 @@ async def _exchange(
                         calls = event.get("tool_calls") or []
                         # Ход не закончен: «done» в интерфейсе закрыл бы ответ,
                         # а после инструмента будет продолжение.
-                        if calls and rounds < MCP_ROUNDS_LIMIT:
+                        if calls and rounds < предел_кругов:
                             continue
                         if rounds:
                             # В последнем «done» показываем расход за все круги:
@@ -1420,11 +1422,11 @@ async def _exchange(
 
             if not calls:
                 break
-            if rounds >= MCP_ROUNDS_LIMIT:
+            if rounds >= предел_кругов:
                 # Предел исчерпан, а модель просит ещё. Молчать нельзя: ответ
                 # оборван на полуслове, и пользователь должен знать почему.
                 yield sse({"type": "context_error", "message":
-                           f"Предел кругов вызова инструментов ({MCP_ROUNDS_LIMIT}) "
+                           f"Предел кругов вызова инструментов ({предел_кругов}) "
                            "исчерпан — ответ оборван. Спросите точнее или "
                            "повторите вопрос."})
                 break
