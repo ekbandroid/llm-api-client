@@ -5,6 +5,7 @@
     python manage.py approve <логин>
     python manage.py list
     python manage.py index-project <логин>
+    python manage.py checks
 """
 
 import getpass
@@ -92,12 +93,36 @@ def index_project(login: str) -> None:
     print("Подключить к диалогу — во вкладке «Документы», или командой /help.")
 
 
+def checks_command() -> None:
+    """Гоняет ворота по текущему репозиторию и печатает отчёт.
+
+    То же, что делает инструмент run_checks для субагента, но руками из
+    командной строки: не нужно повторять шаги run-local.sh по одному. Код
+    возврата — 0, если всё прошло, иначе 1, чтобы этим можно было
+    пользоваться в скриптах.
+    """
+    import checks
+    import codebase
+
+    if not codebase.is_repo():
+        sys.exit(f"{codebase.ROOT} — не git-репозиторий, проверять нечего.")
+    try:
+        файлы = codebase.project_files()
+    except codebase.GitError:
+        файлы = []
+
+    прошло, отчёт = checks.прогнать(codebase.ROOT, файлы)
+    print(отчёт)
+    sys.exit(0 if прошло else 1)
+
+
 COMMANDS = {
     "create-admin": (create_admin, True),
     "set-password": (set_password, True),
     "approve": (approve, True),
     "list": (list_users, False),
     "index-project": (index_project, True),
+    "checks": (checks_command, False),
 }
 
 
