@@ -62,8 +62,16 @@ def прогнать(корень: Path, файлы: list[str]) -> tuple[bool, s
     for имя, команда in список(корень, файлы):
         начало = time.monotonic()
         try:
+            # errors="replace" здесь обязателен, и это не перестраховка.
+            # Нашло ревью дня 32 на PR, который открыл пайплайн дня 35, —
+            # проверено опытом: text=True берёт кодировку локали со строгим
+            # разбором, и первый же негодный байт из проверяемого кода роняет
+            # UnicodeDecodeError. Он не ValueError для TimeoutExpired и не
+            # OSError, то есть не ловится ничем ниже, и падает весь прогон
+            # ворот — вместо того чтобы показать вывод с подпорченным знаком.
             готово = subprocess.run(команда, cwd=корень, capture_output=True,
-                                    text=True, timeout=ПРОВЕРКА_СЕКУНД)
+                                    text=True, encoding="utf-8",
+                                    errors="replace", timeout=ПРОВЕРКА_СЕКУНД)
         except subprocess.TimeoutExpired:
             всё_прошло = False
             итог.append(f"⨯ {имя}: не уложилась в {ПРОВЕРКА_СЕКУНД} с")
