@@ -5,6 +5,11 @@
     python manage.py approve <логин>
     python manage.py list
     python manage.py index-project <логин>
+    python manage.py checks
+
+Команда checks прогоняет ворота из checks.py по текущему репозиторию — то же,
+что человек гоняет перед коммитом по шагам run-local.sh, только одной
+командой. Печатает отчёт и выходит с кодом 0, если всё прошло, иначе 1.
 """
 
 import getpass
@@ -92,12 +97,40 @@ def index_project(login: str) -> None:
     print("Подключить к диалогу — во вкладке «Документы», или командой /help.")
 
 
+def checks_command() -> None:
+    """Прогоняет ворота checks.прогнать по текущему репозиторию.
+
+    Раньше ворота звали только субагент (инструмент run_checks) и пайплайн
+    перед пушем, а руками их прогнать было нечем — приходилось повторять шаги
+    run-local.sh по одному. Здесь тот же набор, что и у тех двух зовущих:
+    список файлов берётся так же (codebase.project_files), корень — codebase.ROOT.
+
+    Выход: 0 — прошли все проверки, 1 — хотя бы одна не прошла. Так отчёт
+    годится и для глаза, и для скрипта, который по коду возврата решает,
+    пускать ли дальше.
+    """
+    import checks
+    import codebase
+
+    if not codebase.is_repo():
+        sys.exit(f"В {codebase.ROOT} нет git-репозитория — воротам нечего проверять.")
+    try:
+        файлы = codebase.project_files()
+    except codebase.GitError:
+        файлы = []
+
+    всё_прошло, отчёт = checks.прогнать(codebase.ROOT, файлы)
+    print(отчёт)
+    sys.exit(0 if всё_прошло else 1)
+
+
 COMMANDS = {
     "create-admin": (create_admin, True),
     "set-password": (set_password, True),
     "approve": (approve, True),
     "list": (list_users, False),
     "index-project": (index_project, True),
+    "checks": (checks_command, False),
 }
 
 
