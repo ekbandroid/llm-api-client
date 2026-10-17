@@ -52,15 +52,6 @@ server = MCPServer(
 )
 
 
-def _обрезать(текст: str, предел: int) -> str:
-    """Отдаёт не больше предела строк и говорит, сколько осталось за краем."""
-    строки = текст.splitlines()
-    if len(строки) <= предел:
-        return текст.rstrip()
-    хвост = len(строки) - предел
-    return "\n".join(строки[:предел]) + f"\n… ещё {хвост} строк, здесь не показаны"
-
-
 def _нет_репозитория() -> str:
     return (f"В {codebase.ROOT} нет git-репозитория, поэтому про ветку, "
             f"изменения и коммиты сказать нечего. Так и бывает на сервере: "
@@ -131,7 +122,7 @@ async def changed_files() -> str:
         if код[1].strip():
             где.append(f"в каталоге {словами.get(код[1], код[1])}")
         строки.append(f"  {путь} — {', '.join(где) or код}")
-    return f"Изменённых файлов {len(отметки)}:\n" + _обрезать("\n".join(строки), 60)
+    return f"Изменённых файлов {len(отметки)}:\n" + checks._обрезать("\n".join(строки), 60)
 
 
 @server.tool()
@@ -164,7 +155,7 @@ async def git_diff(
     if not текст.strip():
         где = "в индексе" if staged else "в рабочем каталоге"
         return f"Пусто: {где}" + (f" по пути {path}" if path else "") + " изменений нет."
-    return _обрезать(текст, DIFF_LINES)
+    return checks._обрезать(текст, DIFF_LINES)
 
 
 @server.tool()
@@ -264,7 +255,7 @@ async def list_project_files(
     if not файлы:
         return f"Под «{pattern}» ничего не подошло." if pattern else "Файлов нет."
     return (f"Файлов: {len(файлы)}\n"
-            + _обрезать("\n".join(f"  {ф}" for ф in файлы), 120))
+            + checks._обрезать("\n".join(f"  {ф}" for ф in файлы), 120))
 
 
 @server.tool()
@@ -385,7 +376,7 @@ async def find_in_files(
                 f"«{query}» не встречается ни в одном файле проекта."
                 + _похоже_на_шаблон(query))
     шапка = f"«{query}» — совпадений {len(находки)} в {len(где)} файлах:"
-    return шапка + "\n" + _обрезать("\n".join(находки), НАЙДЕНО_СТРОК)
+    return шапка + "\n" + checks._обрезать("\n".join(находки), НАЙДЕНО_СТРОК)
 
 
 def _отчёт_о_записи(path: str, относительный: str, что: str) -> str:
@@ -412,7 +403,7 @@ def _отчёт_о_записи(path: str, относительный: str, чт
     if not diff.strip():
         return f"{path} записан, но содержимое не изменилось."
     return (f"{что} {path}. Отменить — git checkout {относительный}\n\n"
-            + _обрезать(diff, DIFF_LINES))
+            + checks._обрезать(diff, DIFF_LINES))
 
 
 def _можно_записать(path: str) -> tuple[Path | None, str, str]:
