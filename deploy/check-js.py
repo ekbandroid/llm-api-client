@@ -79,10 +79,15 @@ def targets(paths: list[Path]) -> list[tuple[Path, Path, str]]:
     return plan
 
 
-def shortly(path: Path) -> str:
-    """Путь от корня проекта: полный только мешает читать."""
+def shortly(path: Path | str) -> str:
+    """Путь от корня проекта: полный только мешает читать.
+
+    str тоже принимается намеренно: сюда попадает и путь, который вернул сам
+    движок, а он приходит строкой. Раньше на ней проверка падала
+    AttributeError вместо того, чтобы назвать находку.
+    """
     try:
-        return str(path.resolve().relative_to(ROOT))
+        return str(Path(path).resolve().relative_to(ROOT))
     except ValueError:
         return str(path)
 
@@ -111,13 +116,31 @@ def by_jsc(plan: list[tuple[Path, Path, str]]) -> list[str]:
     done = subprocess.run([str(JSC), str(script), "--", *[str(f) for f, _, _ in plan]],
                           capture_output=True, text=True)
     named = {str(file): (shown, note) for file, shown, note in plan}
-    problems = []
+    problems, чужие = [], 0
     for line in done.stdout.splitlines():
         path, _, rest = line.partition("|")
         number, _, message = rest.partition("|")
-        shown, note = named.get(path, (path, ""))
+        if path not in named:
+            чужие += 1
+            continue
+        shown, note = named[path]
         where = f"{shortly(shown)}:{number}" + (f" ({note})" if note else "")
         problems.append(f"{where}: {message}")
+    if чужие:
+        # Движок пожаловался на файлы, которых мы ему не давали, — значит он
+        # не узнал свои же аргументы. Причина у этого одна и воспроизводимая:
+        # jsc читает argv как latin-1, и путь с не-ASCII до него доходит
+        # искажённым («проба» становится «Ð¿ÑÐ¾Ð±Ð°»). Файлы он тогда не
+        # открывает вовсе и сообщает об ошибке в каждом. Назвать причину
+        # важнее, чем показать десяток выдуманных находок: без этого проверка
+        # валит всё подряд, и кажется, что сломан код.
+        problems.append(
+            f"jsc не узнал {чужие} из переданных путей — эти файлы остались "
+            "непроверенными. Так бывает, когда в пути к ним есть не-ASCII: "
+            "движок читает аргументы как latin-1, и до файла не доходит. "
+            "Встроенные скрипты это не задевает: их копии лежат во временном "
+            "каталоге из латиницы, потому и счёт здесь меньше общего. "
+            "Перенесите проект или рабочее дерево в путь из латиницы.")
     if done.returncode and not problems:
         problems.append(f"jsc не смог проверить: {done.stderr.strip()[:200]}")
     return problems

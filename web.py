@@ -29,6 +29,7 @@ import history
 import invariants as invariants_mod
 import llm
 import mcp_tools
+import pipeline
 import memory
 import rag
 import reasoning
@@ -1139,6 +1140,7 @@ async def _exchange(
     conversation_id: int, user: dict, content: str | None, *,
     outcome: dict, simulated: dict | None = None,
     command: "commands.Условия | None" = None,
+    servers: list[dict] | None = None,
 ) -> AsyncIterator[str]:
     """Один обмен: сохранить реплику, собрать запрос, стримить ответ, обслужить.
 
@@ -1213,11 +1215,16 @@ async def _exchange(
     # перезапуска службы, — сходим один раз здесь. Про устаревание см.
     # mcp_tools.is_stale: свои серверы меняются с выкаткой, а кэш её
     # переживал, и новый инструмент до модели не доходил.
-    servers = db.list_mcp_servers(user["id"], only_enabled=True)
-    for server in servers:
-        if not mcp_tools.cached_tools(server) or mcp_tools.is_stale(server):
-            await _refresh_mcp(server, user)
-    servers = db.list_mcp_servers(user["id"], only_enabled=True)
+    if servers is None:
+        servers = db.list_mcp_servers(user["id"], only_enabled=True)
+        for server in servers:
+            if not mcp_tools.cached_tools(server) or mcp_tools.is_stale(server):
+                await _refresh_mcp(server, user)
+        servers = db.list_mcp_servers(user["id"], only_enabled=True)
+    # servers передают, когда ход идёт не от вкладки «MCP», а от пайплайна:
+    # субагенту дня 35 нужен ровно один сервер — тот, что смотрит в его
+    # рабочее дерево. Включённые у пользователя сюда не попадают намеренно,
+    # иначе субагент видел бы дерево соседа и правил бы чужую задачу.
     tool_schemas, tool_routes = mcp_tools.request_tools(servers)
     # Выполнение задания не заводит новых заданий: инструменты планирования
     # на это время снимаются. Одной просьбы в тексте мало — проверено, первое
@@ -1895,6 +1902,12 @@ async def conversation_send(
             conversation_id, user["id"], приказ.attach_titles)
     if приказ and приказ.answer:
         return _sse_response(_canned(conversation_id, user, content, приказ.answer))
+    if приказ and приказ.issues:
+        # Пайплайн дня 35, а не один ход с моделью: он заводит рабочие деревья,
+        # запускает субагентов и ходит в git. Поэтому у него свой поток
+        # событий — тех же видов, которые страница уже умеет рисовать.
+        return _sse_response(pipeline.run(conversation_id, user, приказ,
+                                          обмен=_exchange))
     if приказ and пропали:
         беда = ("Наборы проекта не собраны: " + ", ".join(пропали)
                 + ". Соберите их командой `python manage.py index-project "
